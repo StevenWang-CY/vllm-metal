@@ -406,14 +406,15 @@ def split_audio(
             break
 
         split = _find_split_point(audio, end, window_size)
-        # When the energy search does not find a forward split point,
-        # fall back to the target boundary for stable chunk sizes.
-        if split <= pos:
+        # A split inside the requested overlap would make the next chunk start
+        # at or before this one. Fall back to the target boundary so every
+        # iteration contributes new audio while preserving the overlap.
+        if split <= pos + overlap_samples:
             split = end
         else:
             split = min(split, end)
 
         chunks.append((audio[pos:split], pos / sample_rate))
-        pos = max(split - overlap_samples, pos + 1)
+        pos = split - overlap_samples
 
     return chunks

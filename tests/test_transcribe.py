@@ -300,6 +300,74 @@ class TestChunkingPolicy:
         with pytest.raises(ValueError, match="max_audio_clip_s="):
             transcriber.transcribe(short_audio)
 
+    @pytest.mark.parametrize(
+        ("config", "message"),
+        [
+            (
+                SpeechToTextConfig(max_audio_clip_s=0),
+                "max_audio_clip_s must be > 0",
+            ),
+            (
+                SpeechToTextConfig(overlap_chunk_second=-1),
+                "overlap_chunk_second must be >= 0",
+            ),
+            (
+                SpeechToTextConfig(min_energy_split_window_size=0),
+                "min_energy_split_window_size must be > 0",
+            ),
+            (
+                SpeechToTextConfig(
+                    max_audio_clip_s=10,
+                    overlap_chunk_second=10,
+                ),
+                "must be less than max_audio_clip_s",
+            ),
+            (
+                SpeechToTextConfig(
+                    max_audio_clip_s=10,
+                    overlap_chunk_second=11,
+                ),
+                "must be less than max_audio_clip_s",
+            ),
+        ],
+    )
+    def test_prepare_audio_chunks_rejects_invalid_chunking_policy(
+        self,
+        config: SpeechToTextConfig,
+        message: str,
+    ) -> None:
+        transcriber = _ChunkingTestTranscriber(config)
+
+        with pytest.raises(ValueError, match=message):
+            transcriber._prepare_audio_chunks(mx.zeros(1600, dtype=mx.float32))
+
+    def test_prepare_audio_chunks_ignores_quiet_point_inside_overlap(self) -> None:
+        max_clip_s = 2
+        overlap_s = 1
+        window_size = SAMPLE_RATE // 2
+        audio = mx.concatenate(
+            [
+                mx.ones(SAMPLE_RATE // 2, dtype=mx.float32),
+                mx.zeros(SAMPLE_RATE // 2, dtype=mx.float32),
+                mx.ones(2 * SAMPLE_RATE, dtype=mx.float32),
+            ]
+        )
+        transcriber = _ChunkingTestTranscriber(
+            SpeechToTextConfig(
+                max_audio_clip_s=max_clip_s,
+                overlap_chunk_second=overlap_s,
+                min_energy_split_window_size=window_size,
+            )
+        )
+
+        chunks = transcriber._prepare_audio_chunks(audio)
+
+        assert [start for _, start in chunks] == pytest.approx([0.0, 1.0])
+        assert [chunk.shape[0] for chunk, _ in chunks] == [
+            max_clip_s * SAMPLE_RATE,
+            max_clip_s * SAMPLE_RATE,
+        ]
+
 
 class TestGreedyDecode:
     @pytest.fixture()

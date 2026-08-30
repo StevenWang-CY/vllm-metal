@@ -175,6 +175,9 @@ class WhisperTranscriber:
                 )
             return [(audio, 0.0)]
 
+        if max_clip_s <= 0:
+            raise ValueError(f"max_audio_clip_s must be > 0, got {max_clip_s}")
+
         if max_clip_s > DEFAULT_SEGMENT_DURATION:
             raise ValueError(
                 f"max_audio_clip_s={max_clip_s} exceeds Whisper's "
@@ -182,10 +185,24 @@ class WhisperTranscriber:
                 "Set max_audio_clip_s <= 30 for Whisper."
             )
 
+        if window_size <= 0:
+            raise ValueError(
+                f"min_energy_split_window_size must be > 0, got {window_size}"
+            )
+
+        overlap_s = self.config.overlap_chunk_second
+        if overlap_s < 0:
+            raise ValueError(f"overlap_chunk_second must be >= 0, got {overlap_s}")
+        if overlap_s >= max_clip_s:
+            raise ValueError(
+                f"overlap_chunk_second={overlap_s} must be less than "
+                f"max_audio_clip_s={max_clip_s} to ensure forward progress"
+            )
+
         return split_audio(
             audio,
             max_clip_s=max_clip_s,
-            overlap_s=self.config.overlap_chunk_second,
+            overlap_s=overlap_s,
             window_size=window_size,
             sample_rate=SAMPLE_RATE,
         )
