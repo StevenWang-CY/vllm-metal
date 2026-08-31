@@ -112,7 +112,10 @@ class SamplingBatch:
 
     @property
     def needs_logprobs(self) -> bool:
-        return self.max_num_logprobs is not None
+        return any(
+            sampling_params.num_logprobs is not None
+            for sampling_params in self.sampling_params_list
+        )
 
     @staticmethod
     def merge_logprobs_rows(
@@ -186,7 +189,7 @@ class SamplingBatch:
             and sampling_params.frequency_penalty == 0.0
             and sampling_params.presence_penalty == 0.0
             and sampling_params.repetition_penalty == 1.0
-            and sampling_params.logprobs is None
+            and sampling_params.num_logprobs is None
             and not sampling_params.allowed_token_ids
             and not sampling_params.bad_words_token_ids
             for sampling_params in sampling_params_list
@@ -219,8 +222,7 @@ class SamplingBatch:
                 and sp.frequency_penalty == 0.0
                 and sp.presence_penalty == 0.0
                 and sp.repetition_penalty == 1.0
-                and sp.logprobs is None
-                and sp.logprob_token_ids is None
+                and sp.num_logprobs is None
                 and not sp.allowed_token_ids
                 and not sp.bad_words_token_ids
                 for sp in sampling_params_list
@@ -446,13 +448,55 @@ class SamplingBatch:
                 result[i] = sp.bad_words_token_ids
         return result
 
-    def make_sampling_metadata(self) -> SamplingMetadata:
+    def _make_logprob_args(
+        self,
+        logits: torch.Tensor | None,
+    ) -> tuple[int | None, dict[int, list[int]] | None]:
+        """Build mutually exclusive logprob arguments for vLLM's sampler.
+
+        vLLM's compatibility sampler treats any ``logprob_token_ids`` mapping
+        as a batch-wide override of ``max_num_logprobs``. When a batch mixes
+        both request types, materialize the ordinary rows' raw-logit top-k IDs
+        into the mapping and disable the batch-wide top-k argument.
+        """
+        max_num_logprobs = self.max_num_logprobs
+        token_ids_by_row: dict[int, list[int]] = {}
+        for i, sampling_params in enumerate(self.sampling_params_list):
+            if sampling_params.logprob_token_ids:
+                token_ids_by_row[i] = sampling_params.logprob_token_ids
+        if not token_ids_by_row:
+            return max_num_logprobs, None
+
+        topk_requests = [
+            (i, sampling_params.logprobs)
+            for i, sampling_params in enumerate(self.sampling_params_list)
+            if i not in token_ids_by_row and sampling_params.logprobs is not None
+        ]
+        max_topk = max((num_logprobs for _, num_logprobs in topk_requests), default=0)
+        if max_topk > 0:
+            if logits is None:
+                raise ValueError(
+                    "Logits are required when a batch mixes top-k and "
+                    "specific-token logprobs."
+                )
+            topk_token_ids = torch.topk(logits, max_topk, dim=-1).indices
+            for i, num_logprobs in topk_requests:
+                token_ids_by_row[i] = topk_token_ids[i, :num_logprobs].tolist()
+        else:
+            for i, _ in topk_requests:
+                token_ids_by_row[i] = []
+        return None, token_ids_by_row
+
+    def make_sampling_metadata(
+        self, logits: torch.Tensor | None = None
+    ) -> SamplingMetadata:
         """Create vLLM ``SamplingMetadata`` for this batch."""
         (
             frequency_penalties,
             presence_penalties,
             repetition_penalties,
         ) = self._make_penalty_tensors()
+        max_num_logprobs, logprob_token_ids = self._make_logprob_args(logits)
 
         return SamplingMetadata(
             temperature=self._make_temperature(),
@@ -461,7 +505,7 @@ class SamplingBatch:
             top_p=self._make_top_p(),
             top_k=self._make_top_k(),
             generators=self.generators,
-            max_num_logprobs=self.max_num_logprobs,
+            max_num_logprobs=max_num_logprobs,
             prompt_token_ids=self._make_prompt_token_ids(),
             output_token_ids=self.output_token_id_lists,
             frequency_penalties=frequency_penalties,
@@ -471,7 +515,7 @@ class SamplingBatch:
             allowed_token_ids_mask=self._make_allowed_token_ids_mask(),
             bad_words_token_ids=self._make_bad_words_token_ids(),
             logitsprocs=_EMPTY_LOGITSPROCS,
-            logprob_token_ids=None,
+            logprob_token_ids=logprob_token_ids,
         )
 
 
@@ -513,7 +557,7 @@ def sample_from_logits(
     logits_torch = mlx_to_torch(
         logits_2d.astype(mx.float32), device=SamplingBatch.SAMPLER_DEVICE
     )
-    metadata = batch.make_sampling_metadata()
+    metadata = batch.make_sampling_metadata(logits_torch)
     output = sampler.forward(logits_torch, metadata)
     logprobs = (
         output.logprobs_tensors.tolists()

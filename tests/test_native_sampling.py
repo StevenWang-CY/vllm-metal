@@ -28,6 +28,11 @@ class TestNativeRandomEligibility:
 
         assert SamplingBatch.params_allow_native_random(params)
 
+    def test_empty_specific_token_list_is_eligible(self) -> None:
+        assert SamplingBatch.params_allow_native_random(
+            [_random_params(logprob_token_ids=[])]
+        )
+
     @pytest.mark.parametrize(
         ("label", "params_list"),
         [

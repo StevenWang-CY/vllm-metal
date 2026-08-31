@@ -462,6 +462,9 @@ class TestV1SamplingBatch:
             [SamplingParams(temperature=0.0, logprobs=1)]
         ).can_use_native_greedy()
         assert not self._batch(
+            [SamplingParams(temperature=0.0, logprob_token_ids=[1, 2])]
+        ).can_use_native_greedy()
+        assert not self._batch(
             [SamplingParams(temperature=0.0, allowed_token_ids=[1, 2])]
         ).can_use_native_greedy()
         bad_sp = SamplingParams(temperature=0.0)
@@ -672,6 +675,169 @@ class TestV1SamplingBatch:
         assert result.logprobs.logprob_token_ids.shape == (1, 3)
         assert result.logprobs.logprob_token_ids[0, 0] == 2
         assert result.logprobs.sampled_token_ranks.tolist() == [1]
+
+    def test_sample_from_logits_returns_requested_token_logprobs(self) -> None:
+        logits = mx.array([[0.0, 1.0, 4.0, 2.0]], dtype=mx.float32)
+        batch = SamplingBatch(
+            [SamplingParams(temperature=0.0, logprob_token_ids=[0, 3])],
+            [[1, 2, 3]],
+            [[]],
+            vocab_size=4,
+        )
+
+        result = sample_from_logits(logits, batch, Sampler())
+
+        assert result.token_ids == [2]
+        assert result.logprobs is not None
+        assert result.logprobs.logprob_token_ids.tolist() == [[2, 0, 3]]
+        expected = torch.log_softmax(torch.tensor([0.0, 1.0, 4.0, 2.0]), dim=0)
+        assert result.logprobs.logprobs[0].tolist() == pytest.approx(
+            expected[[2, 0, 3]].tolist()
+        )
+        assert result.logprobs.sampled_token_ranks.tolist() == [1]
+
+    def test_empty_requested_token_list_does_not_request_logprobs(self) -> None:
+        params = SamplingParams(temperature=0.0, logprob_token_ids=[])
+        batch = SamplingBatch([params], [[1, 2, 3]], [[]], vocab_size=4)
+
+        assert params.num_logprobs is None
+        assert batch.can_use_native_greedy()
+        assert batch.make_sampling_metadata().logprob_token_ids is None
+        assert (
+            sample_from_logits(
+                mx.array([[0.0, 1.0, 4.0, 2.0]], dtype=mx.float32),
+                batch,
+                Sampler(),
+            ).logprobs
+            is None
+        )
+
+    @pytest.mark.parametrize("specific_row", [0, 1])
+    def test_mixed_specific_and_topk_logprobs_preserve_each_row(
+        self, specific_row: int
+    ) -> None:
+        raw_logits = [[0.0, 1.0, 4.0, 2.0], [5.0, 1.0, 3.0, 2.0]]
+        logits = mx.array(raw_logits, dtype=mx.float32)
+        specific_params = SamplingParams(temperature=0.0, logprob_token_ids=[0, 3])
+        topk_params = SamplingParams(temperature=0.0, logprobs=2)
+        sampling_params = [
+            specific_params if row == specific_row else topk_params for row in range(2)
+        ]
+        batch = SamplingBatch(
+            sampling_params,
+            [[1, 2], [3, 4]],
+            [[], []],
+            vocab_size=4,
+        )
+
+        topk_ids = [[2, 3], [0, 2]]
+        metadata = batch.make_sampling_metadata(torch.tensor(raw_logits))
+        assert metadata.max_num_logprobs is None
+        assert metadata.logprob_token_ids == {
+            specific_row: [0, 3],
+            1 - specific_row: topk_ids[1 - specific_row],
+        }
+
+        result = sample_from_logits(logits, batch, Sampler())
+
+        assert result.token_ids == [2, 0]
+        assert result.logprobs is not None
+        expected_ids = []
+        for row, sampled_token_id in enumerate(result.token_ids):
+            requested_ids = [0, 3] if row == specific_row else topk_ids[row]
+            expected_ids.append([sampled_token_id, *requested_ids])
+        assert result.logprobs.logprob_token_ids.tolist() == expected_ids
+        expected = torch.log_softmax(
+            torch.tensor([[0.0, 1.0, 4.0, 2.0], [5.0, 1.0, 3.0, 2.0]]),
+            dim=1,
+        )
+        for row, token_ids in enumerate(expected_ids):
+            assert result.logprobs.logprobs[row].tolist() == pytest.approx(
+                expected[row, token_ids].tolist()
+            )
+        assert result.logprobs.sampled_token_ranks.tolist() == [1, 1]
+
+    def test_mixed_logprob_metadata_requires_logits(self) -> None:
+        batch = SamplingBatch(
+            [
+                SamplingParams(temperature=0.0, logprob_token_ids=[0, 3]),
+                SamplingParams(temperature=0.0, logprobs=2),
+            ],
+            [[1, 2], [3, 4]],
+            [[], []],
+            vocab_size=4,
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="Logits are required when a batch mixes top-k and specific-token",
+        ):
+            batch.make_sampling_metadata()
+
+    def test_same_row_specific_logprobs_override_topk_without_logits(self) -> None:
+        batch = SamplingBatch(
+            [
+                SamplingParams(
+                    temperature=0.0,
+                    logprobs=2,
+                    logprob_token_ids=[0, 3],
+                )
+            ],
+            [[1, 2]],
+            [[]],
+            vocab_size=4,
+        )
+
+        metadata = batch.make_sampling_metadata()
+
+        assert metadata.max_num_logprobs is None
+        assert metadata.logprob_token_ids == {0: [0, 3]}
+
+    def test_mixed_sampled_token_only_and_specific_logprobs_need_no_logits(
+        self,
+    ) -> None:
+        batch = SamplingBatch(
+            [
+                SamplingParams(temperature=0.0, logprob_token_ids=[0, 3]),
+                SamplingParams(temperature=0.0, logprobs=0),
+            ],
+            [[1, 2], [3, 4]],
+            [[], []],
+            vocab_size=4,
+        )
+
+        metadata = batch.make_sampling_metadata()
+
+        assert metadata.max_num_logprobs is None
+        assert metadata.logprob_token_ids == {0: [0, 3], 1: []}
+
+    def test_mixed_topk_logprobs_preserve_batch_tie_breaking(self) -> None:
+        batch = SamplingBatch(
+            [
+                SamplingParams(temperature=0.0, logprob_token_ids=[0]),
+                SamplingParams(temperature=0.0, logprobs=2),
+                SamplingParams(temperature=0.0, logprobs=5),
+            ],
+            [[1], [2], [3]],
+            [[], [], []],
+            vocab_size=8,
+        )
+        logits = torch.tensor(
+            [
+                [0.0] * 8,
+                [-1.0, -1.0, -1.0, 0.0, -1.0, 1.0, 0.0, 0.0],
+                list(range(8)),
+            ]
+        )
+
+        metadata = batch.make_sampling_metadata(logits)
+
+        assert metadata.max_num_logprobs is None
+        assert metadata.logprob_token_ids == {
+            0: [0],
+            1: [5, 7],
+            2: [7, 6, 5, 4, 3],
+        }
 
     def test_model_runner_output_keeps_logprobs_slot_alignment(self) -> None:
         batch = _ExecutionBatch()
