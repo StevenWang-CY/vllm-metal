@@ -384,7 +384,10 @@ def stale_artifacts() -> list[Path]:
 def build() -> Path:
     """JIT-build the native extension, returning the path to the .so.
 
-    Skips the compile when the prebuilt .so is already current (needs_rebuild)."""
+    Skips the compile when the prebuilt .so is already current (needs_rebuild).
+    A rebuild is compiled beside the installed artifact and promoted only after
+    success, so a linker failure cannot remove the last usable extension.
+    """
     if not needs_rebuild():
         return _OUT
 
@@ -401,7 +404,17 @@ def build() -> Path:
         if not Path(p).exists():
             raise FileNotFoundError(f"{label} not found: {p}")
 
-    _run_or_raise(spec.cmd, "build paged_ops extension")
+    with tempfile.TemporaryDirectory(
+        prefix=".vllm-metal-build-", dir=_OUT.parent
+    ) as tmpdir:
+        tmp_out = Path(tmpdir) / _OUT.name
+        cmd = [str(tmp_out) if arg == str(_OUT) else arg for arg in spec.cmd]
+        # ``clang++ -shared`` derives LC_ID_DYLIB from the output path. Keep the
+        # final artifact identity instead of recording the temporary directory.
+        output_flag = cmd.index("-o")
+        cmd[output_flag:output_flag] = ["-install_name", str(_OUT)]
+        _run_or_raise(cmd, "build paged_ops extension")
+        tmp_out.replace(_OUT)
 
     _HASH.write_text(expected_hash)
     logger.info("Built %s", _OUT)

@@ -143,6 +143,42 @@ def test_needs_rebuild_swallows_resolution_errors(patched, monkeypatch):
     assert build.needs_rebuild() is True
 
 
+def test_failed_rebuild_preserves_previous_extension(patched, monkeypatch):
+    """A failed linker must not remove the last usable native extension."""
+    py_include = patched.src.parent / "python-include"
+    mlx_include = patched.src.parent / "mlx-include"
+    mlx_lib = patched.src.parent / "mlx-lib"
+    py_include.mkdir()
+    mlx_include.mkdir()
+    mlx_lib.mkdir()
+    (mlx_lib / "libmlx.dylib").write_bytes(b"mlx")
+    spec = dataclasses.replace(
+        patched.spec,
+        mlx_lib=mlx_lib,
+        mlx_include=mlx_include,
+        py_include=str(py_include),
+    )
+    monkeypatch.setattr(build, "_build_spec", lambda: spec)
+
+    previous_extension = b"last-known-good-extension"
+    previous_hash = "last-known-good-hash"
+    patched.out.write_bytes(previous_extension)
+    patched.hsh.write_text(previous_hash)
+
+    def fail_after_clobbering_output(cmd: list[str], _what: str) -> None:
+        output = Path(cmd[cmd.index("-o") + 1])
+        output.unlink(missing_ok=True)
+        raise RuntimeError("link failed")
+
+    monkeypatch.setattr(build, "_run_or_raise", fail_after_clobbering_output)
+
+    with pytest.raises(RuntimeError, match="link failed"):
+        build.build()
+
+    assert patched.out.read_bytes() == previous_extension
+    assert patched.hsh.read_text() == previous_hash
+
+
 # --------------------------------------------------------------------------
 # Path contract (the runtime loader and verify_wheel_artifacts depend on these)
 # --------------------------------------------------------------------------
