@@ -614,6 +614,39 @@ class TestExaone4ConfigCompatPatch:
         # Shim stays inert: transformers derives its own sliding/full mix.
         assert "sliding_attention" in config.layer_types
 
+    def test_string_sliding_window_pattern_derives_layer_types(self) -> None:
+        from transformers.models.exaone4.configuration_exaone4 import Exaone4Config
+
+        compat._patch_transformers_exaone4_config()
+        config = Exaone4Config(
+            num_hidden_layers=8,
+            sliding_window=4096,
+            sliding_window_pattern="LLLG",
+        )
+
+        expected_period = [
+            "sliding_attention",
+            "sliding_attention",
+            "sliding_attention",
+            "full_attention",
+        ]
+        assert config.layer_types == expected_period * 2
+
+    @pytest.mark.parametrize("pattern", ["", "LLXG", "LLLL", "GGGG"])
+    def test_malformed_string_sliding_window_pattern_is_rejected(
+        self, pattern: str
+    ) -> None:
+        from transformers.models.exaone4.configuration_exaone4 import Exaone4Config
+
+        compat._patch_transformers_exaone4_config()
+
+        with pytest.raises(ValueError, match="both 'L' and 'G'"):
+            Exaone4Config(
+                num_hidden_layers=4,
+                sliding_window=4096,
+                sliding_window_pattern=pattern,
+            )
+
     def test_explicit_layer_types_are_preserved(self) -> None:
         from transformers.models.exaone4.configuration_exaone4 import Exaone4Config
 

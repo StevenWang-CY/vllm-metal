@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 _APPLIED = False
 _QWEN35_FP8_BLOCK_SIZE = 128
+_EXAONE4_LAYER_TYPE = {"L": "sliding_attention", "G": "full_attention"}
 
 
 def apply_compat_patches() -> None:
@@ -88,24 +89,43 @@ def ensure_vllm_auto_fit_null_block_patch() -> None:
     logger.debug("Installed vLLM auto-fit null-block reservation patch")
 
 
+def _exaone4_layer_types_from_pattern(
+    pattern: str, num_hidden_layers: int
+) -> list[str]:
+    """Expand mlx-lm's repeating EXAONE ``L`` / ``G`` attention pattern.
+
+    mlx-lm selects representative local and global caches with ``index()``, so
+    both layer kinds are required whenever a pattern is present.
+    """
+    if not pattern or set(pattern) != set(_EXAONE4_LAYER_TYPE):
+        raise ValueError(
+            "EXAONE 4.0 sliding_window_pattern must be a non-empty "
+            "string containing both 'L' and 'G' and no other characters."
+        )
+    return [
+        _EXAONE4_LAYER_TYPE[pattern[i % len(pattern)]] for i in range(num_hidden_layers)
+    ]
+
+
 def _patch_transformers_exaone4_config() -> None:
-    """Guard ``Exaone4Config`` against a div-by-zero on no-sliding-window configs.
+    """Guard ``Exaone4Config`` against invalid layer-type derivation.
 
     transformers' ``Exaone4Config.__post_init__`` sets
     ``sliding_window_pattern = 0`` when ``sliding_window is None`` (EXAONE 4.0
     checkpoints without a sliding window, e.g. ``EXAONE-4.0-1.2B``), then derives
     ``layer_types`` via ``(i + 1) % sliding_window_pattern`` — a
-    ``ZeroDivisionError``. The config, and therefore the whole model, fails to
-    load through ``AutoConfig`` / ``mlx_lm`` / vLLM before any forward runs.
+    ``ZeroDivisionError``. It also applies the same modulo to string patterns
+    such as ``mlx-community/EXAONE-4.0-32B-4bit``'s ``"LLLG"``, raising
+    ``TypeError`` when ``layer_types`` is absent. vLLM's ``AutoConfig`` step then
+    fails before vllm-metal can invoke mlx-lm or run a forward pass.
 
     Pre-populate ``layer_types`` as all ``"full_attention"`` (the real layout of
-    a no-sliding-window model) so the original ``__post_init__`` skips the
-    crashing derivation. The wrapper only fires on the exact crash condition
-    (``layer_types is None and sliding_window is None``), so sliding-window
-    variants (e.g. the 32B) keep transformers' own derivation untouched.
+    a no-sliding-window model), or expand an ``L`` / ``G`` string pattern to the
+    corresponding sliding / full attention sequence. Integer patterns and
+    explicit ``layer_types`` keep transformers' own behavior.
 
-    TODO: remove once the supported transformers release no longer divides by a
-    zero ``sliding_window_pattern`` (tracked upstream in transformers).
+    TODO: remove once the supported transformers release handles zero and string
+    ``sliding_window_pattern`` values (tracked upstream in transformers).
     """
     try:
         from transformers.models.exaone4 import configuration_exaone4
@@ -122,11 +142,15 @@ def _patch_transformers_exaone4_config() -> None:
     def _patched_post_init(self: Any, **kwargs: Any) -> Any:
         if self.layer_types is None and self.sliding_window is None:
             self.layer_types = ["full_attention"] * self.num_hidden_layers
+        elif self.layer_types is None and isinstance(self.sliding_window_pattern, str):
+            self.layer_types = _exaone4_layer_types_from_pattern(
+                self.sliding_window_pattern, self.num_hidden_layers
+            )
         return original_post_init(self, **kwargs)
 
     config_cls.__post_init__ = _patched_post_init
     config_cls._vllm_metal_exaone4_patched = True
-    logger.debug("Installed Exaone4 no-sliding-window config compatibility patch")
+    logger.debug("Installed Exaone4 config compatibility patch")
 
 
 def _metal_ray_local_gpu_ids(

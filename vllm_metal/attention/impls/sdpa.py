@@ -296,8 +296,9 @@ def prepare_sdpa_qkv(
           the caller can forward them to the next YOCO layer.
 
     Raises:
-        NotImplementedError: If ``inner`` has neither ``rope`` nor
-            ``rotary_emb`` (only RoPE-based models are supported).
+        NotImplementedError: If no precomputed rotary embeddings are provided,
+            and ``inner`` has neither ``rope`` nor ``rotary_emb`` and does not
+            explicitly disable RoPE.
     """
     B, L, _ = x.shape  # noqa: N806
     norm_placement = attention_contract.qk_norm_placement

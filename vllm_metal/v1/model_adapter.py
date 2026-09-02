@@ -754,17 +754,28 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
     def build_sliding_window_per_layer(
         self, args: dict[str, Any], num_layers: int
     ) -> list[int] | None:
-        """Return per-layer sliding window sizes for Gemma4, else None.
+        """Return model-authoritative per-layer sliding window sizes.
 
-        Gemma4 sliding-attention layers enforce a local window
-        (``config.sliding_window``); full-attention layers attend to the
-        entire context (represented as ``-1``).  Models without
-        ``layer_types`` or ``sliding_window`` in their config return
-        ``None``, keeping the current disabled-everywhere behavior.
+        Explicit ``layer_types`` identify sliding and full layers directly.
+        mlx-lm filters that field out of EXAONE's ``ModelArgs``, so for EXAONE
+        derive the same cyclic layout its model constructor uses from the
+        retained ``sliding_window_pattern``. Full-attention layers use ``-1``.
+        Models without either authoritative layout or ``sliding_window`` return
+        ``None``, keeping window enforcement disabled everywhere.
         """
-        layer_types: list[str] = args.get("layer_types", [])
         sliding_window = args.get("sliding_window")
-        if len(layer_types) != num_layers or not sliding_window:
+        if not sliding_window:
+            return None
+
+        layer_types = args.get("layer_types")
+        if layer_types is None and args.get("model_type") == "exaone4":
+            pattern = args.get("sliding_window_pattern")
+            if isinstance(pattern, str):
+                from vllm_metal.compat import _exaone4_layer_types_from_pattern
+
+                layer_types = _exaone4_layer_types_from_pattern(pattern, num_layers)
+
+        if layer_types is None or len(layer_types) != num_layers:
             return None
 
         sw = int(sliding_window)

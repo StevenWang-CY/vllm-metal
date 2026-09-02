@@ -141,12 +141,20 @@ def apply_attention_rope(
     positions: list[mx.array | None] | None = None,
     position_embeddings: tuple[mx.array, mx.array] | None = None,
 ) -> tuple[mx.array, mx.array]:
-    """Apply the attention module's RoPE contract to packed Q/K tensors."""
+    """Apply the attention module's RoPE contract to packed Q/K tensors.
+
+    Without caller-precomputed embeddings, modules that explicitly set
+    ``use_rope`` to ``False`` keep Q/K unchanged. A missing rotary
+    implementation without that opt-out remains an error.
+    """
     if position_embeddings is not None:
         rotated_q, rotated_k = apply_precomputed_mrope(
             attn_module, queries, keys, position_embeddings
         )
         return rotated_q, (rotated_k if apply_keys else keys)
+
+    if getattr(attn_module, "use_rope", None) is False:
+        return queries, keys
 
     if not hasattr(attn_module, "rope") and not hasattr(attn_module, "rotary_emb"):
         raise NotImplementedError(
