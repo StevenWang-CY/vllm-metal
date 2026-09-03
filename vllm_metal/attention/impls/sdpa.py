@@ -30,6 +30,7 @@ All operations use MLX arrays end-to-end — no PyTorch MPS bridge.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import mlx.core as mx
@@ -546,7 +547,7 @@ def sdpa_forward(
     # Softmax scale — GPT-OSS names it sm_scale rather than scale.
     attn_scale = getattr(inner, "scale", None)
     if attn_scale is None:
-        attn_scale = inner.sm_scale
+        attn_scale = getattr(inner, "sm_scale", None)
 
     # Attention logit softcapping (Gemma 2: ``attn_logit_softcapping``).
     # mlx_lm applies ``tanh(qk / cap) * cap`` to the pre-softmax scores; the
@@ -575,6 +576,15 @@ def sdpa_forward(
         position_embeddings=position_embeddings,
         attention_contract=attention_contract,
     )
+    if attn_scale is None:
+        if not attention_contract.derive_scale_from_query:
+            raise AttributeError(
+                f"{type(inner).__module__}.{type(inner).__name__} exposes "
+                "neither 'scale' nor 'sm_scale'"
+            )
+        # StableLM computes the standard scale inline and exposes no scale
+        # attribute. Use the projected query width before any cache padding.
+        attn_scale = math.sqrt(1 / queries.shape[-1])
 
     # --- Metal kernel dispatch ---
     n_heads = queries.shape[1]

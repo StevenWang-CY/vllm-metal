@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for Gemma4-specific branches in sdpa.
+"""Unit tests for paged SDPA attention contracts.
 
 Covers:
 - ``pad_qkv_to_cache_head_dim`` / ``truncate_padded_output`` pure helpers.
 - ``prepare_sdpa_qkv`` branches (K-eq-V fallback, v_norm, YOCO shared_kv).
-- ``sdpa_forward`` propagation of per-layer ``num_kv_heads`` to the kernel.
+- ``sdpa_forward`` propagation of per-layer metadata to the kernel.
 
 The ``prepare_sdpa_qkv`` tests use minimal fake attention modules rather
 than real mlx_lm Attention modules so they stay fast and deterministic.
@@ -21,6 +21,7 @@ import mlx.nn as nn
 import pytest
 
 import vllm_metal.attention.impls.sdpa as sdpa_mod
+from vllm_metal.attention.attention_contracts import attention_contract_for
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.caches.mha_layout import (
     MHAKVCacheLayout,
@@ -756,12 +757,12 @@ class TestSDPAForward:
         assert sliding_call.block_tables == [[8, 9], [10, 0]]
         assert sliding_call.block_size == 16
 
-    def test_kernel_receives_per_layer_kv_heads(self) -> None:
-        """Heterogeneous layers must pass their concrete KV-head count.
+    def test_kernel_uses_layer_heads_and_registered_default_scale(self) -> None:
+        """Kernel metadata comes from the layer, not padded cache allocation.
 
-        Regression guard for Gemma4-style mixed KV layouts: ``sdpa_forward``
-        resolves the layer's actual cache shape from ``kv_heads_per_layer``
-        and must pass that same count to ``paged_attention_primitive``.
+        StableLM exposes no scale attribute. Mixed layouts may allocate a wider
+        cache, but its registered default must use the projected query width.
+        Unregistered scale-less modules must continue to fail before dispatch.
         """
         actual_kv_heads = 1
         cache = MetalPagedKVCache(
@@ -772,14 +773,25 @@ class TestSDPAForward:
             block_size=8,
             dtype=mx.float16,
             kv_heads_per_layer=[_N_KV_HEADS, actual_kv_heads],
-            head_dim_per_layer=[_HEAD_DIM, _HEAD_DIM],
+            head_dim_per_layer=[_HEAD_DIM, _CACHE_HEAD_DIM],
         )
 
-        inner = SimpleNamespace(
-            n_heads=_N_HEADS,
-            n_kv_heads=actual_kv_heads,
-            scale=_HEAD_DIM**-0.5,
-            o_proj=lambda out: out,
+        from mlx_lm.models.stablelm import Attention, ModelArgs
+
+        inner = Attention(
+            ModelArgs(
+                model_type="stablelm",
+                vocab_size=32,
+                hidden_size=_HIDDEN,
+                num_attention_heads=_N_HEADS,
+                num_hidden_layers=1,
+                num_key_value_heads=actual_kv_heads,
+                intermediate_size=16,
+                rope_theta=10_000.0,
+                use_qkv_bias=False,
+                partial_rotary_factor=0.25,
+                layer_norm_eps=1e-5,
+            )
         )
         ctx = _make_ctx(_SEQ_LEN)
         x = mx.ones((_BATCH, _SEQ_LEN, _HIDDEN))
@@ -789,7 +801,7 @@ class TestSDPAForward:
         values = mx.ones((_BATCH, actual_kv_heads, _SEQ_LEN, _HEAD_DIM))
         kv_for_sharing = (keys, values)
 
-        captured: dict[str, int] = {}
+        captured: dict[str, int | float] = {}
 
         class _FakeOps:
             def reshape_and_cache(
@@ -808,10 +820,12 @@ class TestSDPAForward:
                 _key_cache,
                 _value_cache,
                 num_kv_heads,
+                scale,
                 *_args,
                 **_kwargs,
             ) -> None:
                 captured["num_kv_heads"] = num_kv_heads
+                captured["scale"] = scale
 
         with (
             patch.object(
@@ -826,9 +840,25 @@ class TestSDPAForward:
                 return_value=mx.zeros((_BATCH, _SEQ_LEN, _N_HEADS * _HEAD_DIM)),
             ),
         ):
-            sdpa_forward(inner, x, ctx, cache, layer_idx=1)
+            unregistered = SimpleNamespace(
+                n_heads=_N_HEADS,
+                n_kv_heads=actual_kv_heads,
+                o_proj=lambda out: out,
+            )
+            with pytest.raises(AttributeError, match="neither 'scale' nor 'sm_scale'"):
+                sdpa_forward(unregistered, x, ctx, cache, layer_idx=1)
+
+            sdpa_forward(
+                inner,
+                x,
+                ctx,
+                cache,
+                layer_idx=1,
+                attention_contract=attention_contract_for(inner),
+            )
 
         assert captured["num_kv_heads"] == actual_kv_heads
+        assert captured["scale"] == pytest.approx(_HEAD_DIM**-0.5)
 
     def test_gpt_oss_scale_and_sinks_reach_kernel(self) -> None:
         """GPT-OSS exposes ``sm_scale`` and per-head attention sinks."""
