@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import mlx.core as mx
-from safetensors import safe_open
 from vllm.lora.peft_helper import PEFTHelper
 from vllm.lora.utils import parse_fine_tuned_lora_name
 
@@ -57,8 +56,10 @@ def load_peft_adapter(
     helper = PEFTHelper.from_local_dir(str(adapter_path), max_position_embeddings)
     if lora_config is not None:
         helper.validate_legal(lora_config)
-    with safe_open(str(safetensors_path), framework="np") as f:
-        raw = {k: mx.array(f.get_tensor(k)) for k in f.keys()}
+    raw = mx.load(str(safetensors_path))
+    # Preserve eager loading: later in-place adapter updates must not change
+    # tensors already returned to the adapter manager.
+    mx.eval(raw)
 
     pairs: dict[str, dict[str, mx.array]] = {}
     for name, tensor in raw.items():
