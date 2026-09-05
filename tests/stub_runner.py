@@ -10,7 +10,7 @@ from typing import Any
 import mlx.core as mx
 
 import vllm_metal.v1.model_runner as mr
-from vllm_metal.attention.runtime.families.gdn import build_gdn_hybrid_plan
+from vllm_metal.attention.runtime.factory import build_hybrid_runtime_plan
 from vllm_metal.attention.runtime.hybrid_plan import (
     ATTENTION_LAYER,
     STATE_LAYER,
@@ -32,13 +32,15 @@ from vllm_metal.v1.structured_output import MetalStructuredOutputApplier
 def make_stub_runner(
     *,
     model_args: dict[str, Any] | None = None,
+    is_hybrid: bool = False,
     **attrs: Any,
 ) -> mr.MetalModelRunner:
     """Create a ``MetalModelRunner`` stub without running ``__init__``.
 
     Sets sensible defaults for all internal attributes.  ``_vocab_size``
     is derived from ``model_args["vocab_size"]`` automatically — never
-    set it separately.  Pass keyword arguments to override any attribute.
+    set it separately.  ``is_hybrid`` lands on the default ``model_config``.
+    Pass keyword arguments to override any attribute.
     """
     runner = mr.MetalModelRunner.__new__(mr.MetalModelRunner)
 
@@ -58,7 +60,10 @@ def make_stub_runner(
             mamba_cache_mode="none",
         ),
         "model_config": SimpleNamespace(
-            runner_type="generate", get_head_size=lambda: 128, max_model_len=2048
+            runner_type="generate",
+            get_head_size=lambda: 128,
+            max_model_len=2048,
+            is_hybrid=is_hybrid,
         ),
         "model": object(),
         "tokenizer": None,
@@ -218,9 +223,9 @@ def make_gemma4_mixed_mha_runner(
     )
 
 
-# Production family policy, resolved through the public builder from the
+# Production family policy, resolved through the family table from the
 # smallest valid hybrid layout so tests cannot drift from what production installs.
-_GDN_FAMILY_SPEC = build_gdn_hybrid_plan(
+_GDN_FAMILY_SPEC = build_hybrid_runtime_plan(
     {
         "full_attention_interval": 2,
         "linear_num_key_heads": 1,
