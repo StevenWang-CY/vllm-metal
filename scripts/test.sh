@@ -30,7 +30,7 @@ run_smoke_test() {
   # 2. Wait for the server to be ready
   echo "Waiting for vLLM to start..."
   local health_url="http://localhost:8000/health"
-  if ! curl --retry 30 --retry-delay 10 --retry-all-errors -s "$health_url" > /dev/null; then
+  if ! curl --retry 30 --retry-delay 10 --retry-all-errors -fs "$health_url" > /dev/null; then
     echo "vLLM failed to start."
     kill $vllm_pid
     exit 1
