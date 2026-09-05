@@ -361,7 +361,7 @@ def prepare_sdpa_qkv(
             values = keys
         else:
             keys, values = shared_kv
-        q_norm = _named_norm(inner, "q_norm", "query_layernorm")
+        q_norm = _named_norm(inner, "q_norm", "query_layernorm", "q_layernorm")
         if norm_placement is QKNormPlacement.BEFORE_ROPE:
             queries, keys = _apply_qk_norms(queries, keys, q_norm)
         queries = queries.transpose(0, 2, 1, 3)
@@ -387,8 +387,8 @@ def prepare_sdpa_qkv(
                 values = keys
 
         # Per-head RMSNorm (Qwen3, Qwen3.5, Gemma4, Phi3/Phi4 when present).
-        q_norm = _named_norm(inner, "q_norm", "query_layernorm")
-        k_norm = _named_norm(inner, "k_norm", "key_layernorm")
+        q_norm = _named_norm(inner, "q_norm", "query_layernorm", "q_layernorm")
+        k_norm = _named_norm(inner, "k_norm", "key_layernorm", "k_layernorm")
         if norm_placement is QKNormPlacement.BEFORE_ROPE:
             queries, keys = _apply_qk_norms(queries, keys, q_norm, k_norm)
         if hasattr(inner, "v_norm"):
