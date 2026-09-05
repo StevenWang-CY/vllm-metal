@@ -94,6 +94,7 @@ Llama-3.2-1B-Instruct, and Mistral-7B-Instruct-v0.3 Q8_0
 | Llama 3 | ✅ | GQA (paged) | ✅ | `mlx-community/Meta-Llama-3.1-8B-Instruct-4bit` |
 | Mistral-7B | ✅ | GQA (paged) | ✅ | `mlx-community/Mistral-7B-Instruct-v0.3-4bit` |
 | Mistral-Small-24B | 🔵 | GQA (paged) | ✅ | `mlx-community/Mistral-Small-24B-Instruct-2501-4bit` |
+| StableLM 2 | ✅ | MHA + partial RoPE (paged) | ✅ | `mlx-community/stablelm-2-zephyr-1_6b-4bit` |
 | GPT-OSS | 🔵 | Sink attention (paged) | ✅ | `openai/gpt-oss-20b` |
 | GLM-4.5 | 🟡 | MLA (paged latent cache, MLX SDPA — no Metal kernel) | 🟡 | — |
 | MiniCPM3-4B | ✅ | MLA (paged latent cache) | ✅ | `mlx-community/MiniCPM3-4B-4bit` |
@@ -108,4 +109,4 @@ Llama-3.2-1B-Instruct, and Mistral-7B-Instruct-v0.3 Q8_0
 | Granite 3.3 | 🔵 | GQA (paged) | ✅ | `mlx-community/granite-3.3-8b-instruct-4bit` |
 | EXAONE 4.0 | 🔵 | GQA (paged) | ✅ | `mlx-community/exaone-4.0-1.2b-4bit` |
 | Laguna | ✅  | GQA (paged) | ✅ | `poolside/Laguna-XS-2.1-NVFP4-mlx` |
-| Hunyuan (dense) | 🔵 | GQA + QK norm (paged) | ✅ | `mlx-community/Hunyuan-1.8B-Instruct-4bit` |
+| Hunyuan (dense) | ✅ | GQA + QK norm (paged) | ✅ | `mlx-community/Hunyuan-1.8B-Instruct-4bit` |

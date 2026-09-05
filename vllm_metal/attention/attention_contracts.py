@@ -17,6 +17,7 @@ class AttentionContract:
     """Architecture-specific behavior consumed by the paged SDPA path."""
 
     qk_norm_placement: QKNormPlacement = QKNormPlacement.BEFORE_ROPE
+    derive_scale_from_query: bool = False
 
 
 DEFAULT_ATTENTION_CONTRACT = AttentionContract()
@@ -24,6 +25,7 @@ _ATTENTION_CONTRACTS: dict[str, AttentionContract] = {
     "mlx_lm.models.hunyuan_v1_dense": AttentionContract(
         qk_norm_placement=QKNormPlacement.AFTER_ROPE
     ),
+    "mlx_lm.models.stablelm": AttentionContract(derive_scale_from_query=True),
 }
 
 
