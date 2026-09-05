@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 from vllm.lora.layers import LoRAMapping
 from vllm.sampling_params import SamplingParams
 
@@ -255,8 +256,8 @@ def test_linear_wrapper_call_with_active_lora_changes_output() -> None:
 # PEFT loader (round-trip through a tmp safetensors file)
 
 
-def _write_peft_adapter(tmp_path: Path) -> Path:
-    from safetensors.numpy import save_file
+def _write_peft_adapter(tmp_path: Path, *, dtype: torch.dtype = torch.float32) -> Path:
+    from safetensors.torch import save_file
 
     config = {
         "peft_type": "LORA",
@@ -267,8 +268,8 @@ def _write_peft_adapter(tmp_path: Path) -> Path:
         "use_rslora": False,
     }
     (tmp_path / "adapter_config.json").write_text(json.dumps(config))
-    a = np.arange(6, dtype=np.float32).reshape(2, 3)
-    b = np.arange(8, dtype=np.float32).reshape(4, 2)
+    a = torch.arange(6, dtype=dtype).reshape(2, 3)
+    b = torch.arange(8, dtype=dtype).reshape(4, 2)
     save_file(
         {
             "base_model.model.layers.0.self_attn.q_proj.lora_A.weight": a,
@@ -279,12 +280,19 @@ def _write_peft_adapter(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def test_peft_loader_normalizes_module_name_and_keeps_orientation(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    "torch_dtype,mlx_dtype",
+    [
+        (torch.float32, mx.float32),
+        (torch.float16, mx.float16),
+        (torch.bfloat16, mx.bfloat16),
+    ],
+    ids=["float32", "float16", "bfloat16"],
+)
+def test_peft_loader_normalizes_module_name_and_preserves_weights(
+    tmp_path: Path, torch_dtype: torch.dtype, mlx_dtype: mx.Dtype
 ) -> None:
-    pytest.importorskip("safetensors.numpy")
-
-    adapter_dir = _write_peft_adapter(tmp_path)
+    adapter_dir = _write_peft_adapter(tmp_path, dtype=torch_dtype)
     loaded = peft_loader_mod.load_peft_adapter(adapter_dir, lora_id=1)
 
     assert loaded.lora_id == 1
@@ -292,9 +300,38 @@ def test_peft_loader_normalizes_module_name_and_keeps_orientation(
     assert "layers.0.self_attn.q_proj" in loaded.weights
 
     weights = loaded.weights["layers.0.self_attn.q_proj"]
-    assert weights.lora_a.shape == (2, 3)
-    assert weights.lora_b.shape == (4, 2)
+    assert weights.lora_a.dtype == mlx_dtype
+    assert weights.lora_b.dtype == mlx_dtype
+    np.testing.assert_array_equal(
+        np.array(weights.lora_a.astype(mx.float32)), np.arange(6).reshape(2, 3)
+    )
+    np.testing.assert_array_equal(
+        np.array(weights.lora_b.astype(mx.float32)), np.arange(8).reshape(4, 2)
+    )
     assert weights.scaling == pytest.approx(4.0)
+
+
+def test_peft_loader_materializes_weights_before_return(tmp_path: Path) -> None:
+    from safetensors.torch import save
+
+    adapter_dir = _write_peft_adapter(tmp_path)
+    loaded = peft_loader_mod.load_peft_adapter(adapter_dir, lora_id=1)
+    replacement = save(
+        {
+            "base_model.model.layers.0.self_attn.q_proj.lora_A.weight": torch.zeros(
+                2, 3
+            ),
+            "base_model.model.layers.0.self_attn.q_proj.lora_B.weight": torch.zeros(
+                4, 2
+            ),
+        }
+    )
+    # Overwrite the same file: save_file atomically replaces it on some versions.
+    (adapter_dir / "adapter_model.safetensors").write_bytes(replacement)
+
+    weights = loaded.weights["layers.0.self_attn.q_proj"]
+    np.testing.assert_array_equal(np.array(weights.lora_a), np.arange(6).reshape(2, 3))
+    np.testing.assert_array_equal(np.array(weights.lora_b), np.arange(8).reshape(4, 2))
 
 
 @pytest.mark.parametrize(
