@@ -147,11 +147,12 @@ main() {
   setup_dev_env
 
   if [ "$(uname)" == "Darwin" ]; then
-    # Build the native artifacts (.so + .metallib) into the package tree before
-    # install.sh's `uv pip install .`, so the wheel bundles them (maturin
-    # `include`) and CI exercises the prebuilt path users get, like release.sh.
+    # Export the deployment target in this shell for the wheel build below.
     ensure_metal_toolchain
-    build_native_artifacts
+    # install.sh builds the native artifacts before the wheel check below.
+    installs
+    # shellcheck source=/dev/null
+    source .venv-vllm-metal/bin/activate
 
     # Shift-left the release wheel guard. The pytest run below imports the source
     # tree, which shadows the installed wheel, so a maturin `include` regression
@@ -166,10 +167,6 @@ main() {
       exit 1
     fi
     verify_wheel_artifacts "${wheels[0]}"
-
-    installs
-    # shellcheck source=/dev/null
-    source .venv-vllm-metal/bin/activate
 
     section "Verifying package import"
     python -c "import vllm_metal; print('vllm_metal imported successfully')"
