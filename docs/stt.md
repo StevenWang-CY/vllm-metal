@@ -74,7 +74,7 @@ Transcribe audio to text.
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `file` | file | required | Audio file (wav, mp3, m4a, etc.) |
-| `model` | string | `"whisper"` | Model identifier |
+| `model` | string | First served model name | Optional model name from `/v1/models`, including `--served-model-name` aliases. |
 | `language` | string | `null` | ISO 639-1 language code (e.g. `en`, `zh`) |
 | `prompt` | string | `null` | Guide transcription (e.g. proper nouns) |
 | `response_format` | string | `"json"` | `json`, `text`, or `verbose_json` |
