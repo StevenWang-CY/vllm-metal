@@ -1263,8 +1263,9 @@ class TestMetalPlatform:
         finally:
             reset_config()
 
+    @pytest.mark.parametrize("model_type", ["nemotron_h", "granitemoehybrid"])
     def test_check_and_update_config_downgrades_prefix_caching_for_slot_keyed_families(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, model_type: str
     ) -> None:
         self._patch_stt_resolution(monkeypatch, is_stt=False)
         reset_config()
@@ -1277,7 +1278,7 @@ class TestMetalPlatform:
                     mamba_cache_mode="align",
                     mamba_ssm_cache_dtype="float32",
                 ),
-                model_type="nemotron_h",
+                model_type=model_type,
             )
             vllm_config.cache_config.mamba_block_size = 16
             MetalPlatform.check_and_update_config(vllm_config)

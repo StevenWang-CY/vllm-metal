@@ -41,4 +41,7 @@ _ATTENTION_CONTRACTS: dict[str, AttentionContract] = {
 
 def attention_contract_for(module: object) -> AttentionContract:
     """Return the model's attention contract or the standard default."""
+    if type(module).__module__ == "mlx_lm.models.granitemoehybrid":
+        # Granite selects RoPE or position-free attention from the checkpoint.
+        return AttentionContract(use_rope=module.rope is not None)
     return _ATTENTION_CONTRACTS.get(type(module).__module__, DEFAULT_ATTENTION_CONTRACT)

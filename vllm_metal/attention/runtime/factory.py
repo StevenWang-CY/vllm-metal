@@ -14,6 +14,11 @@ from vllm_metal.attention.runtime.families.gdn import (
     GDN_MODEL_TYPES,
     build_gdn_hybrid_plan,
 )
+from vllm_metal.attention.runtime.families.granite import (
+    GRANITE_FAMILY,
+    GRANITE_MODEL_TYPES,
+    build_granite_hybrid_plan,
+)
 from vllm_metal.attention.runtime.families.nemotron_h import (
     NEMOTRON_H_FAMILY,
     NEMOTRON_H_MODEL_TYPES,
@@ -48,6 +53,11 @@ _STATE_FAMILY_PLAN_BUILDERS = (
         model_types=NEMOTRON_H_MODEL_TYPES,
         family=NEMOTRON_H_FAMILY,
         build=build_nemotron_h_hybrid_plan,
+    ),
+    StateFamilyPlanBuilder(
+        model_types=GRANITE_MODEL_TYPES,
+        family=GRANITE_FAMILY,
+        build=build_granite_hybrid_plan,
     ),
     StateFamilyPlanBuilder(
         model_types=SHORTCONV_MODEL_TYPES,
