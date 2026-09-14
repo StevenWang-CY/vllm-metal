@@ -9,6 +9,8 @@ import numpy as np
 import pytest
 import torch
 
+os.environ["MLX_ENABLE_TF32"] = "0"  # Keep FP32 parity checks strict on M5.
+
 
 def _get_test_seed() -> int:
     """Return the deterministic seed used across tests.
