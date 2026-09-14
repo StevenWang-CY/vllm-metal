@@ -39,61 +39,25 @@ def build_granite_hybrid_plan(
     state_dtypes: tuple[torch.dtype, ...],
 ) -> HybridRuntimePlan:
     """Resolve Granite's explicit layer types and mlx-lm Mamba-2 dimensions."""
-    dimension_names = (
-        "mamba_n_heads",
-        "mamba_d_head",
-        "mamba_d_state",
-        "mamba_n_groups",
-        "mamba_d_conv",
-    )
-    try:
-        layer_types = tuple(model_args["layer_types"])
-        dims = {name: model_args[name] for name in dimension_names}
-    except KeyError as exc:
-        raise ValueError(
-            f"Granite hybrid model args are missing required {exc.args[0]!r}."
-        ) from exc
-
-    if len(layer_types) != num_layers:
-        raise ValueError(
-            f"Granite hybrid layer_types has {len(layer_types)} entries, "
-            f"but num_layers={num_layers}."
-        )
-    if set(layer_types) != {"mamba", "attention"}:
-        raise ValueError(
-            "Granite hybrid layer_types must contain both 'mamba' and "
-            f"'attention' and no other layer types, got {layer_types!r}."
-        )
-    invalid = [
-        f"{name}={value!r}"
-        for name, value in dims.items()
-        if type(value) is not int or value <= 0
-    ]
-    if invalid:
-        raise ValueError(
-            "Granite hybrid state dimensions must be positive integers; "
-            f"invalid {', '.join(invalid)}."
-        )
-    if dims["mamba_n_heads"] % dims["mamba_n_groups"]:
-        raise ValueError(
-            "Granite hybrid mamba_n_heads must be divisible by mamba_n_groups."
-        )
+    num_heads = model_args["mamba_n_heads"]
+    head_dim = model_args["mamba_d_head"]
+    state_size = model_args["mamba_d_state"]
+    n_groups = model_args["mamba_n_groups"]
 
     return HybridRuntimePlan(
         layers=HybridLayerPlan(
             layer_roles=tuple(
                 STATE_LAYER if kind == "mamba" else ATTENTION_LAYER
-                for kind in layer_types
+                for kind in model_args["layer_types"]
             )
         ),
         family=GRANITE_FAMILY,
         geometry=RecurrentStateGeometry(
-            conv_kernel_dim=dims["mamba_d_conv"],
-            conv_dim=dims["mamba_n_heads"] * dims["mamba_d_head"]
-            + 2 * dims["mamba_n_groups"] * dims["mamba_d_state"],
-            num_v_heads=dims["mamba_n_heads"],
-            value_head_dim=dims["mamba_d_head"],
-            key_head_dim=dims["mamba_d_state"],
+            conv_kernel_dim=model_args["mamba_d_conv"],
+            conv_dim=num_heads * head_dim + 2 * n_groups * state_size,
+            num_v_heads=num_heads,
+            value_head_dim=head_dim,
+            key_head_dim=state_size,
         ),
         state_dtypes=state_dtypes,
     )

@@ -88,32 +88,6 @@ def test_granite_plan_matches_mlx_lm_state_and_upstream_spec() -> None:
     assert spec.mamba_type == MambaAttentionBackendEnum.MAMBA2
 
 
-@pytest.mark.parametrize(
-    ("overrides", "message"),
-    [
-        ({"layer_types": ["mamba", "attention"]}, "num_layers=4"),
-        ({"layer_types": ["mamba"] * 4}, "both 'mamba' and 'attention'"),
-        ({"layer_types": ["attention"] * 4}, "both 'mamba' and 'attention'"),
-        ({"layer_types": ["mamba", "attention", "mlp", "attention"]}, "layer_types"),
-        ({"mamba_n_groups": 3}, "mamba_n_groups"),
-        ({"mamba_d_state": 0}, "mamba_d_state=0"),
-        ({"mamba_d_conv": None}, "mamba_d_conv=None"),
-        ({"mamba_n_heads": True}, "mamba_n_heads=True"),
-    ],
-)
-def test_granite_rejects_invalid_topology_or_state_dimensions(overrides, message):
-    args = {**asdict(_model_args()), **overrides}
-    with pytest.raises(ValueError, match=message):
-        build_hybrid_runtime_plan(args, 4, (torch.float32, torch.float32))
-
-
-def test_granite_requires_named_state_dimensions() -> None:
-    args = asdict(_model_args())
-    del args["mamba_d_head"]
-    with pytest.raises(ValueError, match="missing required 'mamba_d_head'"):
-        build_hybrid_runtime_plan(args, 4, (torch.float32, torch.float32))
-
-
 @pytest.mark.parametrize("moe", [False, True], ids=["dense", "moe"])
 @pytest.mark.parametrize("rope", [False, True], ids=["nope", "rope"])
 def test_granite_paged_requests_match_mlx_lm_through_slot_reuse(moe, rope) -> None:
