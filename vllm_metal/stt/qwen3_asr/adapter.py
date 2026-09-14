@@ -81,7 +81,7 @@ class Qwen3ASRRuntimeAdapter(STTRuntimeAdapter):
             if t == asr_text_token:
                 start = i + 1
 
-        if start < 0 or start >= len(tokens):
+        if start < 0:
             return tokens
 
         end = len(tokens)

@@ -698,6 +698,28 @@ class TestQwen3ASRRuntimeAdapterDispatch:
 
         assert runner._pending_output.sampled_token_ids == [[200, 151643]]
 
+    @pytest.mark.parametrize("eos_token", [151643, 151645])
+    def test_runner_preserves_empty_transcript(self, eos_token: int) -> None:
+        adapter = _make_qwen3_runtime_adapter()
+        tokenizer = adapter.transcriber.tokenizer
+        tokenizer.eos_token_id = 151645
+        # No speech: language metadata, <asr_text>, then EOS. The transcriber
+        # consumes EOS before the adapter extracts the (empty) transcript.
+        token_stream = [100, 151674, eos_token]
+        logits = [
+            mx.where(mx.arange(151675) == token, 1.0, 0.0)[None, None, :]
+            for token in token_stream
+        ]
+        adapter.model.prefill.return_value = (logits[0], None)
+        adapter.model.decode_step.side_effect = [(row, None) for row in logits[1:]]
+        adapter._transcriber = Qwen3ASRTranscriber(adapter.model, tokenizer=tokenizer)
+        runner = _StubRunner(adapter)
+        request = _make_new_req(mm_features=_make_valid_mm_features())
+
+        runner._execute_stt(_make_scheduler_output(new_reqs=[request]))
+
+        assert runner._pending_output.sampled_token_ids == [[151643]]
+
 
 class TestQwen3ASRUpstreamContract:
     """Tests for the upstream vLLM contract used by the Metal plugin."""
@@ -753,9 +775,8 @@ class TestExtractASRTextTokens:
         assert result == []
 
     def test_asr_text_at_end(self) -> None:
-        """<asr_text> as last token → no content, return as-is."""
+        """<asr_text> as last token is an empty transcript."""
         adapter = _make_qwen3_runtime_adapter()
         tokens = [100, 200, 151674]
         result = adapter._extract_asr_text_tokens(tokens)
-        # start=3, which equals len(tokens), so returns original
-        assert result == [100, 200, 151674]
+        assert result == []
