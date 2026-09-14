@@ -50,21 +50,8 @@ Native multimodal support currently targets image-only vision-language requests 
 
 ## Text-Only Language Models
 
-`Automatic Prefix Cache` is the default behavior when you do not pass
-`--enable-prefix-caching`. Since
-[#283](https://github.com/vllm-project/vllm-metal/pull/283), unified paged-KV
-models reuse shared prefixes by default. As of vLLM 0.28.0, hybrid/Mamba
-models do too; hybrid GDN support remains experimental (`🔵`). Nemotron-H keeps
-one private Mamba-2 state slot per request, so prefix caching is downgraded to
-off for it; only the mlx-community Nemotron 3.5 Lightning MLX checkpoints
-load, since mlx-lm does not read `attention_head_dim` from the
-`nvidia/Nemotron-H-*` configs yet. These values describe default engine
-behavior, not exhaustive per-model benchmarking on Metal.
-
-Granite 4.0 hybrid models also keep one Mamba-2 state slot per request and
-automatically disable prefix caching. Use `--mamba-ssm-cache-dtype float32`
-for the recurrent state precision used by mlx-lm; `auto` uses the model dtype.
-Greedy choices can differ near tied logits on quantized checkpoints.
+Prefix caching is enabled by default where supported, as shown in the table
+below. It is currently disabled for Nemotron-H and Granite 4.0 hybrid models.
 
 HF AWQ checkpoints load through mlx-lm's `_transform_awq_weights` repack, with an
 entry-point preflight that normalizes AutoAWQ aliases (`w_bit`, `q_group_size`,
@@ -100,6 +87,7 @@ Llama-3.2-1B-Instruct, and Mistral-7B-Instruct-v0.3 Q8_0
 | Qwen3-Next | ✅ | Hybrid SDPA + GDN linear | 🔵 | `mlx-community/Qwen3-Next-80B-A3B-Instruct-8bit` |
 | LFM2 / LFM2.5 | ✅ | Hybrid SDPA + ShortConv | ✅ | `LiquidAI/LFM2.5-1.2B-Instruct` |
 | Nemotron-H (Nemotron 3.5 Lightning) | 🔵 | Hybrid SDPA + Mamba-2 (MoE) | ❌ | `mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-4bit` |
+| Granite 4.0-h-micro | 🔵 | Hybrid SDPA + Mamba-2 | ❌ | `mlx-community/granite-4.0-h-micro-4bit` |
 | Gemma 4 | ✅ | GQA + per-layer sliding window + YOCO | ✅ | `mlx-community/gemma-4-E2B-it` |
 | Gemma 3 | ✅ | GQA (paged) | ✅ | `mlx-community/gemma-3-1b-it-qat-4bit` |
 | Llama 3 | ✅ | GQA (paged) | ✅ | `mlx-community/Meta-Llama-3.1-8B-Instruct-4bit` |
@@ -119,7 +107,6 @@ Llama-3.2-1B-Instruct, and Mistral-7B-Instruct-v0.3 Q8_0
 | Yi-1.5-9B | ✅ | GQA (paged, LlamaForCausalLM) | ✅ | `mlx-community/Yi-1.5-9B-Chat-4bit` |
 | SmolLM3-3B | ✅ | GQA (paged) | ✅ | `mlx-community/SmolLM3-3B-4bit` |
 | Granite 3.3 | 🔵 | GQA (paged) | ✅ | `mlx-community/granite-3.3-8b-instruct-4bit` |
-| Granite 4.0-h-micro | 🔵 | Hybrid SDPA + Mamba-2 | ❌ | `mlx-community/granite-4.0-h-micro-4bit` |
 | EXAONE 4.0 | 🔵 | GQA (paged) | ✅ | `mlx-community/exaone-4.0-1.2b-4bit` |
 | Laguna | ✅  | GQA (paged) | ✅ | `poolside/Laguna-XS-2.1-NVFP4-mlx` |
 | Hunyuan (dense) | ✅ | GQA + QK norm (paged) | ✅ | `mlx-community/Hunyuan-1.8B-Instruct-4bit` |
