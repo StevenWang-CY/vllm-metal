@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Numeric regression coverage for OLMo 2/3 full-projection Q/K norms."""
+"""Numeric regression coverage for OLMo 2/3 and OLMoE full-projection Q/K norms."""
 
 import mlx.core as mx
 import pytest
 from mlx_lm.models.olmo2 import Attention as Olmo2Attention
 from mlx_lm.models.olmo2 import ModelArgs as Olmo2Args
 from mlx_lm.models.olmo3 import ModelArgs, Olmo3Attention
+from mlx_lm.models.olmoe import Attention as OlmoeAttention
+from mlx_lm.models.olmoe import ModelArgs as OlmoeArgs
 
 from vllm_metal.attention.attention_contracts import attention_contract_for
 from vllm_metal.attention.context import PagedAttentionContext
@@ -22,7 +24,7 @@ def _context(seq_len: int) -> PagedAttentionContext:
     )
 
 
-@pytest.mark.parametrize("model_type", ["olmo2", "olmo3"])
+@pytest.mark.parametrize("model_type", ["olmo2", "olmo3", "olmoe"])
 def test_olmo_qk_norm_is_applied_before_splitting_heads(model_type: str) -> None:
     config = {
         "model_type": model_type,
@@ -40,6 +42,11 @@ def test_olmo_qk_norm_is_applied_before_splitting_heads(model_type: str) -> None
     if model_type == "olmo2":
         args = Olmo2Args.from_dict(config)
         attention = Olmo2Attention(args)
+    elif model_type == "olmoe":
+        args = OlmoeArgs.from_dict(
+            {**config, "num_experts": 2, "num_experts_per_tok": 1}
+        )
+        attention = OlmoeAttention(args)
     else:
         args = ModelArgs.from_dict(
             {**config, "sliding_window": 8, "layer_types": ["full_attention"]}
