@@ -114,5 +114,6 @@ Llama-3.2-1B-Instruct, and Mistral-7B-Instruct-v0.3 Q8_0
 | OLMo 2 | ✅ | MHA + full-projection QK norm (paged) | ✅ | `allenai/OLMo-2-0425-1B-Instruct` |
 | OLMoE | ✅ | MHA + full-projection QK norm (paged) | ✅ | `mlx-community/OLMoE-1B-7B-0125-Instruct-4bit` |
 | OLMo 3 | 🔵 | MHA + per-layer sliding window (paged) | ✅ | `mlx-community/Olmo-3-7B-Instruct-4bit` |
+| Command R7B (Cohere2) | 🔵 | GQA + per-layer sliding window, NoPE global layers (paged) | ✅ | `mlx-community/c4ai-command-r7b-12-2024-4bit` |
 
 sliding-window attention (SWA) is not fully optimized.
