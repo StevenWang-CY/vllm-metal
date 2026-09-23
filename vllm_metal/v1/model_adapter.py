@@ -794,6 +794,8 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
         )
         if make_cache is None:
             return None
+        # TODO: Contribute a per-layer attention-layout API to mlx-lm, then
+        # read that metadata here instead of inferring it from KV cache classes.
         from mlx_lm.models.cache import KVCache, RotatingKVCache
 
         caches = make_cache()
