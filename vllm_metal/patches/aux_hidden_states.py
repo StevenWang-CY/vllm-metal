@@ -53,7 +53,17 @@ class _CaptureLayer(nn.Module):
 
 
 class AuxHiddenStateCapture:
-    """Observe selected layers of one model instance through its native forward."""
+    """Observe selected layers of one model instance through its native forward.
+
+    IDs follow hidden-state tuple indexing: 0 is the first decoder input
+    (including embedding scaling); i > 0 is decoder i-1's output before the
+    backbone's final norm. Requested order and duplicates are preserved.
+
+    Construct after loading and transforming the model. Calls on that model
+    must be serialized while this call-scoped bridge replaces selected layers.
+    Compile ``run`` together with the forward, returning both logits and
+    captures as graph outputs; wrapping an already-compiled forward is unsafe.
+    """
 
     def __init__(self, model: nn.Module, layer_ids: tuple[int, ...]) -> None:
         from mlx_lm.models.gemma4_text import DecoderLayer as GemmaLayer
@@ -66,7 +76,11 @@ class AuxHiddenStateCapture:
             GemmaLayer: _gemma_output,
         }
         layers = find_layers(model)
-        if not layer_ids or any(i < 0 or i > len(layers) for i in layer_ids):
+        if (
+            not layers
+            or not layer_ids
+            or any(type(i) is not int or i < 0 or i > len(layers) for i in layer_ids)
+        ):
             raise ValueError(f"Invalid auxiliary layer IDs: {layer_ids}")
         self.layer_ids = layer_ids
         self._layers = layers

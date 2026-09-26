@@ -2,6 +2,7 @@
 """The compatibility bridge must observe, not replace, native model execution."""
 
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
 import pytest
 from mlx.utils import tree_flatten
@@ -11,7 +12,7 @@ from vllm_metal.patches.aux_hidden_states import AuxHiddenStateCapture
 from vllm_metal.v1.model_adapter import DefaultModelAdapter
 
 
-def _model(family):
+def _model(family, *, head_dim=8):
     config = {
         "model_type": family,
         "hidden_size": 32,
@@ -19,7 +20,7 @@ def _model(family):
         "num_hidden_layers": 6,
         "num_attention_heads": 4,
         "num_key_value_heads": 2,
-        "head_dim": 8,
+        "head_dim": head_dim,
         "rms_norm_eps": 1e-6,
         "vocab_size": 128,
         "max_position_embeddings": 64,
@@ -31,7 +32,7 @@ def _model(family):
             model_type="gemma4_text",
             global_head_dim=16,
             num_global_key_value_heads=1,
-            num_kv_shared_layers=0,
+            num_kv_shared_layers=3 if family == "gemma4_text_shared" else 0,
             hidden_size_per_layer_input=0,
             sliding_window=4,
             layer_types=["sliding_attention", "sliding_attention", "full_attention"]
@@ -53,7 +54,9 @@ def _model(family):
     return model
 
 
-@pytest.mark.parametrize("family", ["llama", "qwen3", "gemma4_text", "gemma4"])
+@pytest.mark.parametrize(
+    "family", ["llama", "qwen3", "gemma4_text", "gemma4", "gemma4_text_shared"]
+)
 @pytest.mark.parametrize("compiled", [False, True])
 def test_capture_preserves_native_logits_and_layer_semantics(family, compiled):
     model = _model(family)
@@ -105,11 +108,13 @@ def test_capture_preserves_native_logits_and_layer_semantics(family, compiled):
     assert all(weights_before[k] is weights_after[k] for k in weights_before)
 
 
-@pytest.mark.parametrize("family", ["llama", "qwen3", "gemma4_text"])
+@pytest.mark.parametrize(
+    "family", ["llama", "qwen3", "gemma4_text", "gemma4_text_shared"]
+)
 def test_capture_preserves_cache_updates(family):
     model = _model(family)
     capture = AuxHiddenStateCapture(model, (1, 3, 5))
-    if family == "gemma4_text":
+    if family.startswith("gemma4_text"):
         native_cache, observed_cache = model.make_cache(), model.make_cache()
     else:
         from mlx_lm.models.cache import KVCache
@@ -177,3 +182,182 @@ def test_selective_logits_keep_all_auxiliary_rows_and_final_states_separate():
     )
     for a, b in zip(full.aux_hidden_states, selected.aux_hidden_states, strict=True):
         np.testing.assert_array_equal(np.array(a), np.array(b))
+
+
+@pytest.mark.parametrize("layer_ids", [(), (-1,), (7,), (1.5,), (True,), ("1",)])
+def test_invalid_layer_ids_are_rejected_before_forward(layer_ids):
+    with pytest.raises(ValueError, match="Invalid auxiliary layer IDs"):
+        AuxHiddenStateCapture(_model("qwen3"), layer_ids)
+
+
+def test_empty_backbone_is_rejected():
+    model = _model("qwen3")
+    model.model.layers = []
+    with pytest.raises(ValueError, match="Invalid auxiliary layer IDs"):
+        AuxHiddenStateCapture(model, (0,))
+
+
+def test_unknown_decoder_contract_is_rejected_without_mutating_model():
+    model = _model("qwen3")
+    model.model.layers[0] = nn.Identity()
+    layers = list(model.layers)
+    with pytest.raises(NotImplementedError, match="Auxiliary capture"):
+        AuxHiddenStateCapture(model, (1,))
+    assert all(a is b for a, b in zip(model.layers, layers, strict=True))
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+def test_bypassed_capture_fails_and_restores_layers(compiled):
+    model = _model("qwen3")
+    layers = list(model.layers)
+    capture = AuxHiddenStateCapture(model, (1,))
+    tokens = mx.array([[1, 2]])
+    if compiled:
+        forward = mx.compile(model)
+        mx.eval(forward(tokens))  # Warm the graph before installing observers.
+    else:
+        other = _model("qwen3")
+        forward = other
+    with pytest.raises(RuntimeError, match="Native forward bypassed"):
+        capture.run(forward, tokens)
+    assert all(a is b for a, b in zip(model.layers, layers, strict=True))
+
+
+def test_duplicate_ids_and_disabled_capture():
+    model = _model("qwen3")
+    tokens = mx.array([[1, 2, 3, 4, 5, 6]])
+    adapter = DefaultModelAdapter()
+    baseline = adapter.target_forward(model, tokens)
+    assert baseline.aux_hidden_states == ()
+    capture = AuxHiddenStateCapture(model, (2, 0, 2))
+    result = adapter.target_forward(model, tokens, aux_capture=capture)
+    mx.eval(baseline.logits, result.logits, result.aux_hidden_states)
+    np.testing.assert_array_equal(np.array(baseline.logits), np.array(result.logits))
+    assert all(h.shape == (6, 32) for h in result.aux_hidden_states)
+    np.testing.assert_array_equal(
+        np.array(result.aux_hidden_states[0]), np.array(result.aux_hidden_states[2])
+    )
+    np.testing.assert_array_equal(
+        np.array(result.aux_hidden_states[1]),
+        np.array(model.model.embed_tokens(tokens).reshape(6, 32)),
+    )
+
+
+def test_adapter_rejects_capture_with_missing_token_rows(monkeypatch):
+    model = _model("qwen3")
+    adapter = DefaultModelAdapter()
+    forward = adapter._target_forward
+
+    # A row-reducing optimization may preserve last-token logits while dropping
+    # features needed by a drafter. Never silently return misaligned features.
+    def last_token_only(model, tokens, **kwargs):
+        return forward(model, tokens[:, -1:], **kwargs)
+
+    monkeypatch.setattr(adapter, "_target_forward", last_token_only)
+    with pytest.raises(ValueError, match="one state per input token"):
+        adapter.target_forward(
+            model,
+            mx.array([[1, 2, 3]]),
+            aux_capture=AuxHiddenStateCapture(model, (0, 2)),
+        )
+
+
+@pytest.mark.parametrize("family", ["llama", "qwen3"])
+def test_capture_preserves_paged_writes_and_packed_row_order(family):
+    """Exercise the shared storage and real Metal kernels across a page boundary."""
+    import torch
+    from vllm.config import VllmConfig
+    from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
+
+    from vllm_metal.attention.context import (
+        OffsetCache,
+        clear_context,
+        get_context,
+        prepare_grouped,
+    )
+    from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
+
+    models = [_model(family, head_dim=64) for _ in range(2)]
+    models[1].load_weights(tree_flatten(models[0].parameters()))
+    names = tuple(f"layers.{i}.self_attn" for i in range(6))
+    spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=2, head_size=64, dtype=torch.float32
+    )
+    config = VllmConfig()
+    config.cache_config.kv_cache_layout = "LBNHC"
+    kv_config = get_kv_cache_config_from_groups(
+        config,
+        [KVCacheGroupSpec(layer_names=list(names), kv_cache_spec=spec)],
+        6 * 8 * spec.page_size_bytes,
+    )
+    kv_config.kv_cache_layout = "LBNHC"
+    runtimes = []
+    for model in models:
+        runtime = SDPAPagedAttentionRuntime(
+            num_layers=6,
+            num_kv_heads=2,
+            head_dim=64,
+            block_size=16,
+            dtype=mx.float32,
+        )
+        runtime.initialize_from_config(kv_config, names)
+        assert runtime.patch_model(model) == 6
+        runtimes.append(runtime)
+    capture = AuxHiddenStateCapture(models[1], (6, 0, 2))
+    adapter = DefaultModelAdapter()
+    # Non-contiguous pages; ragged prefill, reordered decode, then a mixed batch.
+    steps = [
+        ([], [([[3, 1]], 18, 0), ([[5]], 3, 0)], list(range(1, 22))),
+        ([([[5]], 3), ([[3, 1]], 18)], [], [22, 23]),
+        ([([[3, 1]], 19)], [([[5]], 2, 4)], [24, 25, 26]),
+    ]
+    written_slots = set()
+    try:
+        for decode, prefill, ids in steps:
+            tokens = mx.array([ids])
+            results = []
+            for index, (model, runtime) in enumerate(
+                zip(models, runtimes, strict=True)
+            ):
+                prepare_grouped(decode, prefill, (16,))
+                ctx = get_context()
+                written_slots.update(ctx.slot_mapping)
+                result = adapter.target_forward(
+                    model,
+                    tokens,
+                    cache=[OffsetCache(max(ctx.offsets)) for _ in range(6)],
+                    aux_capture=capture if index else None,
+                )
+                outputs = [result.logits, *result.aux_hidden_states]
+                runtime.extend_forward_eval_outputs(outputs)
+                mx.eval(outputs)
+                results.append(result)
+                clear_context()
+            plain, observed = results
+            np.testing.assert_array_equal(
+                np.array(plain.logits), np.array(observed.logits)
+            )
+            assert all(h.shape == (len(ids), 32) for h in observed.aux_hidden_states)
+            np.testing.assert_array_equal(
+                np.array(observed.aux_hidden_states[1]),
+                np.array(models[1].model.embed_tokens(tokens)[0]),
+            )
+            # The final pre-norm capture must project to every packed logit row.
+            projected = models[1].lm_head(
+                models[1].model.norm(observed.aux_hidden_states[0])
+            )
+            np.testing.assert_array_equal(
+                np.array(projected), np.array(observed.logits[0])
+            )
+            slots = mx.array(sorted(written_slots))
+            for name in ("key_caches", "value_caches"):
+                caches = [getattr(r.kv_cache, name) for r in runtimes]
+                for a, b in zip(*caches, strict=True):
+                    # Compare initialized slots only; unused pages have no contract.
+                    np.testing.assert_array_equal(
+                        np.array(a.reshape(-1, 2, 64)[slots]),
+                        np.array(b.reshape(-1, 2, 64)[slots]),
+                    )
+    finally:
+        clear_context()

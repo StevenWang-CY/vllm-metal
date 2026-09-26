@@ -311,6 +311,8 @@ class ModelAdapter(Protocol):
         valid only when :meth:`supports_selective_logits` returned ``True``.
         ``aux_capture`` returns selected pre-final-norm states in input-row
         order, independently of ``collect_hidden_states`` and ``logits_indices``.
+        Captures require the packed text path and one state per input token;
+        forward optimizations that drop hidden-state rows must be disabled.
         """
 
     def supports_selective_logits(self, model: Any) -> bool:
@@ -671,12 +673,13 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
         output, auxiliary = aux_capture.run(
             self._target_forward, model, input_ids, **kwargs
         )
-        return replace(
-            output,
-            aux_hidden_states=tuple(
-                self._flatten_target_hidden_states(h) for h in auxiliary
-            ),
-        )
+        auxiliary = tuple(self._flatten_target_hidden_states(h) for h in auxiliary)
+        if any(h.shape[0] != input_ids.size for h in auxiliary):
+            raise ValueError(
+                "Auxiliary capture requires one state per input token; "
+                "disable forward optimizations that drop hidden-state rows."
+            )
+        return replace(output, aux_hidden_states=auxiliary)
 
     def _target_forward(
         self,
