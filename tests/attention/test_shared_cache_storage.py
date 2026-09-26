@@ -186,7 +186,6 @@ def test_budget_above_buffer_limit_uses_shared_regions(monkeypatch):
         is_hybrid=True,
         scheduler_memory_reporting_mode=lambda: "paged_attention_layout_budget",
         profile_run=lambda: 0,
-        draft_scratch_reserve_bytes=lambda: 0,
     )
     planner = WorkerCachePlanner(
         SimpleNamespace(

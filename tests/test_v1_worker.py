@@ -209,7 +209,6 @@ class TestWorkerRunnerBoundaryDelegation:
                 return_value="paged_attention_layout_budget"
             ),
             profile_run=MagicMock(return_value=overhead),
-            draft_scratch_reserve_bytes=MagicMock(return_value=0),
         )
         worker = _make_worker(model_runner)
         worker.cache_config.gpu_memory_utilization = gpu_memory_utilization
@@ -295,7 +294,6 @@ class TestPagedAttentionPlanDiagnostics:
     def test_oom_mitigation_names_gpu_memory_utilization(self, monkeypatch) -> None:
         runner = SimpleNamespace(
             is_hybrid=False,
-            draft_scratch_reserve_bytes=MagicMock(return_value=0),
         )
         planner = self._make_planner(runner, gpu_memory_utilization=0.15)
         monkeypatch.setattr(
@@ -319,7 +317,6 @@ class TestPagedAttentionPlanDiagnostics:
     def test_non_hybrid_oom_error_omits_gdn_reservation(self, monkeypatch) -> None:
         runner = SimpleNamespace(
             is_hybrid=False,
-            draft_scratch_reserve_bytes=MagicMock(return_value=0),
         )
         planner = self._make_planner(runner, gpu_memory_utilization=0.1)
         monkeypatch.setattr(

@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING, Literal
 import mlx.core as mx
 import torch
 from vllm.logger import init_logger
-from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -407,7 +406,7 @@ class ModelCachePolicy:
     def _draft_layer_specs(
         self, *, block_size: int, torch_dtype: torch.dtype
     ) -> dict[str, KVCacheSpec]:
-        """Scheduler-visible spec for the draft model's committed-KV group.
+        """Scheduler-visible spec for the draft model's KV-cache group.
 
         Draft models must be plain transformers (no sliding window / MLA /
         hybrid) -- enforced at startup by ``resolve_draft_dims`` -- so a
@@ -548,7 +547,7 @@ class ModelCachePolicy:
             )
 
     def _adopt_draft_scheduler_group(self, kv_cache_config: KVCacheConfig) -> None:
-        """Tell the drafter which scheduler KV group owns its committed KV.
+        """Pass the scheduler KV group and final context limit to the drafter.
 
         The draft model's own physical backend is already built by this
         point (``install_drafter``, called from ``determine_available_memory``
@@ -584,7 +583,9 @@ class ModelCachePolicy:
                 "draft KV-cache spec registered but no DraftModelProposer is "
                 f"installed (got {type(drafter).__name__})"
             )
-        drafter.adopt_committed_group(group_indices[0])
+        drafter.adopt_scheduler_group(
+            group_indices[0], self._runner.model_config.max_model_len
+        )
 
     def _scheduler_group_indices_for_layers(
         self,
@@ -645,41 +646,6 @@ class ModelCachePolicy:
         return (
             self._kv_factor() * block_size * dtype_size * self._kv_layer_size_sum()
             + self._draft_cache_block_size_bytes()
-        )
-
-    def draft_scratch_reserve_blocks(self) -> int:
-        """Blocks reserved for the draft model's speculative lookahead tail.
-
-        The committed portion of the draft's KV is a normal scheduler-owned
-        group (see ``_draft_layer_specs``), so the scheduler owns every block
-        id in ``[0, num_blocks)`` for it. The *speculative* tail -- positions
-        drafted ahead of a request's committed length, not yet verified --
-        has no scheduler concept (no group is ever "ahead" of committed
-        tokens), so it stays a small proposer-local reservation sized to the
-        worst case: every concurrently active request drafting
-        ``num_speculative_tokens`` positions at once. Zero without a draft
-        model. See ``DraftModelProposer``'s split of committed vs. scratch
-        block ids, and ``WorkerCachePlanner.setup_paged_attention`` for how
-        this over-provisions the draft's *physical* backend beyond the
-        scheduler-visible block count.
-        """
-        spec = self._runner.vllm_config.speculative_config
-        if self._runner._draft_dims is None or spec is None:
-            return 0
-        block_size = self._runner.cache_config.block_size
-        extra_per_req = cdiv(spec.num_speculative_tokens, block_size)
-        return self._runner.scheduler_config.max_num_seqs * extra_per_req
-
-    def draft_scratch_reserve_bytes(self) -> int:
-        """Bytes held out of the KV budget for the draft's scratch tail.
-
-        Subtracted before dividing by the (target + draft) combined
-        per-block cost, so ``num_blocks`` leaves this much headroom in the
-        draft's own physical pool without it being scheduler-visible or
-        counted against the target's budget.
-        """
-        return (
-            self.draft_scratch_reserve_blocks() * self._draft_cache_block_size_bytes()
         )
 
     def _draft_cache_block_size_bytes(self) -> int:
@@ -999,8 +965,7 @@ class WorkerCachePlanner:
             fraction,
             overhead,
         )
-        draft_scratch_bytes = self._worker.model_runner.draft_scratch_reserve_bytes()
-        kv_budget = base_kv_budget - draft_scratch_bytes
+        kv_budget = base_kv_budget
         return _PagedAttentionPlan(
             block_size=block_size,
             fraction=fraction,
