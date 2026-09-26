@@ -119,8 +119,8 @@ def test_capture_preserves_cache_updates(family):
     else:
         from mlx_lm.models.cache import KVCache
 
-        native_cache = [KVCache() for _ in model.layers]
-        observed_cache = [KVCache() for _ in model.layers]
+        native_cache = [KVCache() for _ in model.model.layers]
+        observed_cache = [KVCache() for _ in model.model.layers]
     for ids in ([[1, 2, 3, 4, 5, 6]], [[7]]):
         tokens = mx.array(ids)
         expected = model(tokens, cache=native_cache)
@@ -200,16 +200,16 @@ def test_empty_backbone_is_rejected():
 def test_unknown_decoder_contract_is_rejected_without_mutating_model():
     model = _model("qwen3")
     model.model.layers[0] = nn.Identity()
-    layers = list(model.layers)
+    layers = list(model.model.layers)
     with pytest.raises(NotImplementedError, match="Auxiliary capture"):
         AuxHiddenStateCapture(model, (1,))
-    assert all(a is b for a, b in zip(model.layers, layers, strict=True))
+    assert all(a is b for a, b in zip(model.model.layers, layers, strict=True))
 
 
 @pytest.mark.parametrize("compiled", [False, True])
 def test_bypassed_capture_fails_and_restores_layers(compiled):
     model = _model("qwen3")
-    layers = list(model.layers)
+    layers = list(model.model.layers)
     capture = AuxHiddenStateCapture(model, (1,))
     tokens = mx.array([[1, 2]])
     if compiled:
@@ -220,7 +220,7 @@ def test_bypassed_capture_fails_and_restores_layers(compiled):
         forward = other
     with pytest.raises(RuntimeError, match="Native forward bypassed"):
         capture.run(forward, tokens)
-    assert all(a is b for a, b in zip(model.layers, layers, strict=True))
+    assert all(a is b for a, b in zip(model.model.layers, layers, strict=True))
 
 
 def test_duplicate_ids_and_disabled_capture():
