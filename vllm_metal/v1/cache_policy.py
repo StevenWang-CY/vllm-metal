@@ -182,7 +182,6 @@ class _PagedAttentionPlan:
     model_memory: int
     overhead: int
     per_block_bytes: int
-    base_kv_budget: int
     kv_budget: int
     num_blocks: int
 
@@ -959,13 +958,12 @@ class WorkerCachePlanner:
         model_memory = self.get_model_memory_usage()
         per_block_bytes = self._worker.get_cache_block_size_bytes()
         usable_metal = int(metal_limit * fraction)
-        base_kv_budget = self.base_kv_budget_bytes(
+        kv_budget = self.base_kv_budget_bytes(
             metal_limit,
             model_memory,
             fraction,
             overhead,
         )
-        kv_budget = base_kv_budget
         return _PagedAttentionPlan(
             block_size=block_size,
             fraction=fraction,
@@ -974,7 +972,6 @@ class WorkerCachePlanner:
             model_memory=model_memory,
             overhead=overhead,
             per_block_bytes=per_block_bytes,
-            base_kv_budget=base_kv_budget,
             kv_budget=kv_budget,
             num_blocks=max(0, kv_budget // per_block_bytes),
         )

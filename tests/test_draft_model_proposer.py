@@ -18,6 +18,7 @@ from unittest.mock import Mock
 import mlx.core as mx
 import pytest
 from vllm.sampling_params import SamplingParams
+from vllm.utils.math_utils import cdiv
 
 from vllm_metal.attention.context import OffsetCache, get_context
 from vllm_metal.v1 import draft_model_proposer
@@ -170,7 +171,10 @@ def _prefills_context(
             block_ids=[
                 list(
                     range(
-                        (start_pos + len(token_ids) + num_speculative_tokens + 15) // 16
+                        cdiv(
+                            start_pos + len(token_ids) + num_speculative_tokens,
+                            BLOCK_SIZE,
+                        )
                     )
                 )
             ],

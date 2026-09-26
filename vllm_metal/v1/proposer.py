@@ -33,9 +33,8 @@ if TYPE_CHECKING:
 
 
 # Ingests at or below this size are submitted as expanded decode rows instead
-# of a prefill segment (see _ingest_and_draft_first). Covers the steady-state
-# K+1-token ingest for any practical num_speculative_tokens while keeping
-# full-prompt catch-up ingests on the tiled prefill kernel.
+# of a prefill segment (see _ingest_and_draft_first). Keeps small steady-state
+# ingests on decode and full-prompt catch-up on the tiled prefill kernel.
 _DECODE_INGEST_MAX_TOKENS = 16
 
 
@@ -101,12 +100,11 @@ class MetalProposer(Protocol):
         ...
 
     def release_requests(self, req_ids: set[str]) -> None:
-        """Release any per-request drafter state for these evicted/preempted ids.
+        """Clear per-request drafter state on eviction, preemption, or resume.
 
-        Called from the runner's lifecycle reconcile on eviction, preemption, and
-        resume. A proposer that pins a bounded per-request resource (draft cache
-        blocks) must release it here rather than hold it while the request waits;
-        a stateless proposer is a no-op.
+        The runner calls this before a request can reuse an ID or recompute
+        its prefix. Physical KV blocks remain scheduler-owned; a stateless
+        proposer is a no-op.
         """
         ...
 
