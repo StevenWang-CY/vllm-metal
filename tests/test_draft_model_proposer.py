@@ -98,12 +98,14 @@ def _proposer(
     model: _StubDraftModel,
     *,
     max_model_len: int = 4096,
+    min_speculative_tokens: int = 1,
     allow_deferred_zero_k_ingest: bool = False,
 ) -> DraftModelProposer:
     proposer = DraftModelProposer(
         model=model,
         block_size=BLOCK_SIZE,
         max_model_len=max_model_len,
+        min_speculative_tokens=min_speculative_tokens,
         num_layers=1,
         controller=SpeculativeDecodeController(),
         extract_logits=lambda output: output,

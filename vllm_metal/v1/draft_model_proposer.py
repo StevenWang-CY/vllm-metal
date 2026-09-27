@@ -59,6 +59,7 @@ import mlx.core as mx
 from mlx_lm import load as mlx_lm_load
 from vllm.logger import init_logger
 from vllm.v1.outputs import DraftTokenIds
+from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 
 from vllm_metal import envs
 from vllm_metal.attention.context import (
@@ -123,12 +124,17 @@ class DraftModelProposer:
         num_layers: int,
         controller: SpeculativeDecodeController,
         extract_logits: Callable[[Any], mx.array],
+        min_speculative_tokens: int = 1,
         merge_ingest_windows: bool = False,
         allow_deferred_zero_k_ingest: bool = False,
     ) -> None:
         self._model = model
         self._block_size = block_size
         self._max_model_len = max_model_len
+        self._min_speculative_tokens = min_speculative_tokens
+        # Keep diagnostics across preemption; finish/pruning clears them so
+        # a reused request ID starts a new logging lifetime.
+        self._context_limit_logged: set[str] = set()
         self._controller = controller
         self._extract_logits = extract_logits
         self._allow_deferred_zero_k_ingest = allow_deferred_zero_k_ingest
@@ -178,6 +184,7 @@ class DraftModelProposer:
         extract_logits: Callable[[Any], mx.array],
         num_blocks: int,
         max_model_len: int,
+        max_num_seqs: int,
         block_size: int,
         dtype: mx.Dtype,
         allow_deferred_zero_k_ingest: bool,
@@ -203,6 +210,13 @@ class DraftModelProposer:
             n_patched,
             num_blocks,
         )
+        min_speculative_tokens = speculative_config.num_speculative_tokens
+        schedule = speculative_config.num_speculative_tokens_per_batch_size
+        if schedule:
+            widths = build_dynamic_sd_schedule_lookup(
+                schedule, max_num_seqs, speculative_config.num_speculative_tokens
+            )
+            min_speculative_tokens = min((k for k in widths[1:] if k > 0), default=0)
         return cls(
             model=model,
             block_size=block_size,
@@ -210,6 +224,7 @@ class DraftModelProposer:
             num_layers=dims.num_layers,
             controller=controller,
             extract_logits=extract_logits,
+            min_speculative_tokens=min_speculative_tokens,
             # Mirror of the runner's `merge_verify_windows` structural
             # conditions, reduced to what can arise here: this proposer
             # patches drafts through `SDPAPagedAttentionRuntime`, so the
@@ -255,6 +270,7 @@ class DraftModelProposer:
                 "before the first speculative decode step"
             )
 
+        self._context_limit_logged.difference_update(ctx.finished_req_ids)
         self._prune_finished(ctx.request_states)
         if num_speculative_tokens <= 0 and self._allow_deferred_zero_k_ingest:
             # Remember where lazy K=0 catch-up must start without running MLX.
@@ -331,7 +347,8 @@ class DraftModelProposer:
         )
 
     def release_requests(self, req_ids: set[str]) -> None:
-        # Physical blocks belong to the scheduler; only validity tracking is local.
+        # Invalidate KV for recompute without repeating the context-cap log.
+        # Finished IDs and pruning reset that diagnostic separately.
         for req_id in req_ids:
             self._draft_seq_lens.pop(req_id, None)
             self._spec_kv_writes.pop(req_id, None)
@@ -339,6 +356,7 @@ class DraftModelProposer:
     # -- internals -----------------------------------------------------------
 
     def _prune_finished(self, request_states: Mapping[str, RequestState]) -> None:
+        self._context_limit_logged.intersection_update(request_states)
         for req_id in list(self._draft_seq_lens.keys()):
             if req_id not in request_states:
                 del self._draft_seq_lens[req_id]
@@ -353,20 +371,38 @@ class DraftModelProposer:
         # eligibility only here (greedy + non-intermediate prefill +
         # greedy-only sampling); ingest itself runs for every active row
         # regardless -- see module docstring.
-        drafting_req_ids = {
-            req_id
-            for req_id, state in self._controller.draft_eligible_requests(
-                ctx.decode_reqs,
-                ctx.decode_token_ids,
-                ctx.prefill_reqs,
-                ctx.prefill_result_modes,
-                ctx.request_states,
-            )
+        drafting_req_ids: set[str] = set()
+        for req_id, state in self._controller.draft_eligible_requests(
+            ctx.decode_reqs,
+            ctx.decode_token_ids,
+            ctx.prefill_reqs,
+            ctx.prefill_result_modes,
+            ctx.request_states,
+        ):
+            if num_speculative_tokens <= 0:
+                continue
             # Apply upstream's input-fit bound per request: K positions beyond
             # the target's computed suffix (the final token was just sampled).
-            if num_speculative_tokens > 0
-            and len(state.token_ids) - 1 + num_speculative_tokens <= self._max_model_len
-        }
+            input_len = len(state.token_ids) - 1
+            if input_len + num_speculative_tokens <= self._max_model_len:
+                drafting_req_ids.add(req_id)
+            elif (
+                self._min_speculative_tokens > 0
+                and input_len + self._min_speculative_tokens > self._max_model_len
+                and req_id not in self._context_limit_logged
+            ):
+                # A smaller dynamic K may still fit after a temporary skip.
+                # Report only when no configured positive width can fit again.
+                logger.info(
+                    "Draft-model context limit reached for request %r: "
+                    "input_tokens=%d, min_draft_tokens=%d, max_model_len=%d. "
+                    "Continuing with target-only decoding.",
+                    req_id,
+                    input_len,
+                    self._min_speculative_tokens,
+                    self._max_model_len,
+                )
+                self._context_limit_logged.add(req_id)
         plans: list[_DraftPlan] = []
         for req_id, state in ctx.decode_reqs:
             plan = self._make_decode_plan(

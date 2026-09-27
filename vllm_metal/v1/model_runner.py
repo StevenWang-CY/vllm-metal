@@ -1008,6 +1008,7 @@ class MetalModelRunner:
                 extract_logits=self._model_adapter.extract_logits,
                 num_blocks=num_blocks,
                 max_model_len=spec.draft_model_config.max_model_len,
+                max_num_seqs=self.scheduler_config.max_num_seqs,
                 block_size=block_size,
                 dtype=self.kv_cache_dtype,
                 allow_deferred_zero_k_ingest=allow_deferred_zero_k_ingest,

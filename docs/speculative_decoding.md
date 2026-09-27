@@ -67,6 +67,9 @@ Its committed KV and speculative lookahead share the Metal KV memory budget
 with the target. The scheduler allocates both; no separate draft scratch pool
 is reserved. Drafting stops when its write span would exceed the smaller of
 the draft model's context limit and the engine's final target context limit.
+When no configured positive draft width can fit, the engine logs the request
+and effective context limit once and continues with target-only decoding.
+Temporary dynamic-width skips and K=0 steps do not trigger this message.
 
 ### Example
 
