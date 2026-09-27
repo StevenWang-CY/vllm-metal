@@ -54,6 +54,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
+from weakref import WeakValueDictionary
 
 import mlx.core as mx
 from mlx_lm import load as mlx_lm_load
@@ -132,9 +133,12 @@ class DraftModelProposer:
         self._block_size = block_size
         self._max_model_len = max_model_len
         self._min_speculative_tokens = min_speculative_tokens
-        # Keep diagnostics across preemption; finish/pruning clears them so
-        # a reused request ID starts a new logging lifetime.
-        self._context_limit_logged: set[str] = set()
+        # RequestState survives preemption, but a reused ID gets a new state.
+        # Weak references also release completed requests when a cleanup-only
+        # scheduler step finishes them without calling propose().
+        self._context_limit_logged: WeakValueDictionary[str, RequestState] = (
+            WeakValueDictionary()
+        )
         self._controller = controller
         self._extract_logits = extract_logits
         self._allow_deferred_zero_k_ingest = allow_deferred_zero_k_ingest
@@ -270,7 +274,8 @@ class DraftModelProposer:
                 "before the first speculative decode step"
             )
 
-        self._context_limit_logged.difference_update(ctx.finished_req_ids)
+        for req_id in ctx.finished_req_ids:
+            self._context_limit_logged.pop(req_id, None)
         self._prune_finished(ctx.request_states)
         if num_speculative_tokens <= 0 and self._allow_deferred_zero_k_ingest:
             # Remember where lazy K=0 catch-up must start without running MLX.
@@ -356,7 +361,8 @@ class DraftModelProposer:
     # -- internals -----------------------------------------------------------
 
     def _prune_finished(self, request_states: Mapping[str, RequestState]) -> None:
-        self._context_limit_logged.intersection_update(request_states)
+        for req_id in set(self._context_limit_logged).difference(request_states):
+            self._context_limit_logged.pop(req_id, None)
         for req_id in list(self._draft_seq_lens.keys()):
             if req_id not in request_states:
                 del self._draft_seq_lens[req_id]
@@ -389,7 +395,7 @@ class DraftModelProposer:
             elif (
                 self._min_speculative_tokens > 0
                 and input_len + self._min_speculative_tokens > self._max_model_len
-                and req_id not in self._context_limit_logged
+                and self._context_limit_logged.get(req_id) is not state
             ):
                 # A smaller dynamic K may still fit after a temporary skip.
                 # Report only when no configured positive width can fit again.
@@ -402,7 +408,7 @@ class DraftModelProposer:
                     self._min_speculative_tokens,
                     self._max_model_len,
                 )
-                self._context_limit_logged.add(req_id)
+                self._context_limit_logged[req_id] = state
         plans: list[_DraftPlan] = []
         for req_id, state in ctx.decode_reqs:
             plan = self._make_decode_plan(

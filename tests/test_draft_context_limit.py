@@ -4,11 +4,13 @@
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
+from weakref import ref
 
 import mlx.core as mx
 import pytest
 from vllm import SamplingParams
 
+from tests.stub_runner import make_stub_runner
 from tests.test_draft_model_proposer import (
     _context,
     _prefills_context,
@@ -167,6 +169,30 @@ def test_log_survives_recompute_but_not_request_id_reuse(finish, info):
             is None
         )
     assert proposer.propose(ctx) is None
+    assert info.call_count == 2
+
+
+@pytest.mark.parametrize("keep_old_state", [False, True])
+def test_request_id_reuse_after_cleanup_without_a_proposal(keep_old_state, info):
+    proposer = _proposer(_StubDraftModel(), max_model_len=32, min_speculative_tokens=3)
+    old = _request_state(scheduler_block_ids=[0, 1], token_ids=list(range(31)))
+    assert (
+        proposer.propose(_context("r", old, {"r": old}, num_speculative_tokens=3))
+        is None
+    )
+    runner = make_stub_runner(_drafter=proposer, _request_states={"r": old})
+    # A zero-token cleanup step releases the old request without calling
+    # propose(), so its finished ID will not reach the next ProposeContext.
+    runner._reconcile_request_lifecycle({"r"})
+    if not keep_old_state:
+        old_ref = ref(old)
+        del old
+        assert old_ref() is None  # Diagnostics must not retain completed tokens.
+    new = _request_state(scheduler_block_ids=[0, 1], token_ids=list(range(31)))
+    assert (
+        proposer.propose(_context("r", new, {"r": new}, num_speculative_tokens=3))
+        is None
+    )
     assert info.call_count == 2
 
 
