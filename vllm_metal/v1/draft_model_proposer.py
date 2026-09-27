@@ -139,6 +139,7 @@ class DraftModelProposer:
         self._context_limit_logged: WeakValueDictionary[str, RequestState] = (
             WeakValueDictionary()
         )
+        self._num_context_limit_fallback_requests = 0
         self._controller = controller
         self._extract_logits = extract_logits
         self._allow_deferred_zero_k_ingest = allow_deferred_zero_k_ingest
@@ -252,6 +253,16 @@ class DraftModelProposer:
         self._scheduler_group_index = group_index
         # The engine may auto-fit the target limit after memory profiling.
         self._max_model_len = min(self._max_model_len, target_max_model_len)
+
+    def get_stats(self) -> dict[str, int]:
+        """Snapshot cumulative request fallbacks and the effective draft limits."""
+        return {
+            "num_context_limit_fallback_requests": (
+                self._num_context_limit_fallback_requests
+            ),
+            "min_draft_tokens": self._min_speculative_tokens,
+            "max_model_len": self._max_model_len,
+        }
 
     # -- MetalProposer protocol ---------------------------------------------
 
@@ -409,6 +420,7 @@ class DraftModelProposer:
                     self._max_model_len,
                 )
                 self._context_limit_logged[req_id] = state
+                self._num_context_limit_fallback_requests += 1
         plans: list[_DraftPlan] = []
         for req_id, state in ctx.decode_reqs:
             plan = self._make_decode_plan(

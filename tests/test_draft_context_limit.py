@@ -56,6 +56,7 @@ def test_smaller_final_target_limit_logs_once_and_bounds_ingest(prefill, info):
     drafts = proposer.propose(ctx)
     assert drafts is not None and len(drafts.draft_token_ids[0]) == 3
     info.assert_not_called()
+    assert proposer.get_stats()["num_context_limit_fallback_requests"] == 0
     for token in (9, 10, 11):
         state.token_ids.append(token)
         assert (
@@ -65,6 +66,7 @@ def test_smaller_final_target_limit_logs_once_and_bounds_ingest(prefill, info):
             is None
         )
     info.assert_called_once()
+    assert proposer.get_stats()["num_context_limit_fallback_requests"] == 1
     message = info.call_args.args[0] % info.call_args.args[1:]
     assert "request 'r'" in message
     assert "input_tokens=30, min_draft_tokens=3, max_model_len=32" in message
@@ -86,19 +88,23 @@ def test_dynamic_width_can_resume_after_temporary_context_skip(deferred, info):
     ctx = _context("r", state, {"r": state}, num_speculative_tokens=3)
     assert proposer.propose(ctx) is None
     info.assert_not_called()
+    assert proposer.get_stats()["num_context_limit_fallback_requests"] == 0
 
     state.token_ids.append(9)
     drafts = proposer.propose(replace(ctx, num_speculative_tokens=1))
     assert drafts is not None and len(drafts.draft_token_ids[0]) == 1
     info.assert_not_called()
+    assert proposer.get_stats()["num_context_limit_fallback_requests"] == 0
 
     state.token_ids.append(10)
     assert proposer.propose(replace(ctx, num_speculative_tokens=0)) is None
     info.assert_not_called()
+    assert proposer.get_stats()["num_context_limit_fallback_requests"] == 0
     # Now even K=1 cannot fit. Report it when drafting is requested again.
     assert proposer.propose(replace(ctx, num_speculative_tokens=1)) is None
     assert proposer.propose(replace(ctx, num_speculative_tokens=3)) is None
     info.assert_called_once()
+    assert proposer.get_stats()["num_context_limit_fallback_requests"] == 1
 
 
 def test_initial_prefill_fallback_is_per_request_and_keeps_other_rows_drafting(info):
@@ -118,8 +124,10 @@ def test_initial_prefill_fallback_is_per_request_and_keeps_other_rows_drafting(i
     assert model.input_lens == [9 + 31 + 32, 1, 1]
     assert {call.args[1] for call in info.call_args_list} == {"capped", "beyond"}
     assert info.call_count == 2
+    assert proposer.get_stats()["num_context_limit_fallback_requests"] == 2
     assert proposer.propose(ctx) is None
     assert info.call_count == 2
+    assert proposer.get_stats()["num_context_limit_fallback_requests"] == 2
 
 
 @pytest.mark.parametrize("mode", ["non_greedy", "no_sample", "intermediate"])
@@ -139,6 +147,7 @@ def test_other_eligibility_gates_do_not_log_context_fallback(mode, info):
         )
     assert proposer.propose(ctx) is None
     info.assert_not_called()
+    assert proposer.get_stats()["num_context_limit_fallback_requests"] == 0
 
 
 @pytest.mark.parametrize("finish", ["explicit", "pruned"])
@@ -151,6 +160,7 @@ def test_log_survives_recompute_but_not_request_id_reuse(finish, info):
     proposer.release_requests({"r"})
     assert proposer.propose(ctx) is None
     info.assert_called_once()
+    assert proposer.get_stats()["num_context_limit_fallback_requests"] == 1
 
     proposer.release_requests({"r"})
     if finish == "explicit":
@@ -170,6 +180,7 @@ def test_log_survives_recompute_but_not_request_id_reuse(finish, info):
         )
     assert proposer.propose(ctx) is None
     assert info.call_count == 2
+    assert proposer.get_stats()["num_context_limit_fallback_requests"] == 2
 
 
 @pytest.mark.parametrize("keep_old_state", [False, True])
@@ -194,6 +205,7 @@ def test_request_id_reuse_after_cleanup_without_a_proposal(keep_old_state, info)
         is None
     )
     assert info.call_count == 2
+    assert proposer.get_stats()["num_context_limit_fallback_requests"] == 2
 
 
 @pytest.mark.parametrize(
@@ -240,3 +252,4 @@ def test_build_uses_reachable_scheduler_widths(
         is None
     )
     assert info.call_count == int(logs)
+    assert proposer.get_stats()["num_context_limit_fallback_requests"] == int(logs)

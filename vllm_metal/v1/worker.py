@@ -333,6 +333,10 @@ class MetalWorker(WorkerBase):
         """
         return self.model_runner.supported_worker_tasks()
 
+    def get_draft_model_stats(self) -> dict[str, int] | None:
+        """Read draft-model counters through the engine's collective RPC API."""
+        return self.model_runner.get_draft_model_stats()
+
     def sleep(self, level: int = 1) -> None:
         """Enter sleep mode (not supported on Metal).
 

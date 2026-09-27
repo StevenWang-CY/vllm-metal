@@ -143,6 +143,10 @@ class STTModelRunner:
         """STT does not run speculative decoding."""
         return None
 
+    def get_draft_model_stats(self) -> dict[str, int] | None:
+        """STT has no draft model, so there are no stats to report."""
+        return None
+
     # ------------------------------------------------------------------
     # Execution (one-shot transcribe)
     # ------------------------------------------------------------------

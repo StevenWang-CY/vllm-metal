@@ -1028,6 +1028,11 @@ class MetalModelRunner:
                 "(supported: Gemma4 MTP, draft_model, ngram)."
             )
 
+    def get_draft_model_stats(self) -> dict[str, int] | None:
+        """Return ordinary draft-model statistics, or None for other methods."""
+        get_stats = getattr(self._drafter, "get_stats", None)
+        return get_stats() if callable(get_stats) else None
+
     def warm_up(self) -> None:
         """Warm up the model with a dummy forward pass.
 
