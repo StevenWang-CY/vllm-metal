@@ -13,13 +13,13 @@ import importlib.util
 import json
 import sys
 from dataclasses import fields
-from importlib.metadata import version
 from pathlib import Path
 
 import mlx.core as mx
 import numpy as np
 from mlx_lm import load
 
+from tools.attention_bench_utils import package_versions
 from vllm_metal.patches.aux_hidden_states import AuxHiddenStateCapture
 from vllm_metal.v1.dflash import load_dflash
 
@@ -151,7 +151,7 @@ def qualify(target_path: Path, draft_path: Path, reference_path: Path) -> dict:
         "native_source_sha256": hashlib.sha256(
             Path(load_dflash.__code__.co_filename).read_bytes()
         ).hexdigest(),
-        "versions": {name: version(name) for name in ("mlx", "mlx-lm", "numpy")},
+        "versions": package_versions("mlx", "mlx-lm", "numpy"),
         "capture_layer_ids": draft.config.capture_layer_ids,
         "draft_layers": draft.config.num_hidden_layers,
         "cases": rows,

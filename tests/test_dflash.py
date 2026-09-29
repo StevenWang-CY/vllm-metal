@@ -234,6 +234,8 @@ def test_config_preserves_capture_order_and_validates_target():
 
 
 def test_batched_one_token_drafts_use_contiguous_quantized_head_inputs():
+    # Only discriminates on a Metal GPU, where a strided input can select a
+    # different quantized kernel than a contiguous one.
     model = DFlashModel(_config())
     model.set_dtype(mx.bfloat16)
     embedding = nn.Embedding(64, 32)
@@ -256,6 +258,30 @@ def test_batched_one_token_drafts_use_contiguous_quantized_head_inputs():
 
 
 @pytest.mark.parametrize(
+    "dtype",
+    [mx.int8, mx.uint8, mx.int16, mx.uint16, mx.int32, mx.uint32, mx.int64, mx.uint64],
+)
+def test_anchor_integer_precision_does_not_limit_mask_or_vocabulary(dtype):
+    config = replace(_config(), vocab_size=151936, mask_token_id=151669)
+    embedding = nn.Embedding(3, config.hidden_size)
+
+    def embed(tokens):
+        assert mx.issubdtype(tokens.dtype, mx.integer)
+        assert tokens.tolist() == [[1, 151669, 151669], [2, 151669, 151669]]
+        # Use a small embedding table while checking the full target token IDs.
+        return embedding(mx.where(tokens == config.mask_token_id, 0, tokens))
+
+    logits = DFlashModel(config).draft_logits(
+        mx.array([1, 2], dtype=dtype),
+        [mx.zeros((2, 7, config.hidden_size))] * 3,
+        num_draft_tokens=2,
+        embed=embed,
+        project=lambda h: mx.zeros((*h.shape[:-1], config.vocab_size)),
+    )
+    assert logits.shape == (2, 2, config.vocab_size)
+
+
+@pytest.mark.parametrize(
     "anchors,width",
     [
         (mx.array([1]), 0),
@@ -263,6 +289,9 @@ def test_batched_one_token_drafts_use_contiguous_quantized_head_inputs():
         (mx.array([1]), True),
         (mx.array([-1]), 1),
         (mx.array([64]), 1),
+        (mx.array([2**32 + 1], dtype=mx.int64), 1),
+        (mx.array(np.array([2**63 + 1], dtype=np.uint64)), 1),
+        (mx.array([-(2**63)], dtype=mx.int64), 1),
         (mx.array([1.0]), 1),
         (mx.array([[1]]), 1),
         (mx.array([], dtype=mx.int32), 1),

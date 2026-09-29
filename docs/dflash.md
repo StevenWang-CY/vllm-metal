@@ -14,8 +14,9 @@ embedding and output projection; comparisons use that same target precision.
 ## Model contract
 
 - Checkpoint target layer IDs name zero-based decoder outputs before final
-  normalization. The loader translates `[1, 9, 17, 25, 33]` to the shared
-  capture bridge's `[2, 10, 18, 26, 34]`, preserving order.
+  normalization. `DFlashConfig.capture_layer_ids` translates
+  `[1, 9, 17, 25, 33]` to the shared capture bridge's `[2, 10, 18, 26, 34]`,
+  preserving order.
 - Each block attends to the complete committed context and every position
   within its own block. Proposal logits come from slots 1 onward.
 - The caller supplies the target projections and full-prefix features.

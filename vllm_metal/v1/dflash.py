@@ -339,12 +339,17 @@ class DFlashModel(nn.Module):
             or not mx.issubdtype(anchors.dtype, mx.integer)
         ):
             raise ValueError("DFlash anchors must be a nonempty integer vector")
-        if bool(mx.any((anchors < 0) | (anchors >= self.config.vocab_size))):
+        # Compare Python integers so a narrow anchor dtype cannot truncate the
+        # vocabulary bound. Reject wide out-of-range IDs before normalizing.
+        min_anchor = cast(int, anchors.min().item())
+        max_anchor = cast(int, anchors.max().item())
+        if min_anchor < 0 or max_anchor >= self.config.vocab_size:
             raise ValueError("DFlash anchor token is outside the target vocabulary")
+        anchors = anchors.astype(mx.int64)
         masks = mx.full(
             (anchors.shape[0], num_draft_tokens),
             self.config.mask_token_id,
-            dtype=anchors.dtype,
+            dtype=mx.int64,
         )
         inputs = mx.concatenate([anchors[:, None], masks], axis=1)
         hidden = self(embed(inputs), features, logits_start=1)
