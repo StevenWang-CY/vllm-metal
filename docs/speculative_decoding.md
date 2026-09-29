@@ -135,6 +135,10 @@ cache. Its benefit depends on repeated token spans in the request history.
 
 ## Benchmarking
 
+The experimental [DFlash checkpoint qualification](dflash.md) tool validates the
+trained block-forward contract before DFlash serving integration. DFlash is not
+one of the serving methods listed above.
+
 Use vLLM's benchmark CLI for serving workloads. For a reproducible Gemma4
 target-only versus MTP comparison, use the in-tree benchmark:
 
