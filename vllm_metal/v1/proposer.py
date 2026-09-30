@@ -81,6 +81,7 @@ class ProposeContext:
     # against absence from request_states (which the new request repopulates
     # under the same id).
     finished_req_ids: set[str]
+    target_aux_hidden_states: tuple[mx.array, ...] = ()
 
 
 class MetalProposer(Protocol):

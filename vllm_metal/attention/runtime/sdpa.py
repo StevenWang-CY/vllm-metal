@@ -135,3 +135,9 @@ class SDPAPagedAttentionRuntime(PagedAttentionRuntimeBase):
     @property
     def kv_cache(self) -> MetalPagedKVCache:
         return self._require_initialized("kv_cache")
+
+    @property
+    def storage(self) -> KVCacheStorage:
+        if self._storage is None:
+            raise RuntimeError("Shared KV storage has not been initialized")
+        return self._storage

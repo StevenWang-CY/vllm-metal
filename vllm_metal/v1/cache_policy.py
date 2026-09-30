@@ -378,6 +378,10 @@ class ModelCachePolicy:
         specs.update(
             self._draft_layer_specs(block_size=block_size, torch_dtype=torch_dtype)
         )
+        from vllm_metal.v1.dflash_proposer import DFlashProposer
+
+        if isinstance(self._runner._drafter, DFlashProposer):
+            specs.update(self._runner._drafter.kv_specs(block_size))
         return specs
 
     def _state_layer_spec(self, hybrid_plan: HybridRuntimePlan) -> MambaSpec:
@@ -562,6 +566,22 @@ class ModelCachePolicy:
         block_size = runtime.kv_group_block_sizes()[0]
         self.install_gemma4_mtp_kv_sharing(runtime, block_size=block_size)
         self._runner.install_paged_attention_runtime(runtime, block_size=block_size)
+        from vllm_metal.v1.dflash_proposer import DFlashProposer
+
+        drafter = self._runner._drafter
+        if isinstance(drafter, DFlashProposer):
+            groups = self._scheduler_group_indices_for_layers(
+                kv_cache_config, drafter.layer_names
+            )
+            if len(groups) != 1:
+                raise NotImplementedError(
+                    "DFlash layers must share one scheduler KV group"
+                )
+            drafter.bind_cache(
+                runtime.storage,
+                group_index=groups[0],
+                max_model_len=self._runner.model_config.max_model_len,
+            )
         self._runner.install_drafter(
             num_blocks=kv_cache_config.num_blocks, block_size=block_size
         )

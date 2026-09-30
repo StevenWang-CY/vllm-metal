@@ -120,6 +120,8 @@ from vllm_metal.v1.spec_decode import (
 from vllm_metal.v1.structured_output import MetalStructuredOutputApplier
 
 if TYPE_CHECKING:
+    from vllm_metal.patches.aux_hidden_states import AuxHiddenStateCapture
+
     # Kept out of the runtime import graph: draft_model_proposer.py pulls in
     # mlx_lm's model loader at module scope, which should only load when
     # draft_model speculative decoding is actually configured (see the lazy
@@ -341,6 +343,7 @@ class _PagedForwardState(NamedTuple):
     # ``_sample_paged_batch`` stashes each onto ``RequestState``.
     mm_prefill_deltas: dict[str, int]
     pooling_hidden_states: mx.array | None = None
+    target_aux_hidden_states: tuple[mx.array, ...] = ()
     # Every prefill row is an intermediate chunk and no decode rows exist:
     # the step samples nothing, regardless of whether the projection-free
     # forward was available (skip-sampling is decoupled from skip-projection
@@ -399,6 +402,7 @@ class MetalModelRunner:
         self._multimodal_adapter: MultimodalRuntimeAdapter | None = None
         self._gemma4_mtp_assistant: Gemma4MTPAssistantRuntime | None = None
         self._drafter: MetalProposer | None = None
+        self._aux_capture: AuxHiddenStateCapture | None = None
         # Resolved eagerly (config-only, no weights) so `ModelCachePolicy`
         # can size a scheduler-visible KV-cache group for the draft model
         # before `determine_available_memory()`/`get_kv_cache_spec()` run.
@@ -673,6 +677,15 @@ class MetalModelRunner:
         if self._is_pooling:
             self._model_lifecycle.install_pooling_backend()
 
+        spec = self.vllm_config.speculative_config
+        if spec is not None and spec.method == "dflash":
+            from vllm_metal.v1.dflash_proposer import DFlashProposer
+
+            # Load before memory profiling so draft weights count against the
+            # same device budget. Cache views bind after scheduler planning.
+            self._drafter = DFlashProposer.build(self)
+            self._aux_capture = self._drafter.target_capture(self._forward_model)
+
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self._lora.add_adapter(lora_request)
 
@@ -777,12 +790,16 @@ class MetalModelRunner:
         collect_hidden_states: bool = False,
         logits_indices: mx.array | None = None,
     ) -> TargetModelForwardOutput:
+        capture: dict[str, Any] = (
+            {"aux_capture": self._aux_capture} if self._aux_capture is not None else {}
+        )
         return self._model_adapter.target_forward(
             self._forward_model,
             input_ids,
             cache=cache,
             collect_hidden_states=collect_hidden_states,
             logits_indices=logits_indices,
+            **capture,
         )
 
     def _paged_logits_layout(
@@ -884,6 +901,17 @@ class MetalModelRunner:
         cache_before = mx.get_cache_memory()
         dummy_tokens = mx.zeros((1, warmup_len), dtype=mx.int32)
         mx.eval(*self._dummy_forward_outputs(dummy_tokens))
+        from vllm_metal.v1.dflash_proposer import DFlashProposer
+
+        if isinstance(self._drafter, DFlashProposer):
+            captured = self._target_forward(
+                dummy_tokens, logits_indices=self._profile_logits_indices(dummy_tokens)
+            )
+            mx.eval(captured.logits, *captured.aux_hidden_states)
+            self._drafter.profile(
+                captured.aux_hidden_states, self.scheduler_config.max_num_seqs
+            )
+            del captured
         # The vision encoder runs outside the text forward; profile it too so
         # the buffer-cache cap covers one encoder pass (the runner encodes
         # features one adapter call per step, so one maximal feature is the
@@ -1060,6 +1088,14 @@ class MetalModelRunner:
             return
         if Gemma4MTPAssistantSource.is_gemma4_mtp(spec):
             self._drafter = Gemma4MTPProposer(self)
+        elif spec.method == "dflash":
+            from vllm_metal.v1.dflash_proposer import DFlashProposer
+
+            if (
+                not isinstance(self._drafter, DFlashProposer)
+                or self._drafter.cache is None
+            ):
+                raise RuntimeError("DFlash was not loaded and bound to scheduler KV")
         elif spec.uses_draft_model():
             allow_deferred_zero_k_ingest = (
                 not self.vllm_config.cache_config.enable_prefix_caching
@@ -1092,7 +1128,7 @@ class MetalModelRunner:
         else:
             raise NotImplementedError(
                 f"Speculative method {spec.method!r} is not supported on Metal "
-                "(supported: Gemma4 MTP, draft_model, ngram)."
+                "(supported: Gemma4 MTP, draft_model, ngram, dflash)."
             )
 
     def get_draft_model_stats(self) -> dict[str, int] | None:
@@ -1257,6 +1293,7 @@ class MetalModelRunner:
         # branches project nothing, so the packed boundaries stand.
         logits_layout = _PagedLogitsLayout(None, cu_seqlens)
         target_hidden_states: mx.array | None = None
+        target_aux_hidden_states: tuple[mx.array, ...] = ()
         pooling_hidden_states: mx.array | None = None
         intermediate_hidden: mx.array | None = None
         intermediate_only = False
@@ -1426,6 +1463,7 @@ class MetalModelRunner:
                     )
                     logits = target_output.logits
                     target_hidden_states = target_output.hidden_states
+                    target_aux_hidden_states = target_output.aux_hidden_states
                     del target_output
         finally:
             clear_context()
@@ -1447,6 +1485,7 @@ class MetalModelRunner:
             # Runtime-owned forward side effects may not be forced by
             # evaluating logits alone, so submit the complete output set.
             forward_outputs = [logits]
+            forward_outputs.extend(target_aux_hidden_states)
             if target_hidden_states is not None:
                 forward_outputs.append(target_hidden_states)
             self._submit_paged_forward_outputs(*forward_outputs)
@@ -1461,6 +1500,7 @@ class MetalModelRunner:
             scheduler_output=scheduler_output,
             logits=logits,
             target_hidden_states=target_hidden_states,
+            target_aux_hidden_states=target_aux_hidden_states,
             pooling_hidden_states=pooling_hidden_states,
             cu_seqlens=cu_seqlens,
             logits_cu_seqlens=logits_layout.cu_seqlens,
@@ -1830,6 +1870,7 @@ class MetalModelRunner:
         num_speculative_tokens = scheduler_output.num_spec_tokens_to_schedule
         draft_ctx = ProposeContext(
             target_hidden_states=target_hidden_states,
+            target_aux_hidden_states=paged_state.target_aux_hidden_states,
             decode_reqs=decode_reqs,
             decode_segments=decode_segments,
             decode_token_ids=decode_token_ids,

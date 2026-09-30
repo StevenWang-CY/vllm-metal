@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import multiprocessing as mp
 import os
 import random
 
@@ -10,6 +11,28 @@ import pytest
 import torch
 
 os.environ["MLX_ENABLE_TF32"] = "0"  # Keep FP32 parity checks strict on M5.
+
+
+@pytest.fixture
+def run_in_spawn_process():
+    """Isolate a real engine: MLX is not fork-safe, and engines retain state."""
+
+    def run(target, *args, timeout=300):
+        process = mp.get_context("spawn").Process(target=target, args=args)
+        process.start()
+        try:
+            process.join(timeout=timeout)
+            assert not process.is_alive(), "Serving test timed out"
+            assert process.exitcode == 0, "Serving test failed in child process"
+        finally:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=10)
+                if process.is_alive():
+                    process.kill()
+                    process.join(timeout=10)
+
+    return run
 
 
 def _get_test_seed() -> int:
