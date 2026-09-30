@@ -32,6 +32,11 @@ embedding and output projection; comparisons use that same target precision.
   named by the checkpoint's model card; equal geometry alone does not establish
   tokenizer identity or training compatibility. `load_dflash` requires the
   target's configuration as `target_config` and checks it before loading weights.
+- `draft_logits` accepts valid target token IDs, normally supplied by the target
+  sampler, and does not read token values back to the CPU. Validate external
+  token IDs with `draft.validate_anchors(anchors)` at the input boundary, outside
+  the compiled or repeated draft forward. Shape and dtype checks remain in the
+  forward; mask IDs and anchors are represented as int64 without narrowing.
 
 ## Reproduce the numerical comparison
 
@@ -56,11 +61,11 @@ python -m tools.dflash_parity \
     --output /path/to/new-results.json
 ```
 
-The tool uses both capture implementations and compares draft logits and greedy
-proposal IDs at batch sizes 1 and 2, context lengths 17, 33, and 65, and block
-sizes 2, 5, and 16. It records exact equality separately from the numerical
-tolerance (`atol=rtol=1e-3`), rejects non-finite or incomplete comparisons, and
-fails on any proposal mismatch. The report includes snapshot paths, native and
+The tool uses both capture implementations and compares eager and compiled draft
+logits and greedy proposal IDs at batch sizes 1 and 2, context lengths 17, 33, and
+65, and block sizes 2, 5, and 16. It records exact equality separately from the
+numerical tolerance (`atol=rtol=1e-3`), rejects non-finite or incomplete comparisons,
+and fails on any proposal mismatch. The report includes snapshot paths, native and
 reference source hashes, and library versions. Use a new output file for each run.
 If a checkpoint selects the final target layer, the tool normalizes the reference
 hook's output to match the PyTorch/Hugging Face contract and records that adjustment

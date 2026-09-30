@@ -356,24 +356,18 @@ class DFlashModel(nn.Module):
         embed: Callable[[mx.array], mx.array],
         project: Callable[[mx.array], mx.array],
     ) -> mx.array:
-        """Borrow the actual target projections and return slots 1..K only."""
+        """Return slots 1..K without reading token values back to the host.
+
+        Anchors must be valid target token IDs, e.g. produced by its sampler.
+        For external inputs, call validate_anchors at the input boundary,
+        outside the compiled/repeated drafting forward.
+        """
         if (
             type(num_draft_tokens) is not int
             or not 1 <= num_draft_tokens < self.config.block_size
         ):
             raise ValueError("DFlash requires 1 <= num_draft_tokens < block_size")
-        if (
-            anchors.ndim != 1
-            or anchors.size < 1
-            or not mx.issubdtype(anchors.dtype, mx.integer)
-        ):
-            raise ValueError("DFlash anchors must be a nonempty integer vector")
-        # Compare Python integers so a narrow anchor dtype cannot truncate the
-        # vocabulary bound. Reject wide out-of-range IDs before normalizing.
-        min_anchor = cast(int, anchors.min().item())
-        max_anchor = cast(int, anchors.max().item())
-        if min_anchor < 0 or max_anchor >= self.config.vocab_size:
-            raise ValueError("DFlash anchor token is outside the target vocabulary")
+        self._validate_anchor_metadata(anchors)
         anchors = anchors.astype(mx.int64)
         masks = mx.full(
             (anchors.shape[0], num_draft_tokens),
@@ -386,6 +380,25 @@ class DFlashModel(nn.Module):
         if logits.shape != (anchors.shape[0], num_draft_tokens, self.config.vocab_size):
             raise ValueError("DFlash target projection has an incompatible vocabulary")
         return logits
+
+    @staticmethod
+    def _validate_anchor_metadata(anchors: mx.array) -> None:
+        if (
+            anchors.ndim != 1
+            or anchors.size < 1
+            or not mx.issubdtype(anchors.dtype, mx.integer)
+        ):
+            raise ValueError("DFlash anchors must be a nonempty integer vector")
+
+    def validate_anchors(self, anchors: mx.array) -> None:
+        """Synchronously validate external token IDs before entering the draft loop."""
+        self._validate_anchor_metadata(anchors)
+        # Python integers avoid narrowing the vocabulary bound. Check wide IDs
+        # before draft_logits converts them, so overflow cannot hide invalid IDs.
+        min_anchor = cast(int, anchors.min().item())
+        max_anchor = cast(int, anchors.max().item())
+        if min_anchor < 0 or max_anchor >= self.config.vocab_size:
+            raise ValueError("DFlash anchor token is outside the target vocabulary")
 
 
 def load_dflash(path: str | Path, *, target_config: Mapping[str, Any]) -> DFlashModel:

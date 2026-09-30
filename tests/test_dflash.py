@@ -354,8 +354,11 @@ def test_anchor_integer_precision_does_not_limit_mask_or_vocabulary(dtype):
         # Use a small embedding table while checking the full target token IDs.
         return embedding(mx.where(tokens == config.mask_token_id, 0, tokens))
 
-    logits = DFlashModel(config).draft_logits(
-        mx.array([1, 2], dtype=dtype),
+    model = DFlashModel(config)
+    anchors = mx.array([1, 2], dtype=dtype)
+    model.validate_anchors(anchors)
+    logits = model.draft_logits(
+        anchors,
         [mx.zeros((2, 7, config.hidden_size))] * 3,
         num_draft_tokens=2,
         embed=embed,
@@ -364,17 +367,49 @@ def test_anchor_integer_precision_does_not_limit_mask_or_vocabulary(dtype):
     assert logits.shape == (2, 2, config.vocab_size)
 
 
+@pytest.mark.parametrize("width", [1, 3])
+@pytest.mark.parametrize("anchor_dtype", [mx.int8, mx.uint64])
+def test_compiled_drafting_replays_with_fresh_anchors_and_features(width, anchor_dtype):
+    model = DFlashModel(_config())
+    model.set_dtype(mx.bfloat16)
+    embedding = nn.Embedding(64, 32)
+    embedding.set_dtype(mx.bfloat16)
+    embedding = nn.QuantizedEmbedding.from_embedding(embedding, group_size=32, bits=4)
+    mx.eval(model.parameters(), embedding.parameters())
+
+    def forward(anchors, features):
+        return model.draft_logits(
+            anchors,
+            features,
+            num_draft_tokens=width,
+            embed=embedding,
+            project=embedding.as_linear,
+        )
+
+    compiled = mx.compile(forward)
+    previous = None
+    for ids in ([2, 3], [5, 6]):
+        anchors = mx.array(ids, dtype=anchor_dtype)
+        model.validate_anchors(anchors)
+        features = tuple(
+            mx.random.normal((2, 7, 32)).astype(mx.bfloat16) for _ in range(3)
+        )
+        expected = forward(anchors, features)
+        actual = compiled(anchors, features)
+        np.testing.assert_array_equal(
+            np.array(actual.astype(mx.float32)), np.array(expected.astype(mx.float32))
+        )
+        if previous is not None:
+            assert not np.array_equal(previous, np.array(actual.astype(mx.float32)))
+        previous = np.array(actual.astype(mx.float32))
+
+
 @pytest.mark.parametrize(
     "anchors,width",
     [
         (mx.array([1]), 0),
         (mx.array([1]), 8),
         (mx.array([1]), True),
-        (mx.array([-1]), 1),
-        (mx.array([64]), 1),
-        (mx.array([2**32 + 1], dtype=mx.int64), 1),
-        (mx.array(np.array([2**63 + 1], dtype=np.uint64)), 1),
-        (mx.array([-(2**63)], dtype=mx.int64), 1),
         (mx.array([1.0]), 1),
         (mx.array([[1]]), 1),
         (mx.array([], dtype=mx.int32), 1),
@@ -388,6 +423,24 @@ def test_invalid_proposal_inputs_fail_before_embedding(anchors, width):
         DFlashModel(_config()).draft_logits(
             anchors, (), num_draft_tokens=width, embed=unexpected, project=unexpected
         )
+
+
+@pytest.mark.parametrize(
+    "anchors",
+    [
+        mx.array([-1]),
+        mx.array([64]),
+        mx.array([2**32 + 1], dtype=mx.int64),
+        mx.array(np.array([2**63 + 1], dtype=np.uint64)),
+        mx.array([-(2**63)], dtype=mx.int64),
+        mx.array([1.0]),
+        mx.array([[1]]),
+        mx.array([], dtype=mx.int32),
+    ],
+)
+def test_external_anchor_validation_rejects_invalid_tokens(anchors):
+    with pytest.raises(ValueError):
+        DFlashModel(_config()).validate_anchors(anchors)
 
 
 def test_projection_vocabulary_mismatch_is_rejected():

@@ -13,6 +13,7 @@ import importlib.util
 import json
 import sys
 from dataclasses import fields
+from functools import partial
 from pathlib import Path
 
 import mlx.core as mx
@@ -110,16 +111,18 @@ def qualify(target_path: Path, draft_path: Path, reference_path: Path) -> dict:
                 if hasattr(target, "_hidden_states"):
                     delattr(target, "_hidden_states")
             anchors = mx.argmax(native_logits[:, -1], axis=-1)
+            draft.validate_anchors(anchors)
             for width in sorted(
                 {2, min(5, draft.config.block_size), draft.config.block_size}
             ):
-                actual = draft.draft_logits(
-                    anchors,
-                    features,
+                forward = partial(
+                    draft.draft_logits,
                     num_draft_tokens=width - 1,
                     embed=embed,
                     project=project,
                 )
+                actual = forward(anchors, features)
+                compiled = mx.compile(forward)(anchors, features)
                 block = mx.concatenate(
                     [
                         anchors[:, None],
@@ -138,10 +141,12 @@ def qualify(target_path: Path, draft_path: Path, reference_path: Path) -> dict:
                     logits_start=1,
                 )
                 comparison = compare(actual, expected)
-                np.testing.assert_array_equal(
-                    np.array(mx.argmax(actual, axis=-1)),
-                    np.array(mx.argmax(expected, axis=-1)),
-                )
+                compiled_comparison = compare(compiled, expected)
+                for logits in (actual, compiled):
+                    np.testing.assert_array_equal(
+                        np.array(mx.argmax(logits, axis=-1)),
+                        np.array(mx.argmax(expected, axis=-1)),
+                    )
                 rows.append(
                     {
                         "batch": batch,
@@ -149,12 +154,15 @@ def qualify(target_path: Path, draft_path: Path, reference_path: Path) -> dict:
                         "block_size": width,
                         "proposal_positions": batch * (width - 1),
                         "logits": comparison,
+                        "compiled_logits": compiled_comparison,
                         "capture": capture_checks,
                         "argmax_exact": True,
                     }
                 )
                 print(
-                    f"PASS B={batch} context={length} block={width} max_error={comparison['max_abs_error']}",
+                    f"PASS B={batch} context={length} block={width} "
+                    f"eager_error={comparison['max_abs_error']} "
+                    f"compiled_error={compiled_comparison['max_abs_error']}",
                     flush=True,
                 )
     return {
