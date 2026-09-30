@@ -1,8 +1,9 @@
-# DFlash checkpoint qualification
+# Experimental DFlash serving
 
-This is the model-qualification stage of [RFC #825](https://github.com/vllm-project/vllm-metal/issues/825).
-It provides a native Qwen3 DFlash block forward and a numerical comparison tool.
-It does **not** enable `method="dflash"` in vLLM serving.
+This implements the first experimental serving stage of
+[RFC #825](https://github.com/vllm-project/vllm-metal/issues/825): synchronous,
+fixed-width DFlash drafting with native Metal block attention and
+scheduler-owned KV. The standalone model qualification tools remain available.
 
 The first reference checkpoint is
 [z-lab/Qwen3-4B-DFlash-b16](https://huggingface.co/z-lab/Qwen3-4B-DFlash-b16/tree/b74e3a329c4d963783143b1e970d95b002be72bd),
@@ -10,6 +11,53 @@ paired with Qwen3-4B. It has **five draft layers** and a 16-position block:
 one anchor and 15 predictions. It does not fulfill the RFC's preferred
 three-layer milestone. Quantized target conversions borrow their own actual
 embedding and output projection; comparisons use that same target precision.
+
+## Serve the qualified pair
+
+```bash
+vllm serve mlx-community/Qwen3-4B-4bit \
+    --no-enable-prefix-caching --no-async-scheduling \
+    --max-model-len 4096 --max-num-seqs 4 \
+    --speculative-config '{"method":"dflash","model":"z-lab/Qwen3-4B-DFlash-b16","num_speculative_tokens":3}'
+```
+
+Use `temperature=0` without penalties, token constraints, or sample logprobs to
+exercise drafting. Other requests use ordinary target sampling. The current
+serving path requires a single-device Qwen3 text target, matching FP16 or BF16
+target/draft activation precision, and a native cache block size (8, 16, or 32).
+LoRA, TurboQuant, prefix caching, and dynamic draft widths fail explicitly.
+For this checkpoint, the fixed draft width may be 1–15. Near the context limit,
+requests continue with target-only decoding when a complete block cannot fit.
+
+Draft weights load before memory profiling. Draft layer specs are included in
+the scheduler's cache budget, and target/draft views share its `KVCacheStorage`.
+Captured target features are projected once per committed position. The
+compiled block reads that paged context and writes the anchor/masks into the
+scheduler's lookahead slots; each query sees the whole block. After verification,
+only committed target-feature rows enter draft context. These overwrite temporary
+KV even for accepted draft tokens. Preemption and cancellation clear logical
+coverage before pages or request IDs are reused.
+
+The full-prefix callable below is for qualification. Serving uses
+`DFlashPagedCache.compile_draft`, passing cache views and fixed-width block
+tables as graph inputs, so it does not gather or reproject the full prefix.
+Different batch sizes can compile different graphs; context growth within the
+configured limit does not change the block-table shape.
+
+Run the real-checkpoint lifecycle test with:
+
+```bash
+pytest -m slow tests/test_dflash_serving_e2e.py
+python -m tools.dflash_serving_parity --output-dir /path/to/new-parity-results
+```
+
+It checks target-only parity, page boundaries, chunked prefill, acceptance and
+rejection, constrained-cache preemption, cancellation, and context-limit fallback.
+Floating-point reduction differences between single-token and multi-token target
+forwards can change greedy choices near ties. Report exact matches separately
+from mutual top-k agreement; the latter checks only the first differing token.
+Measure throughput for your target, draft width, and workload before enabling
+this experimental mode in a deployment.
 
 ## Model contract
 
@@ -113,12 +161,9 @@ This is forward parity, not generated-sequence parity or a performance benchmark
 The independent small-model tests also compare against explicit CPU attention
 math and check that a causal block mask produces a different result.
 
-## Serving milestones
+## Remaining milestones
 
-The qualification forward recomputes context K/V with MLX attention. Serving
-integration must bind committed draft KV to scheduler-owned `KVCacheStorage`,
-use scheduler lookahead for temporary block writes, and express the block mask
-through Metal paged attention. The first experimental serving stage must reject
-prefix caching, as requested in the RFC. Lifecycle correctness, generated-token
-parity, and batch-1/batch-N serving measurements remain separate gates before
-claiming DSpark support or acceleration.
+This is DFlash serving, not full DSpark support. A smaller qualified checkpoint,
+DSpark-specific prediction heads, adaptive widths, sampled verification, prefix
+reuse, and asynchronous execution remain separate roadmap items. Keep each
+change independently reviewable and qualify its lifecycle and serving behavior.

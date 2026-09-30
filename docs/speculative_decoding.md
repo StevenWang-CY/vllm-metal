@@ -1,6 +1,6 @@
 # Speculative Decoding
 
-vllm-metal supports three speculative decoding methods on the paged-attention
+vllm-metal supports the following speculative decoding methods on the paged-attention
 path. Use vLLM's [speculative decoding guide](https://docs.vllm.ai/en/latest/features/speculative_decoding/)
 for method behavior and configuration details.
 
@@ -13,7 +13,10 @@ for method behavior and configuration details.
 | Additional model weights | Assistant checkpoint | Draft model | None |
 | Additional KV cache | None; reads target KV | Second scheduler-managed cache | None |
 
-All three methods currently have these Metal-specific constraints:
+Experimental [DFlash serving](dflash.md) is also available for a qualified Qwen3
+target/draft pair, with prefix caching disabled and a fixed draft width.
+
+These methods currently have these Metal-specific constraints:
 
 - Only plain greedy requests (`temperature=0`, without penalties, token
   constraints, or sample logprobs) are drafted. Other requests run without
@@ -135,9 +138,8 @@ cache. Its benefit depends on repeated token spans in the request history.
 
 ## Benchmarking
 
-The experimental [DFlash checkpoint qualification](dflash.md) tool validates the
-trained block-forward contract before DFlash serving integration. DFlash is not
-one of the serving methods listed above.
+The [DFlash guide](dflash.md) covers its experimental serving restrictions and
+standalone checkpoint qualification.
 
 Use vLLM's benchmark CLI for serving workloads. For a reproducible Gemma4
 target-only versus MTP comparison, use the in-tree benchmark:
