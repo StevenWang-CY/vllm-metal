@@ -14,7 +14,12 @@ from mlx.utils import tree_flatten
 from mlx_lm.models import qwen3
 
 from vllm_metal.patches.aux_hidden_states import AuxHiddenStateCapture
-from vllm_metal.v1.dflash import DFlashConfig, DFlashModel, load_dflash
+from vllm_metal.v1.dflash import (
+    DFlashConfig,
+    DFlashModel,
+    DFlashTargetCapture,
+    load_dflash,
+)
 
 
 def _config():
@@ -43,6 +48,16 @@ def _raw(config=None):
         name: raw.pop(name) for name in ("mask_token_id", "target_layer_ids")
     }
     return raw
+
+
+def _target_config(config=None):
+    config = config or _config()
+    return {
+        **asdict(config),
+        "model_type": "qwen3",
+        "num_hidden_layers": config.num_target_layers,
+        "tie_word_embeddings": False,
+    }
 
 
 def _torch_forward(model, embeddings, features, *, causal=False):
@@ -181,7 +196,7 @@ def test_capture_indices_and_borrowed_quantized_projection(tied):
     target = qwen3.Model(args)
     nn.quantize(target, group_size=32, bits=4)
     mx.eval(target.parameters())
-    capture = AuxHiddenStateCapture(target, config.capture_layer_ids)
+    capture = DFlashTargetCapture(target, config)
     tokens = mx.array([[1, 4, 2, 7, 9]])
     _, features = capture.run(target, tokens)
     assert config.capture_layer_ids == (4, 1, 3)
@@ -194,7 +209,10 @@ def test_capture_indices_and_borrowed_quantized_projection(tied):
         hidden = layer(hidden, mask)
         outputs.append(hidden)
     for feature, index in zip(features, config.target_layer_ids, strict=True):
-        np.testing.assert_array_equal(np.array(feature), np.array(outputs[index]))
+        expected_feature = outputs[index]
+        if index == config.num_target_layers - 1:
+            expected_feature = target.model.norm(expected_feature)
+        np.testing.assert_array_equal(np.array(feature), np.array(expected_feature))
     model = DFlashModel(config)
     before = dict(tree_flatten(model.parameters()))
     project = target.model.embed_tokens.as_linear if tied else target.lm_head
@@ -231,6 +249,71 @@ def test_config_preserves_capture_order_and_validates_target():
     for key in target:
         with pytest.raises(ValueError, match="target"):
             config.validate_target({**target, key: -1})
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("taps", [(3, 0, 2, 3), (1, 0)])
+def test_target_capture_matches_huggingface_hidden_states(compiled, taps):
+    from transformers import Qwen3Config, Qwen3ForCausalLM
+
+    config = replace(_config(), target_layer_ids=taps)
+    target = qwen3.Model(qwen3.ModelArgs.from_dict(_target_config(config)))
+    target.model.norm.weight = mx.linspace(0.75, 1.75, config.hidden_size)
+    mx.eval(target.parameters())
+    hf_args = asdict(target.args)
+    hf_args.pop("model_type")
+    hf_args.pop("rope_scaling")
+    hf_args["rope_parameters"] = {
+        "rope_type": "default",
+        "rope_theta": hf_args.pop("rope_theta"),
+    }
+    hf_config = Qwen3Config(**hf_args)
+    hf_config._attn_implementation = "eager"
+    reference = Qwen3ForCausalLM(hf_config).eval()
+    reference.load_state_dict(
+        {
+            name: torch.from_numpy(np.array(weight))
+            for name, weight in tree_flatten(target.parameters())
+        },
+        strict=True,
+    )
+    capture = DFlashTargetCapture(target, config)
+
+    def forward(tokens):
+        return capture.run(target, tokens)
+
+    run = mx.compile(forward) if compiled else forward
+    previous = None
+    for ids in ([[1, 2, 3], [4, 5, 6]], [[7, 8, 9], [10, 11, 12]]):
+        logits, features = run(mx.array(ids))
+        with torch.no_grad():
+            expected = reference(
+                torch.tensor(ids), output_hidden_states=True, use_cache=False
+            )
+        np.testing.assert_allclose(
+            np.array(logits), expected.logits.numpy(), atol=2e-5, rtol=2e-5
+        )
+        for tap, feature in zip(taps, features, strict=True):
+            np.testing.assert_allclose(
+                np.array(feature),
+                expected.hidden_states[tap + 1].numpy(),
+                atol=2e-5,
+                rtol=2e-5,
+            )
+        if 3 in taps:
+            # The generic bridge must retain its pre-norm contract. That output
+            # is observably wrong for the HF final-layer entry used by DFlash.
+            _, raw = AuxHiddenStateCapture(target, (4,)).run(target, mx.array(ids))
+            assert not np.allclose(np.array(raw[0]), np.array(features[0]))
+        if previous is not None:
+            assert not np.array_equal(previous, np.array(features[0]))
+        previous = np.array(features[0])
+
+
+def test_target_capture_rejects_incompatible_model():
+    target = qwen3.Model(qwen3.ModelArgs.from_dict(_target_config()))
+    with pytest.raises(ValueError, match="target num_hidden_layers"):
+        DFlashTargetCapture(target, replace(_config(), num_target_layers=5))
 
 
 def test_batched_one_token_drafts_use_contiguous_quantized_head_inputs():
@@ -354,17 +437,105 @@ def test_invalid_geometry_is_rejected(field, value):
         ("layer_types", ["full_attention", "sliding_attention"]),
         ("layer_types", ["full_attention"]),
         ("use_sliding_window", True),
+        ("sliding_window", 2048),
         ("rope_scaling", {"factor": 2}),
         ("rope_parameters", {"rope_type": "yarn"}),
         ("quantization", {"bits": 4}),
+        ("quantization_config", {"bits": 4}),
         ("is_causal", True),
-        ("sample_from_anchor", True),
-        ("output_multiplier", 2),
     ],
 )
 def test_unsupported_checkpoint_semantics_fail_early(field, value):
     with pytest.raises(ValueError):
         DFlashConfig.from_dict({**_raw(), field: value})
+
+
+@pytest.mark.parametrize("location", ["top", "draft"])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("input_embedding_scale", 2),
+        ("output_multiplier", 2),
+        ("final_logit_softcapping", 30),
+        ("sample_from_anchor", True),
+    ],
+)
+def test_unsupported_semantics_rejected_at_both_config_levels(location, field, value):
+    raw = _raw()
+    (raw if location == "top" else raw["dflash_config"])[field] = value
+    with pytest.raises(ValueError, match=field):
+        DFlashConfig.from_dict(raw)
+
+
+@pytest.mark.parametrize("draft", [None, [], "invalid"])
+def test_checkpoint_requires_draft_config_object(draft):
+    with pytest.raises(ValueError, match="requires dflash_config"):
+        DFlashConfig.from_dict({**_raw(), "dflash_config": draft})
+
+
+@pytest.mark.parametrize(
+    "missing", ["hidden_size", "mask_token_id", "target_layer_ids"]
+)
+def test_missing_checkpoint_fields_are_reported(missing):
+    raw = _raw()
+    (raw if missing == "hidden_size" else raw["dflash_config"]).pop(missing)
+    with pytest.raises(ValueError, match=f"Incomplete.*{missing}"):
+        DFlashConfig.from_dict(raw)
+
+
+def test_missing_draft_config_is_reported():
+    raw = _raw()
+    raw.pop("dflash_config")
+    with pytest.raises(ValueError, match="requires dflash_config"):
+        DFlashConfig.from_dict(raw)
+
+
+@pytest.mark.parametrize("taps", [None, 1])
+def test_noniterable_checkpoint_taps_are_reported(taps):
+    raw = _raw()
+    raw["dflash_config"]["target_layer_ids"] = taps
+    with pytest.raises(ValueError, match="Incomplete"):
+        DFlashConfig.from_dict(raw)
+
+
+@pytest.mark.parametrize("location", ["top", "draft", "both"])
+def test_block_size_sources_agree(location):
+    raw = _raw()
+    if location != "top":
+        raw["dflash_config"]["block_size"] = raw["block_size"]
+    if location == "draft":
+        raw.pop("block_size")
+    assert DFlashConfig.from_dict(raw) == _config()
+
+
+def test_conflicting_block_size_is_rejected():
+    raw = _raw()
+    raw["dflash_config"]["block_size"] = raw["block_size"] - 1
+    with pytest.raises(ValueError, match="Conflicting.*block_size"):
+        DFlashConfig.from_dict(raw)
+
+
+def test_missing_block_size_is_rejected():
+    raw = _raw()
+    raw.pop("block_size")
+    with pytest.raises(ValueError, match="block_size"):
+        DFlashConfig.from_dict(raw)
+
+
+@pytest.mark.parametrize(
+    "field", ["model_type", "hidden_size", "vocab_size", "num_hidden_layers"]
+)
+@pytest.mark.parametrize("missing", [False, True])
+def test_loader_validates_target_before_reading_weights(tmp_path, field, missing):
+    (tmp_path / "config.json").write_text(json.dumps(_raw()))
+    target = _target_config()
+    if missing:
+        target.pop(field)
+    else:
+        target[field] = "llama" if field == "model_type" else target[field] + 1
+    # No weight file exists: the incompatibility must be reported first.
+    with pytest.raises(ValueError, match=f"target {field}"):
+        load_dflash(tmp_path, target_config=target)
 
 
 def _checkpoint(tmp_path):
@@ -377,7 +548,7 @@ def _checkpoint(tmp_path):
 
 def test_loading_roundtrip_preserves_checkpoint_and_forward(tmp_path):
     model, weights = _checkpoint(tmp_path)
-    loaded = load_dflash(tmp_path)
+    loaded = load_dflash(tmp_path, target_config=_target_config())
     for name, tensor in tree_flatten(loaded.parameters()):
         np.testing.assert_array_equal(np.array(tensor), np.array(weights[name]))
     embeddings = mx.random.normal((1, 4, 32))
@@ -420,7 +591,7 @@ def test_loading_rejects_incompatible_weights(tmp_path, corruption):
         (tmp_path / "model.safetensors.index.json").write_text("{}")
     mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
     with pytest.raises(ValueError):
-        load_dflash(tmp_path)
+        load_dflash(tmp_path, target_config=_target_config())
 
 
 @pytest.mark.parametrize("bad", ["count", "shape", "batch", "empty", "limit", "block"])

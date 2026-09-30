@@ -34,13 +34,17 @@ import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten
 from mlx_lm.models.qwen3 import MLP
 from safetensors import safe_open
+
+from vllm_metal.patches.aux_hidden_states import AuxHiddenStateCapture
+
+_Output = TypeVar("_Output")
 
 
 @dataclass(frozen=True)
@@ -99,7 +103,7 @@ class DFlashConfig:
 
     @property
     def capture_layer_ids(self) -> tuple[int, ...]:
-        """Translate zero-based decoder outputs to the shared capture convention."""
+        """Bridge indices; DFlashTargetCapture normalizes the final-layer tap."""
         return tuple(i + 1 for i in self.target_layer_ids)
 
     @classmethod
@@ -179,6 +183,31 @@ class DFlashConfig:
         for name, value in expected.items():
             if target.get(name) != value:
                 raise ValueError(f"DFlash target {name} must be {value!r}")
+
+
+class DFlashTargetCapture(AuxHiddenStateCapture):
+    """Adapt native Qwen3 capture to DFlash's HF hidden-state tuple contract.
+
+    The shared bridge always observes pre-norm decoder outputs. HF replaces
+    its last hidden-state entry with the final normalized output, so only a
+    checkpoint tap at target layer N-1 needs the target's final norm here.
+    The target owns its parameters; captured features remain call-scoped.
+    """
+
+    def __init__(self, target: nn.Module, config: DFlashConfig) -> None:
+        config.validate_target(vars(target.args))
+        super().__init__(target, config.capture_layer_ids)
+        self._final_layer_id = config.num_target_layers
+        self._final_norm = target.model.norm
+
+    def run(
+        self, forward: Callable[..., _Output], *args: Any, **kwargs: Any
+    ) -> tuple[_Output, tuple[mx.array, ...]]:
+        output, features = super().run(forward, *args, **kwargs)
+        return output, tuple(
+            self._final_norm(feature) if i == self._final_layer_id else feature
+            for i, feature in zip(self.layer_ids, features, strict=True)
+        )
 
 
 class _Attention(nn.Module):
@@ -276,8 +305,8 @@ class DFlashModel(nn.Module):
     ) -> mx.array:
         """Return normalized block states from logits_start onward.
 
-        Features cover the full prefix starting at zero. Each feature is
-        [batch, context length, hidden size], in capture order.
+        Features from DFlashTargetCapture cover the full prefix starting at zero.
+        Each feature is [batch, context length, hidden size], in capture order.
         There is no padding: every row in a call has the same context/block size.
         """
         if (
@@ -359,10 +388,11 @@ class DFlashModel(nn.Module):
         return logits
 
 
-def load_dflash(path: str | Path) -> DFlashModel:
-    """Load an unpacked, single-file z-lab checkpoint from a local snapshot."""
+def load_dflash(path: str | Path, *, target_config: Mapping[str, Any]) -> DFlashModel:
+    """Validate the target before loading a local, single-file z-lab checkpoint."""
     path = Path(path)
     config = DFlashConfig.from_dict(json.loads((path / "config.json").read_text()))
+    config.validate_target(target_config)
     files = sorted(path.glob("*.safetensors"))
     if len(files) != 1 or (path / "model.safetensors.index.json").exists():
         raise ValueError("DFlash qualification requires one unsharded safetensors file")

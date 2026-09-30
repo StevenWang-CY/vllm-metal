@@ -20,8 +20,7 @@ import numpy as np
 from mlx_lm import load
 
 from tools.attention_bench_utils import package_versions
-from vllm_metal.patches.aux_hidden_states import AuxHiddenStateCapture
-from vllm_metal.v1.dflash import load_dflash
+from vllm_metal.v1.dflash import DFlashTargetCapture, load_dflash
 
 
 def compare(actual: mx.array, expected: mx.array) -> dict:
@@ -48,8 +47,10 @@ def qualify(target_path: Path, draft_path: Path, reference_path: Path) -> dict:
     reference = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = reference
     spec.loader.exec_module(reference)
-    draft = load_dflash(draft_path)
-    draft.config.validate_target(json.loads((target_path / "config.json").read_text()))
+    draft = load_dflash(
+        draft_path,
+        target_config=json.loads((target_path / "config.json").read_text()),
+    )
     target, tokenizer = load(str(target_path))
     embed = target.model.embed_tokens
     project = embed.as_linear if target.args.tie_word_embeddings else target.lm_head
@@ -68,7 +69,7 @@ def qualify(target_path: Path, draft_path: Path, reference_path: Path) -> dict:
     ref_draft.eval()
     ref_draft.bind(target)
     mx.eval(ref_draft.parameters())
-    capture = AuxHiddenStateCapture(target, draft.config.capture_layer_ids)
+    capture = DFlashTargetCapture(target, draft.config)
     prompts = [
         "Explain how a computer works in simple terms.",
         "Write a Python function that adds two numbers and explain it.",
@@ -87,7 +88,19 @@ def qualify(target_path: Path, draft_path: Path, reference_path: Path) -> dict:
             try:
                 reference._patch_model(target, ref_draft.config.target_layer_ids)
                 ref_logits = target(tokens)
-                ref_features = tuple(target._hidden_states)
+                # The MLX hook observes pre-norm decoder outputs. Match the HF
+                # hidden_states[lid + 1] contract used by the PyTorch reference
+                # when a checkpoint requests the final target layer.
+                ref_features = tuple(
+                    target.model.norm(feature)
+                    if lid == ref_draft.config.num_target_layers - 1
+                    else feature
+                    for lid, feature in zip(
+                        ref_draft.config.target_layer_ids,
+                        target._hidden_states,
+                        strict=True,
+                    )
+                )
                 compare(native_logits, ref_logits)
                 capture_checks = [
                     compare(a, b) for a, b in zip(features, ref_features, strict=True)
@@ -154,6 +167,8 @@ def qualify(target_path: Path, draft_path: Path, reference_path: Path) -> dict:
         "versions": package_versions("mlx", "mlx-lm", "numpy"),
         "capture_layer_ids": draft.config.capture_layer_ids,
         "draft_layers": draft.config.num_hidden_layers,
+        "reference_final_norm_applied": draft.config.num_target_layers - 1
+        in draft.config.target_layer_ids,
         "cases": rows,
         "passed": True,
     }

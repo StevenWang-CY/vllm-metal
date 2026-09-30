@@ -13,10 +13,13 @@ embedding and output projection; comparisons use that same target precision.
 
 ## Model contract
 
-- Checkpoint target layer IDs name zero-based decoder outputs before final
-  normalization. `DFlashConfig.capture_layer_ids` translates
-  `[1, 9, 17, 25, 33]` to the shared capture bridge's `[2, 10, 18, 26, 34]`,
-  preserving order.
+- Checkpoint target layer ID `i` selects Hugging Face `hidden_states[i + 1]`.
+  Intermediate entries are decoder outputs before final normalization; the
+  final entry is **after** the target's final norm. Use `DFlashTargetCapture`
+  to adapt the shared bridge's pre-norm outputs to this contract. It preserves
+  order and duplicates, and applies the target norm only for a final-layer tap.
+  The reference checkpoint's `[1, 9, 17, 25, 33]` maps to bridge indices
+  `[2, 10, 18, 26, 34]` and needs no final normalization.
 - Each block attends to the complete committed context and every position
   within its own block. Proposal logits come from slots 1 onward.
 - The caller supplies the target projections and full-prefix features.
@@ -27,7 +30,8 @@ embedding and output projection; comparisons use that same target precision.
   unsupported checkpoint semantics fail explicitly.
 - Target geometry checks establish structural compatibility. Use the target
   named by the checkpoint's model card; equal geometry alone does not establish
-  tokenizer identity or training compatibility.
+  tokenizer identity or training compatibility. `load_dflash` requires the
+  target's configuration as `target_config` and checks it before loading weights.
 
 ## Reproduce the numerical comparison
 
@@ -58,6 +62,10 @@ sizes 2, 5, and 16. It records exact equality separately from the numerical
 tolerance (`atol=rtol=1e-3`), rejects non-finite or incomplete comparisons, and
 fails on any proposal mismatch. The report includes snapshot paths, native and
 reference source hashes, and library versions. Use a new output file for each run.
+If a checkpoint selects the final target layer, the tool normalizes the reference
+hook's output to match the PyTorch/Hugging Face contract and records that adjustment
+as `reference_final_norm_applied`. Independent tests compare captured features with
+an actual Hugging Face Qwen3 forward, including the final layer and compiled replay.
 
 This is forward parity, not generated-sequence parity or a performance benchmark.
 The independent small-model tests also compare against explicit CPU attention
