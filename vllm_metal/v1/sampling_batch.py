@@ -719,7 +719,7 @@ def sample_prefill_tokens(
     *,
     vocab_size: int,
 ) -> _SamplingResult:
-    """Sample one token per prefill request from the last logit position.
+    """Sample from the last logit position of each completed prefill.
 
     Args:
         logits: Full logits array, shape ``(1, total_tokens, vocab)``.
@@ -729,14 +729,20 @@ def sample_prefill_tokens(
         sampler: vLLM Sampler instance.
         vocab_size: Model vocabulary size.
     Returns:
-        Sampled token IDs and optional logprobs, one row per prefill request.
+        Sampled token IDs and optional logprobs, aligned to ``prefill_reqs``.
+        Intermediate chunks have an unused zero token placeholder; they must
+        not consume RNG state or emit sample logprobs.
     """
-    if not prefill_reqs:
-        return _SamplingResult([])
+    final_indices = [
+        i for i, pr in enumerate(prefill_reqs) if pr.prompt_len is not None
+    ]
+    if not final_indices:
+        return _SamplingResult([0] * len(prefill_reqs))
+    final_reqs = [prefill_reqs[i] for i in final_indices]
 
     prompt_token_id_lists: list[list[int]] = []
     output_token_id_lists: list[list[int]] = []
-    for pr in prefill_reqs:
+    for pr in final_reqs:
         token_ids = (
             pr.full_prompt_token_ids
             if pr.full_prompt_token_ids is not None
@@ -747,20 +753,31 @@ def sample_prefill_tokens(
         output_token_id_lists.append(token_ids[prompt_len:])
 
     last_logits = mx.stack(
-        [
-            logits[0, cu_seqlens[num_decode + j + 1] - 1, :]
-            for j in range(len(prefill_reqs))
-        ]
+        [logits[0, cu_seqlens[num_decode + j + 1] - 1, :] for j in final_indices]
     )
     batch = SamplingBatch(
-        [pr.sampling_params for pr in prefill_reqs],
+        [pr.sampling_params for pr in final_reqs],
         prompt_token_id_lists,
         output_token_id_lists,
         vocab_size=vocab_size,
         generators={
             j: pr.generator
-            for j, pr in enumerate(prefill_reqs)
+            for j, pr in enumerate(final_reqs)
             if pr.generator is not None
         },
     )
-    return sample_from_logits(last_logits, batch, sampler)
+    result = sample_from_logits(last_logits, batch, sampler)
+    if len(final_reqs) == len(prefill_reqs):
+        return result
+
+    # Restore the packed prefill order consumed by postprocessing and the
+    # drafter. Only completed rows own actual sampled tokens and logprobs.
+    token_ids = [0] * len(prefill_reqs)
+    logprobs_rows: list[LogprobsLists | None] = [None] * len(prefill_reqs)
+    for sampled_index, prefill_index in enumerate(final_indices):
+        token_ids[prefill_index] = result.token_ids[sampled_index]
+        if result.logprobs is not None:
+            logprobs_rows[prefill_index] = result.logprobs.slice_request(
+                sampled_index, 1
+            )
+    return _SamplingResult(token_ids, SamplingBatch.merge_logprobs_rows(logprobs_rows))

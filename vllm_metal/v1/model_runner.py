@@ -1769,6 +1769,10 @@ class MetalModelRunner:
 
         # ---- postprocess: write results back into batch ----
         for i, entry in enumerate(batch.paged_prefill_entries):
+            if entry.result_mode == "intermediate":
+                batch.set_output(entry.output_idx, [])
+                continue
+
             next_token = prefill_result.token_ids[i]
             logprobs = (
                 prefill_result.logprobs.slice_request(i, 1)
@@ -1776,10 +1780,6 @@ class MetalModelRunner:
                 else None
             )
             prefill = prefill_reqs[i]
-
-            if entry.result_mode == "intermediate":
-                batch.set_output(entry.output_idx, [], logprobs)
-                continue
 
             batch.set_output(entry.output_idx, [next_token], logprobs)
             mm_delta = mm_prefill_deltas.get(prefill.req_id)

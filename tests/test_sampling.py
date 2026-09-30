@@ -436,6 +436,122 @@ class TestV1SamplingBatch:
 
         assert result == sampling_batch._SamplingResult([])
 
+    @pytest.mark.parametrize("selective_logits", [False, True])
+    @pytest.mark.parametrize("logprobs_mode", ["raw_logprobs", "processed_logprobs"])
+    def test_mixed_prefill_samples_only_completed_chunks(
+        self, selective_logits: bool, logprobs_mode: str
+    ) -> None:
+        # Intermediate chunks surround two final chunks, one of which is a
+        # resumed request with generated history. A decode segment precedes
+        # them in the logits tensor. Keep the original row mapping in both
+        # the full and selective-head layouts.
+        params = [
+            SamplingParams(
+                temperature=0.8,
+                seed=7 + i,
+                logprobs=2,
+                presence_penalty=0.5,
+                repetition_penalty=1.2,
+            )
+            for i in range(5)
+        ]
+        generators = [create_request_generator(sp) for sp in params]
+        before = [generator.get_state() for generator in generators]
+        requests = [
+            PrefillRequest(
+                f"p{i}",
+                [2, 3],
+                params[i],
+                [[i]],
+                generators[i],
+                2 if i in (1, 3) else None,
+                2 if i == 3 else 0,
+                [0, 1, 2, 3] if i == 3 else [2, 3],
+            )
+            for i in range(5)
+        ]
+        # The intermediate rows must neither sample nor leak logprobs into
+        # a neighboring final row. Use distinct distributions for every row.
+        rows = mx.random.normal((12, 8))
+        boundaries = [0, 2, 4, 6, 8, 10, 12]
+        if selective_logits:
+            rows = mx.take(rows, mx.array([0, 1, 3, 5, 7, 9, 11]), axis=0)
+            boundaries = [0, 2, 3, 4, 5, 6, 7]
+
+        result = sampling_batch.sample_prefill_tokens(
+            rows[None],
+            requests,
+            cu_seqlens=boundaries,
+            num_decode=1,
+            sampler=Sampler(logprobs_mode=logprobs_mode),
+            vocab_size=8,
+        )
+
+        for i in (0, 2, 4):
+            assert torch.equal(generators[i].get_state(), before[i])
+        assert len(result.token_ids) == len(requests)
+        assert result.logprobs is not None
+        for i in (1, 3):
+            request = requests[i]
+            reference_generator = create_request_generator(params[i])
+            reference = sample_from_logits(
+                mx.array(rows[boundaries[i + 2] - 1 : boundaries[i + 2]]),
+                SamplingBatch(
+                    [params[i]],
+                    [request.full_prompt_token_ids[:2]],
+                    [request.full_prompt_token_ids[2:] if i == 3 else []],
+                    vocab_size=8,
+                    generators={0: reference_generator},
+                ),
+                Sampler(logprobs_mode=logprobs_mode),
+            )
+            assert result.token_ids[i] == reference.token_ids[0]
+            assert torch.equal(
+                generators[i].get_state(), reference_generator.get_state()
+            )
+            assert reference.logprobs is not None
+            np.testing.assert_array_equal(
+                result.logprobs.logprob_token_ids[i],
+                reference.logprobs.logprob_token_ids[0],
+            )
+            np.testing.assert_allclose(
+                result.logprobs.logprobs[i], reference.logprobs.logprobs[0]
+            )
+            assert (
+                result.logprobs.sampled_token_ranks[i]
+                == reference.logprobs.sampled_token_ranks[0]
+            )
+
+    def test_all_intermediate_prefills_leave_rng_untouched(self, monkeypatch) -> None:
+        # This path still runs with a drafter installed, even when there are
+        # no decode or final-prefill rows. No sampling work is needed.
+        params = SamplingParams(temperature=0.8, seed=7)
+        generator = create_request_generator(params)
+        before = generator.get_state()
+        global_before = torch.random.get_rng_state()
+        requests = [
+            PrefillRequest("p0", [1, 2], params, [[0]], generator, None, 0, None),
+            PrefillRequest("p1", [3, 4], SamplingParams(), [[1]], None, None, 0, None),
+        ]
+
+        def unexpected_sample(*args, **kwargs):
+            raise AssertionError("Intermediate prompt chunks must not sample")
+
+        monkeypatch.setattr(sampling_batch, "sample_from_logits", unexpected_sample)
+        result = sampling_batch.sample_prefill_tokens(
+            mx.zeros((1, 4, 8)),
+            requests,
+            cu_seqlens=[0, 2, 4],
+            num_decode=0,
+            sampler=Sampler(),
+            vocab_size=8,
+        )
+
+        assert len(result.token_ids) == len(requests)
+        assert result.logprobs is None
+        assert torch.equal(generator.get_state(), before)
+        assert torch.equal(torch.random.get_rng_state(), global_before)
+
     def test_can_use_native_greedy_requires_greedy_without_filters(self) -> None:
         assert self._batch([SamplingParams(temperature=0.0)]).can_use_native_greedy()
         assert not self._batch(

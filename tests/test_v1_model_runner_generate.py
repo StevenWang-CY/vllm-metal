@@ -18,6 +18,7 @@ from vllm.v1.core.sched.output import (
     SchedulerOutput,
 )
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+from vllm.v1.sample.sampler import Sampler
 
 import vllm_metal.attention.impls.mm_prefix as mm_prefix_module
 import vllm_metal.envs as metal_envs
@@ -3871,6 +3872,83 @@ class TestIntermediateBodyOnlyForward:
         # Act / Assert
         with pytest.raises(RuntimeError, match="must sample"):
             runner._sample_paged_batch()
+
+
+@pytest.mark.parametrize("has_final_prefill", [False, True])
+def test_intermediate_prefill_keeps_rng_and_drafter_bookkeeping(has_final_prefill):
+    runner = make_stub_runner(model_args={"vocab_size": 8}, _sampler=Sampler())
+    # An installed drafter excludes the intermediate-only short-circuit.
+    # It must still receive every chunk, including those that sample nothing.
+    runner._drafter = Mock()
+    runner._drafter.propose.return_value = None
+    params = SamplingParams(temperature=0.8, seed=7, logprobs=2)
+    generator = torch.Generator().manual_seed(7)
+    before = generator.get_state()
+    prefills = [
+        mr.PrefillRequest("chunk", [1, 2], params, [[0]], generator, None, 0, None)
+    ]
+    if has_final_prefill:
+        prefills.append(
+            mr.PrefillRequest(
+                "final",
+                [3, 4],
+                SamplingParams(temperature=0, logprobs=2),
+                [[1]],
+                None,
+                2,
+                0,
+                None,
+            )
+        )
+    batch = mr._ExecutionBatch()
+    for pr in prefills:
+        batch.paged_prefill_entries.append(
+            mr._PendingPrefillEntry(
+                output_idx=batch.add_output(pr.req_id, []),
+                prefill=pr,
+                result_mode="intermediate" if pr.prompt_len is None else "new_final",
+            )
+        )
+    runner._request_states["chunk"] = mr.RequestState(
+        token_ids=[1, 2, 3, 4],
+        prompt_len=4,
+        sampling_params=params,
+        generator=generator,
+        block_ids=[[0]],
+    )
+    boundaries = list(range(0, 2 * len(prefills) + 1, 2))
+    runner._execute_model_state = mr._PagedForwardState(
+        batch=batch,
+        prefill_reqs=prefills,
+        decode_reqs=[],
+        scheduler_output=SimpleNamespace(
+            num_spec_tokens_to_schedule=3, finished_req_ids=set()
+        ),
+        logits=mx.broadcast_to(mx.arange(8), (1, boundaries[-1], 8)).astype(mx.float32),
+        target_hidden_states=None,
+        cu_seqlens=boundaries,
+        logits_cu_seqlens=boundaries,
+        decode_segments=(),
+        num_decode_tokens=0,
+        mm_prefill_deltas={},
+    )
+
+    result, _ = runner._sample_paged_batch()
+
+    assert torch.equal(generator.get_state(), before)
+    assert result.sampled_tokens[0] == []
+    assert result.sample_logprobs[0] is None
+    assert runner._request_states["chunk"].token_ids == [1, 2, 3, 4]
+    assert runner._paged_request_seq_lens["chunk"] == 2
+    runner._drafter.propose.assert_called_once()
+    ctx = runner._drafter.propose.call_args.args[0]
+    assert ctx.prefill_reqs == prefills
+    assert ctx.prefill_result_modes[0] == "intermediate"
+    if has_final_prefill:
+        assert result.sampled_tokens[1] == [7]
+        assert result.sample_logprobs[1].logprob_token_ids[0, 0] == 7
+        assert runner._request_states["final"].token_ids == [3, 4, 7]
+        assert ctx.prefill_token_ids[1] == 7
 
 
 class TestStateBlockIdLifecycle:
