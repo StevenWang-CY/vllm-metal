@@ -666,3 +666,259 @@ def test_incompatible_forward_inputs_fail(bad):
         embeddings = mx.zeros((1, 9, 32))
     with pytest.raises(ValueError):
         model(embeddings, features)
+
+
+@pytest.mark.parametrize("batch,width", [(1, 2), (2, 8)])
+@pytest.mark.parametrize(
+    "dtype,tolerance", [(mx.float32, 2e-5), (mx.float16, 5e-3), (mx.bfloat16, 4e-2)]
+)
+def test_bucketed_drafting_matches_independent_attention(
+    batch, width, dtype, tolerance
+):
+    config = replace(_config(), max_position_embeddings=37)
+    model = DFlashModel(config)
+    embedding = nn.Embedding(config.vocab_size, config.hidden_size)
+    projection = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+    for module in (model, embedding, projection):
+        module.set_dtype(dtype)
+        mx.eval(module.parameters())
+    run = model.compile_draft(
+        num_draft_tokens=width - 1,
+        embed=embedding,
+        project=projection,
+        context_bucket_size=8,
+    )
+    limit = config.max_position_embeddings - width
+    # Partial/full buckets, crossing a boundary, the capped final bucket, and
+    # returning to an earlier shape with fresh anchors and features.
+    for step, length in enumerate((1, 7, 8, 9, 16, 17, limit - 1, limit, 7)):
+        anchors = mx.array([step + row for row in range(batch)])
+        features = tuple(
+            mx.random.normal((batch, length, config.hidden_size)).astype(dtype)
+            for _ in config.target_layer_ids
+        )
+        block = mx.concatenate(
+            [anchors[:, None], mx.full((batch, width - 1), config.mask_token_id)],
+            axis=1,
+        )
+        expected = _torch_forward(model, embedding(block), features)[:, 1:]
+        expected = expected @ np.array(projection.weight.astype(mx.float32)).T
+        actual = run(anchors, features)
+        np.testing.assert_allclose(
+            np.array(actual.astype(mx.float32)),
+            expected,
+            atol=tolerance,
+            rtol=tolerance,
+        )
+
+
+def test_bucketed_drafting_reuses_traces_and_masks_padding(monkeypatch):
+    model = DFlashModel(replace(_config(), max_position_embeddings=35))
+    embedding = nn.Embedding(64, 32)
+    mx.eval(model.parameters(), embedding.parameters())
+    traces = []
+    compile_original = mx.compile
+
+    def compile_traced(forward):
+        def traced(anchors, features, context_length):
+            traces.append(features[0].shape)
+            return forward(anchors, features, context_length)
+
+        return compile_original(traced)
+
+    monkeypatch.setattr(mx, "compile", compile_traced)
+    run = model.compile_draft(
+        num_draft_tokens=3,
+        embed=embedding,
+        project=embedding.as_linear,
+        context_bucket_size=8,
+    )
+    # Poison the otherwise zero padding. It must not affect the valid queries.
+    pad_original = mx.pad
+
+    def poison_pad(array, widths):
+        return pad_original(array, widths, constant_values=100)
+
+    monkeypatch.setattr(mx, "pad", poison_pad)
+    unbucketed_traces = []
+
+    def eager(anchors, features):
+        unbucketed_traces.append(features[0].shape)
+        return model.draft_logits(
+            anchors,
+            features,
+            num_draft_tokens=3,
+            embed=embedding,
+            project=embedding.as_linear,
+        )
+
+    unbucketed = compile_original(eager)
+    lengths = (1, 2, 7, 8, 9, 10, 15, 16, 17, 29, 30, 31, 7)
+    for step, length in enumerate(lengths):
+        anchors = mx.array([step])
+        features = tuple(mx.random.normal((1, length, 32)) for _ in range(3))
+        actual = run(anchors, features)
+        expected = unbucketed(anchors, features)
+        np.testing.assert_allclose(
+            np.array(actual), np.array(expected), atol=2e-5, rtol=2e-5
+        )
+    assert traces == [(1, length, 32) for length in (8, 16, 24, 31)]
+    assert len(unbucketed_traces) == len(set(lengths)) == 12
+    # A new batch shape needs a trace, but returning to B=1 reuses its graph.
+    for batch in (2, 1):
+        features = tuple(mx.random.normal((batch, 7, 32)) for _ in range(3))
+        actual = run(mx.arange(batch), features)
+        expected = unbucketed(mx.arange(batch), features)
+        np.testing.assert_allclose(
+            np.array(actual), np.array(expected), atol=2e-5, rtol=2e-5
+        )
+    assert traces[-1] == (2, 8, 32) and len(traces) == 5
+
+
+@pytest.mark.parametrize("num_draft_tokens", [1, 7])
+@pytest.mark.parametrize("tied", [False, True])
+def test_bucketed_drafting_with_borrowed_quantized_projection(num_draft_tokens, tied):
+    model = DFlashModel(_config())
+    model.set_dtype(mx.bfloat16)
+    embedding = nn.Embedding(64, 32)
+    projection = nn.Linear(32, 64, bias=False)
+    embedding.set_dtype(mx.bfloat16)
+    projection.set_dtype(mx.bfloat16)
+    embedding = nn.QuantizedEmbedding.from_embedding(embedding, group_size=32, bits=4)
+    projection = nn.QuantizedLinear.from_linear(projection, group_size=32, bits=4)
+    project = embedding.as_linear if tied else projection
+    mx.eval(model.parameters(), embedding.parameters(), projection.parameters())
+    before = dict(tree_flatten(model.parameters())).keys()
+    run = model.compile_draft(
+        num_draft_tokens=num_draft_tokens,
+        embed=embedding,
+        project=project,
+        context_bucket_size=8,
+    )
+    for length in (7, 8, 9, 7):
+        anchors = mx.array([length, length + 1], dtype=mx.uint64)
+        features = tuple(
+            mx.random.normal((2, length, 32)).astype(mx.bfloat16) for _ in range(3)
+        )
+        expected = model.draft_logits(
+            anchors,
+            features,
+            num_draft_tokens=num_draft_tokens,
+            embed=embedding,
+            project=project,
+        )
+        actual = run(anchors, features)
+        np.testing.assert_array_equal(
+            np.array(actual.astype(mx.float32)), np.array(expected.astype(mx.float32))
+        )
+    assert dict(tree_flatten(model.parameters())).keys() == before
+
+
+@pytest.mark.parametrize("bucket", [0, -1, 1.5, True])
+def test_compile_draft_rejects_invalid_bucket_size(bucket):
+    with pytest.raises(ValueError, match="context_bucket_size"):
+        DFlashModel(_config()).compile_draft(
+            num_draft_tokens=1,
+            embed=lambda x: x,
+            project=lambda x: x,
+            context_bucket_size=bucket,
+        )
+
+
+@pytest.mark.parametrize("width", [0, -1, 8, 1.5, True])
+def test_compile_draft_rejects_invalid_width(width):
+    with pytest.raises(ValueError, match="num_draft_tokens"):
+        DFlashModel(_config()).compile_draft(
+            num_draft_tokens=width,
+            embed=lambda x: x,
+            project=lambda x: x,
+        )
+
+
+@pytest.mark.parametrize("bad", ["count", "shape", "batch", "empty", "limit", "anchor"])
+def test_bucketed_drafting_validates_inputs_even_after_compilation(bad):
+    model = DFlashModel(_config())
+    embedding = nn.Embedding(64, 32)
+    run = model.compile_draft(
+        num_draft_tokens=3,
+        embed=embedding,
+        project=embedding.as_linear,
+    )
+    anchors = mx.array([1])
+    features = [mx.zeros((1, 124, 32)) for _ in range(3)]
+    mx.eval(run(anchors, features))
+    if bad == "count":
+        features.pop()
+    elif bad == "shape":
+        features[0] = mx.zeros((1, 123, 32))
+    elif bad == "batch":
+        anchors = mx.array([1, 2])
+    elif bad == "empty":
+        features = [mx.zeros((1, 0, 32)) for _ in range(3)]
+    elif bad == "limit":
+        features = [mx.zeros((1, 125, 32)) for _ in range(3)]
+    else:
+        anchors = anchors.astype(mx.float32)
+    with pytest.raises(ValueError):
+        run(anchors, features)
+
+
+def test_bucketed_drafting_preserves_bfloat16_attention_key_order():
+    # Match the trained checkpoint's attention geometry. A padding gap between
+    # context and block can change reduction order enough to round BF16 outputs
+    # differently, even when the gap is masked correctly.
+    config = replace(
+        _config(),
+        hidden_size=128,
+        intermediate_size=256,
+        num_attention_heads=32,
+        num_key_value_heads=8,
+        head_dim=128,
+        max_position_embeddings=8192,
+    )
+    model = DFlashModel(config)
+    embedding = nn.Embedding(config.vocab_size, config.hidden_size)
+    for module in (model, embedding):
+        module.set_dtype(mx.bfloat16)
+        mx.eval(module.parameters())
+    run = model.compile_draft(
+        num_draft_tokens=1,
+        embed=embedding,
+        project=embedding.as_linear,
+    )
+    for length in (
+        17,
+        33,
+        255,
+        256,
+        257,
+        769,
+        1021,
+        1022,
+        1023,
+        1024,
+        1025,
+        3841,
+        4093,
+        4094,
+        4095,
+        4096,
+        4097,
+        17,
+    ):
+        features = tuple(
+            mx.random.normal((2, length, config.hidden_size)).astype(mx.bfloat16)
+            for _ in config.target_layer_ids
+        )
+        anchors = mx.array([1, 2])
+        expected = model.draft_logits(
+            anchors,
+            features,
+            num_draft_tokens=1,
+            embed=embedding,
+            project=embedding.as_linear,
+        )
+        np.testing.assert_array_equal(
+            np.array(run(anchors, features).astype(mx.float32)),
+            np.array(expected.astype(mx.float32)),
+        )

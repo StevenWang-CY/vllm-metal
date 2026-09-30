@@ -34,7 +34,7 @@ import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import Any, TypeVar, cast
+from typing import Any, cast
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -42,9 +42,7 @@ from mlx.utils import tree_flatten
 from mlx_lm.models.qwen3 import MLP
 from safetensors import safe_open
 
-from vllm_metal.patches.aux_hidden_states import AuxHiddenStateCapture
-
-_Output = TypeVar("_Output")
+from vllm_metal.patches.aux_hidden_states import AuxHiddenStateCapture, _Output
 
 
 @dataclass(frozen=True)
@@ -231,7 +229,14 @@ class _Attention(nn.Module):
         self.q_norm = nn.RMSNorm(config.head_dim, eps=config.rms_norm_eps)
         self.k_norm = nn.RMSNorm(config.head_dim, eps=config.rms_norm_eps)
 
-    def __call__(self, x: mx.array, context: mx.array, rope: nn.RoPE) -> mx.array:
+    def __call__(
+        self,
+        x: mx.array,
+        context: mx.array,
+        rope: nn.RoPE,
+        context_length: mx.array | None,
+        mask: mx.array | None,
+    ) -> mx.array:
         batch, width, _ = x.shape
         length = context.shape[1]
         q = self.q_norm(
@@ -253,14 +258,25 @@ class _Attention(nn.Module):
             .reshape(batch, width, self.n_kv_heads, -1)
             .transpose(0, 2, 1, 3)
         )
-        q, ck, bk = rope(q, offset=length), rope(ck), rope(bk, offset=length)
+        offset = length if context_length is None else context_length
+        q, ck, bk = rope(q, offset=offset), rope(ck), rope(bk, offset=offset)
+        keys = mx.concatenate([ck, bk], axis=2)
+        values = mx.concatenate([cv, bv], axis=2)
+        if context_length is not None:
+            # Keep valid keys in their unpadded order: [context, block, padding].
+            # A gap before the block changes SDPA's reduction order and can
+            # amplify BF16 rounding through the trained draft's later layers.
+            start = context_length.reshape(1)
+            keys = mx.slice_update(keys, bk, start, axes=(2,))
+            values = mx.slice_update(values, bv, start, axes=(2,))
         # Every block query sees the entire committed context AND draft block.
         # This is bidirectional block attention, not the target's causal mask.
         output = mx.fast.scaled_dot_product_attention(
             q,
-            mx.concatenate([ck, bk], axis=2),
-            mx.concatenate([cv, bv], axis=2),
+            keys,
+            values,
             scale=self.scale,
+            mask=mask,
         )
         return self.o_proj(output.transpose(0, 2, 1, 3).reshape(batch, width, -1))
 
@@ -275,8 +291,17 @@ class _DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-    def __call__(self, x: mx.array, context: mx.array, rope: nn.RoPE) -> mx.array:
-        h = x + self.self_attn(self.input_layernorm(x), context, rope)
+    def __call__(
+        self,
+        x: mx.array,
+        context: mx.array,
+        rope: nn.RoPE,
+        context_length: mx.array | None,
+        mask: mx.array | None,
+    ) -> mx.array:
+        h = x + self.self_attn(
+            self.input_layernorm(x), context, rope, context_length, mask
+        )
         return h + self.mlp(self.post_attention_layernorm(h))
 
 
@@ -309,6 +334,39 @@ class DFlashModel(nn.Module):
         Each feature is [batch, context length, hidden size], in capture order.
         There is no padding: every row in a call has the same context/block size.
         """
+        return self._forward(embeddings, features, logits_start=logits_start)
+
+    def _validate_features(
+        self, features: Sequence[mx.array], batch: int, width: int
+    ) -> int:
+        if len(features) != len(self.config.target_layer_ids):
+            raise ValueError(
+                "DFlash requires one feature tensor per configured target layer"
+            )
+        shape = features[0].shape
+        if (
+            len(shape) != 3
+            or shape[0] != batch
+            or shape[1] < 1
+            or shape[2] != self.config.hidden_size
+            or any(f.shape != shape for f in features)
+        ):
+            raise ValueError(
+                "DFlash features must share [batch, context length, hidden_size]"
+            )
+        if shape[1] + width > self.config.max_position_embeddings:
+            raise ValueError("DFlash context and block exceed max_position_embeddings")
+        return shape[1]
+
+    def _forward(
+        self,
+        embeddings: mx.array,
+        features: Sequence[mx.array],
+        *,
+        logits_start: int,
+        context_length: mx.array | None = None,
+    ) -> mx.array:
+        # Only compile_draft supplies padded features and their logical length.
         if (
             embeddings.ndim != 3
             or embeddings.shape[0] < 1
@@ -321,27 +379,19 @@ class DFlashModel(nn.Module):
             raise ValueError("DFlash block exceeds the trained block_size")
         if type(logits_start) is not int or not 0 <= logits_start < embeddings.shape[1]:
             raise ValueError("DFlash logits_start must select a nonempty block suffix")
-        if len(features) != len(self.config.target_layer_ids):
-            raise ValueError(
-                "DFlash requires one feature tensor per configured target layer"
+        length = self._validate_features(
+            features, embeddings.shape[0], embeddings.shape[1]
+        )
+        mask = None
+        if context_length is not None:
+            # All prefix and block keys precede the masked padding suffix.
+            mask = mx.arange(length + embeddings.shape[1]) < (
+                context_length + embeddings.shape[1]
             )
-        shape = features[0].shape
-        if (
-            len(shape) != 3
-            or shape[0] != embeddings.shape[0]
-            or shape[1] < 1
-            or shape[2] != self.config.hidden_size
-            or any(f.shape != shape for f in features)
-        ):
-            raise ValueError(
-                "DFlash features must share [batch, context length, hidden_size]"
-            )
-        if shape[1] + embeddings.shape[1] > self.config.max_position_embeddings:
-            raise ValueError("DFlash context and block exceed max_position_embeddings")
         context = self.hidden_norm(self.fc(mx.concatenate(features, axis=-1)))
         h = embeddings
         for layer in self.layers:
-            h = layer(h, context, self.rope)
+            h = layer(h, context, self.rope, context_length, mask)
         # Slice before normalization, as in the reference. Normalization produces
         # contiguous rows for the borrowed head; a strided BF16 slice can select
         # a different quantized projection kernel for batched one-token drafts.
@@ -362,6 +412,24 @@ class DFlashModel(nn.Module):
         For external inputs, call validate_anchors at the input boundary,
         outside the compiled/repeated drafting forward.
         """
+        return self._draft_logits(
+            anchors,
+            features,
+            num_draft_tokens=num_draft_tokens,
+            embed=embed,
+            project=project,
+        )
+
+    def _draft_logits(
+        self,
+        anchors: mx.array,
+        features: Sequence[mx.array],
+        *,
+        num_draft_tokens: int,
+        embed: Callable[[mx.array], mx.array],
+        project: Callable[[mx.array], mx.array],
+        context_length: mx.array | None = None,
+    ) -> mx.array:
         if (
             type(num_draft_tokens) is not int
             or not 1 <= num_draft_tokens < self.config.block_size
@@ -375,11 +443,73 @@ class DFlashModel(nn.Module):
             dtype=mx.int64,
         )
         inputs = mx.concatenate([anchors[:, None], masks], axis=1)
-        hidden = self(embed(inputs), features, logits_start=1)
+        hidden = self._forward(
+            embed(inputs), features, logits_start=1, context_length=context_length
+        )
         logits = project(hidden)
         if logits.shape != (anchors.shape[0], num_draft_tokens, self.config.vocab_size):
             raise ValueError("DFlash target projection has an incompatible vocabulary")
         return logits
+
+    def compile_draft(
+        self,
+        *,
+        num_draft_tokens: int,
+        embed: Callable[[mx.array], mx.array],
+        project: Callable[[mx.array], mx.array],
+        context_bucket_size: int = 256,
+    ) -> Callable[[mx.array, Sequence[mx.array]], mx.array]:
+        """Build once, then reuse for growing full-prefix features.
+
+        The returned callable pads outside the compiled forward. Batch size,
+        dtype and context bucket determine its input shapes; the true prefix
+        length is a device scalar used for masking and draft RoPE positions.
+        All rows still require the same prefix length. Keep model weights and
+        borrowed projections fixed for the lifetime of this callable.
+        """
+        if type(context_bucket_size) is not int or context_bucket_size < 1:
+            raise ValueError("DFlash context_bucket_size must be a positive integer")
+        if (
+            type(num_draft_tokens) is not int
+            or not 1 <= num_draft_tokens < self.config.block_size
+        ):
+            raise ValueError("DFlash requires 1 <= num_draft_tokens < block_size")
+        width = num_draft_tokens + 1
+
+        def forward(anchors, features, context_length):
+            return self._draft_logits(
+                anchors,
+                features,
+                num_draft_tokens=num_draft_tokens,
+                embed=embed,
+                project=project,
+                context_length=context_length,
+            )
+
+        compiled = mx.compile(forward)
+
+        def draft(anchors: mx.array, features: Sequence[mx.array]) -> mx.array:
+            self._validate_anchor_metadata(anchors)
+            length = self._validate_features(features, anchors.shape[0], width)
+            bucket = min(
+                ((length + context_bucket_size - 1) // context_bucket_size)
+                * context_bucket_size,
+                self.config.max_position_embeddings - width,
+            )
+            # MLX 0.32.1 changes vector SDPA kernels/partition counts at
+            # power-of-two KV lengths starting at 1024. Do not let padding
+            # cross those boundaries (including their exact-length case):
+            # changing the reduction can amplify BF16 rounding in the draft.
+            span = length + width
+            boundary = max(1024, 1 << (span - 1).bit_length())
+            bucket = min(bucket, boundary - (span != boundary) - width)
+            padded = tuple(
+                mx.pad(feature, ((0, 0), (0, bucket - length), (0, 0)))
+                for feature in features
+            )
+            return compiled(anchors, padded, mx.array(length, dtype=mx.int32))
+
+        return draft
 
     @staticmethod
     def _validate_anchor_metadata(anchors: mx.array) -> None:
