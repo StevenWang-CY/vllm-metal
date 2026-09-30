@@ -38,6 +38,36 @@ embedding and output projection; comparisons use that same target precision.
   the compiled or repeated draft forward. Shape and dtype checks remain in the
   forward; mask IDs and anchors are represented as int64 without narrowing.
 
+## Reuse compiled drafting across context lengths
+
+Create a callable once after loading the draft and target weights, then pass it
+unpadded full-prefix features on each step:
+
+```python
+compiled_draft = draft.compile_draft(
+    num_draft_tokens=15,
+    embed=target.model.embed_tokens,
+    project=project,  # The same tied or untied target head used for qualification.
+)
+logits = compiled_draft(anchors, features)
+```
+
+The callable pads context features to multiples of `context_bucket_size`
+(default 256), capped at the checkpoint's position limit minus the block width.
+Buckets also stop at MLX attention dispatch boundaries so padding does not
+select a different reduction algorithm before the real sequence reaches it.
+The callable validates the real prefix length before padding. The compiled forward receives
+that length as a device scalar for RoPE and attention masking, so growing within
+a bucket reuses its graph. Valid context and block keys remain contiguous, with
+masked padding at the end, preserving their attention reduction order.
+
+Call the returned wrapper directly; it performs padding outside the compiled
+forward. All rows must still have the same real context length. Draft width and
+weights stay fixed for the callable's lifetime; changing batch size, dtype, or
+bucket can create another graph. External anchors need the same boundary
+validation as `draft_logits`. Bucketing still recomputes full-context K/V and
+adds padded work; it is not scheduler cache integration or a serving speedup claim.
+
 ## Reproduce the numerical comparison
 
 Download these snapshots with the Hugging Face CLI; it prints each local path:
@@ -61,10 +91,13 @@ python -m tools.dflash_parity \
     --output /path/to/new-results.json
 ```
 
-The tool uses both capture implementations and compares eager and compiled draft
-logits and greedy proposal IDs at batch sizes 1 and 2, context lengths 17, 33, and
-65, and block sizes 2, 5, and 16. It records exact equality separately from the
-numerical tolerance (`atol=rtol=1e-3`), rejects non-finite or incomplete comparisons,
+The tool uses both capture implementations and compares eager, compiled, and
+bucketed compiled draft logits and greedy proposal IDs at batch sizes 1 and 2,
+context lengths 17, 33, 65, 255, 256, 257, 769, 1022, 1023, 1024, and 1025,
+and block sizes 2, 5, and 16.
+It reuses the compiled callables across lengths, including bucket
+and attention dispatch boundaries.
+It records exact equality separately from the numerical tolerance (`atol=rtol=1e-3`), rejects non-finite or incomplete comparisons,
 and fails on any proposal mismatch. The report includes snapshot paths, native and
 reference source hashes, and library versions. Use a new output file for each run.
 If a checkpoint selects the final target layer, the tool normalizes the reference

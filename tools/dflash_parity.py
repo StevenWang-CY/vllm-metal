@@ -75,11 +75,27 @@ def qualify(target_path: Path, draft_path: Path, reference_path: Path) -> dict:
         "Explain how a computer works in simple terms.",
         "Write a Python function that adds two numbers and explain it.",
     ]
+    widths = sorted({2, min(5, draft.config.block_size), draft.config.block_size})
+    forwards = {
+        width: partial(
+            draft.draft_logits, num_draft_tokens=width - 1, embed=embed, project=project
+        )
+        for width in widths
+    }
+    compiled_forwards = {
+        width: mx.compile(forward) for width, forward in forwards.items()
+    }
+    bucketed_forwards = {
+        width: draft.compile_draft(
+            num_draft_tokens=width - 1, embed=embed, project=project
+        )
+        for width in widths
+    }
     rows = []
     for batch in (1, 2):
-        for length in (17, 33, 65):
+        for length in (17, 33, 65, 255, 256, 257, 769, 1022, 1023, 1024, 1025):
             token_rows = [
-                tokenizer.encode(prompts[i] * 12)[:length] for i in range(batch)
+                tokenizer.encode(prompts[i] * 256)[:length] for i in range(batch)
             ]
             if any(len(row) != length for row in token_rows):
                 raise ValueError("Prompt did not produce the requested context length")
@@ -112,17 +128,10 @@ def qualify(target_path: Path, draft_path: Path, reference_path: Path) -> dict:
                     delattr(target, "_hidden_states")
             anchors = mx.argmax(native_logits[:, -1], axis=-1)
             draft.validate_anchors(anchors)
-            for width in sorted(
-                {2, min(5, draft.config.block_size), draft.config.block_size}
-            ):
-                forward = partial(
-                    draft.draft_logits,
-                    num_draft_tokens=width - 1,
-                    embed=embed,
-                    project=project,
-                )
-                actual = forward(anchors, features)
-                compiled = mx.compile(forward)(anchors, features)
+            for width in widths:
+                actual = forwards[width](anchors, features)
+                compiled = compiled_forwards[width](anchors, features)
+                bucketed = bucketed_forwards[width](anchors, features)
                 block = mx.concatenate(
                     [
                         anchors[:, None],
@@ -142,7 +151,8 @@ def qualify(target_path: Path, draft_path: Path, reference_path: Path) -> dict:
                 )
                 comparison = compare(actual, expected)
                 compiled_comparison = compare(compiled, expected)
-                for logits in (actual, compiled):
+                bucketed_comparison = compare(bucketed, expected)
+                for logits in (actual, compiled, bucketed):
                     np.testing.assert_array_equal(
                         np.array(mx.argmax(logits, axis=-1)),
                         np.array(mx.argmax(expected, axis=-1)),
@@ -155,6 +165,7 @@ def qualify(target_path: Path, draft_path: Path, reference_path: Path) -> dict:
                         "proposal_positions": batch * (width - 1),
                         "logits": comparison,
                         "compiled_logits": compiled_comparison,
+                        "bucketed_logits": bucketed_comparison,
                         "capture": capture_checks,
                         "argmax_exact": True,
                     }
@@ -162,7 +173,8 @@ def qualify(target_path: Path, draft_path: Path, reference_path: Path) -> dict:
                 print(
                     f"PASS B={batch} context={length} block={width} "
                     f"eager_error={comparison['max_abs_error']} "
-                    f"compiled_error={compiled_comparison['max_abs_error']}",
+                    f"compiled_error={compiled_comparison['max_abs_error']} "
+                    f"bucketed_error={bucketed_comparison['max_abs_error']}",
                     flush=True,
                 )
     return {
