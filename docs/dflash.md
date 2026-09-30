@@ -53,6 +53,8 @@ python -m tools.dflash_serving_parity --output-dir /path/to/new-parity-results
 
 It checks target-only parity, page boundaries, chunked prefill, acceptance and
 rejection, constrained-cache preemption, cancellation, and context-limit fallback.
+It also covers EOS, stop tokens, short output budgets, and mixed batches with
+sampling/logprob fallback, including cache-page release after completion.
 Floating-point reduction differences between single-token and multi-token target
 forwards can change greedy choices near ties. Report exact matches separately
 from mutual top-k agreement; the latter checks only the first differing token.

@@ -5,6 +5,7 @@ Run explicitly with ``pytest -m slow tests/test_dflash_serving_e2e.py``.
 """
 
 import json
+import math
 import os
 
 import pytest
@@ -46,6 +47,13 @@ def _serve(mode, baseline_path, verify_window):
         for n in (13, 15, 16, 63)
     ] + [tokenizer.encode("Describe why plants grow. " * 20)[:61]]
     sampling = SamplingParams(temperature=0, max_tokens=48, ignore_eos=True)
+    eos_prompt = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "Reply with just the word OK."}],
+        tokenize=True,
+        return_dict=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
 
     def generate(prompt, params=sampling):
         return list(
@@ -66,23 +74,28 @@ def _serve(mode, baseline_path, verify_window):
 
     try:
         if mode == "target":
+            eos = generate(eos_prompt, SamplingParams(temperature=0, max_tokens=32))
             baseline_path.write_text(
                 json.dumps(
-                    [
-                        generate(
-                            prompt,
-                            SamplingParams(
-                                temperature=0,
-                                max_tokens=32 if i < 3 else 48,
-                                ignore_eos=True,
-                            ),
-                        )
-                        for i, prompt in enumerate(prompts)
-                    ]
+                    {
+                        "eos": eos,
+                        "outputs": [
+                            generate(
+                                prompt,
+                                SamplingParams(
+                                    temperature=0,
+                                    max_tokens=32 if i < 3 else 48,
+                                    ignore_eos=True,
+                                ),
+                            )
+                            for i, prompt in enumerate(prompts)
+                        ],
+                    }
                 )
             )
             return
-        baseline = json.loads(baseline_path.read_text())
+        reference = json.loads(baseline_path.read_text())
+        baseline = reference["outputs"]
         proposer = runner._drafter
         assert proposer.cache.storage is runner.paged_attention_runtime.storage
         stats = {
@@ -176,6 +189,84 @@ def _serve(mode, baseline_path, verify_window):
         )
         assert constrained in ("yes", "no")
         assert stats["drafted"] == drafted
+
+        # Finishing inside a speculative block must not leak extra tokens or
+        # leave pages unavailable for the next request.
+        for budget in (1, 2, 3, 5):
+            assert (
+                generate(
+                    prompts[0],
+                    SamplingParams(temperature=0, max_tokens=budget, ignore_eos=True),
+                )
+                == baseline[0][:budget]
+            )
+            assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == free
+        stop_index = next(
+            i for i in range(4, 16) if baseline[0][i] not in baseline[0][:i]
+        )
+        stop = baseline[0][stop_index]
+        stopped = llm.generate(
+            [{"prompt_token_ids": prompts[0]}],
+            SamplingParams(
+                temperature=0, max_tokens=32, ignore_eos=True, stop_token_ids=[stop]
+            ),
+            use_tqdm=False,
+        )[0].outputs[0]
+        assert list(stopped.token_ids) == baseline[0][: stop_index + 1]
+        assert stopped.finish_reason == "stop" and stopped.stop_reason == stop
+        eos = llm.generate(
+            [{"prompt_token_ids": eos_prompt}],
+            SamplingParams(temperature=0, max_tokens=32),
+            use_tqdm=False,
+        )[0].outputs[0]
+        assert list(eos.token_ids) == reference["eos"]
+        assert eos.finish_reason == "stop"
+        assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == free
+
+        mixed = {"decode_prefill": False, "spec_plain": False}
+        sample = runner._sample_paged_batch
+
+        def record_mixed(*args, **kwargs):
+            state = runner._execute_model_state
+            segments = state.decode_segments
+            mixed["decode_prefill"] |= bool(segments and state.prefill_reqs)
+            mixed["spec_plain"] |= any(s.draft_token_ids for s in segments) and any(
+                not s.draft_token_ids for s in segments
+            )
+            return sample(*args, **kwargs)
+
+        runner._sample_paged_batch = record_mixed
+        for temperature in (0, 0.7):
+            mixed.update(decode_prefill=False, spec_plain=False)
+            drafted = stats["drafted"]
+            results = llm.generate(
+                [{"prompt_token_ids": prompts[i]} for i in (0, 3)],
+                [
+                    SamplingParams(temperature=0, max_tokens=32, ignore_eos=True),
+                    SamplingParams(
+                        temperature=temperature,
+                        seed=7,
+                        max_tokens=16,
+                        ignore_eos=True,
+                        logprobs=1,
+                    ),
+                ],
+                use_tqdm=False,
+            )
+            assert list(results[0].outputs[0].token_ids) == baseline[0]
+            fallback = results[1].outputs[0]
+            assert len(fallback.token_ids) == len(fallback.logprobs) == 16
+            assert all(
+                math.isfinite(row[token].logprob)
+                for token, row in zip(
+                    fallback.token_ids, fallback.logprobs, strict=True
+                )
+            )
+            if temperature == 0:
+                assert list(fallback.token_ids) == baseline[3][:16]
+            assert all(mixed.values()), mixed
+            assert stats["drafted"] > drafted
+            assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == free
     finally:
         engine.engine_core.shutdown()
 
