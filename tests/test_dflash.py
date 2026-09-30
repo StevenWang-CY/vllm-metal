@@ -720,9 +720,9 @@ def test_bucketed_drafting_reuses_traces_and_masks_padding(monkeypatch):
     compile_original = mx.compile
 
     def compile_traced(forward):
-        def traced(anchors, features, context_length):
-            traces.append(features[0].shape)
-            return forward(anchors, features, context_length)
+        def traced(anchors, contexts, context_length):
+            traces.append((anchors.shape[0], contexts[0][0].shape[2]))
+            return forward(anchors, contexts, context_length)
 
         return compile_original(traced)
 
@@ -762,7 +762,7 @@ def test_bucketed_drafting_reuses_traces_and_masks_padding(monkeypatch):
         np.testing.assert_allclose(
             np.array(actual), np.array(expected), atol=2e-5, rtol=2e-5
         )
-    assert traces == [(1, length, 32) for length in (8, 16, 24, 31)]
+    assert traces == [(1, length) for length in (8, 16, 24, 31)]
     assert len(unbucketed_traces) == len(set(lengths)) == 12
     # A new batch shape needs a trace, but returning to B=1 reuses its graph.
     for batch in (2, 1):
@@ -772,7 +772,7 @@ def test_bucketed_drafting_reuses_traces_and_masks_padding(monkeypatch):
         np.testing.assert_allclose(
             np.array(actual), np.array(expected), atol=2e-5, rtol=2e-5
         )
-    assert traces[-1] == (2, 8, 32) and len(traces) == 5
+    assert traces[-1] == (2, 8) and len(traces) == 5
 
 
 @pytest.mark.parametrize("num_draft_tokens", [1, 7])
@@ -863,7 +863,11 @@ def test_bucketed_drafting_validates_inputs_even_after_compilation(bad):
         run(anchors, features)
 
 
-def test_bucketed_drafting_preserves_bfloat16_attention_key_order():
+@pytest.mark.parametrize("seed", [0, 17])
+def test_bucketed_drafting_preserves_bfloat16_context_and_attention(seed):
+    # Seed 17 also detects shape-dependent rounding when raw features are padded
+    # before the context projection. Keep this case independent of the global seed.
+    mx.random.seed(seed)
     # Match the trained checkpoint's attention geometry. A padding gap between
     # context and block can change reduction order enough to round BF16 outputs
     # differently, even when the gap is masked correctly.
@@ -915,6 +919,54 @@ def test_bucketed_drafting_preserves_bfloat16_attention_key_order():
             anchors,
             features,
             num_draft_tokens=1,
+            embed=embedding,
+            project=embedding.as_linear,
+        )
+        np.testing.assert_array_equal(
+            np.array(run(anchors, features).astype(mx.float32)),
+            np.array(expected.astype(mx.float32)),
+        )
+
+
+@pytest.mark.parametrize("width", [8, 9])
+@pytest.mark.parametrize("bucket", [3, 4096])
+def test_bucketed_drafting_accepts_strided_inputs_and_custom_buckets(width, bucket):
+    # Exercise vector/full SDPA with both tiny and heavily padded context buckets.
+    mx.random.seed(17)
+    config = replace(
+        _config(),
+        hidden_size=128,
+        intermediate_size=256,
+        num_attention_heads=32,
+        num_key_value_heads=8,
+        head_dim=128,
+        block_size=16,
+        max_position_embeddings=2048,
+    )
+    model = DFlashModel(config)
+    model.set_dtype(mx.bfloat16)
+    embedding = nn.Embedding(config.vocab_size, config.hidden_size)
+    embedding.set_dtype(mx.bfloat16)
+    embedding = nn.QuantizedEmbedding.from_embedding(embedding, group_size=32, bits=4)
+    mx.eval(model.parameters(), embedding.parameters())
+    run = model.compile_draft(
+        num_draft_tokens=width - 1,
+        embed=embedding,
+        project=embedding.as_linear,
+        context_bucket_size=bucket,
+    )
+    for step, length in enumerate((17, 18, 769, 1025, 17)):
+        anchors = mx.arange(step, step + 4, dtype=mx.uint64)[::2]
+        features = tuple(
+            mx.random.normal((2, length * 2, config.hidden_size)).astype(mx.bfloat16)[
+                :, ::2, :
+            ]
+            for _ in config.target_layer_ids
+        )
+        expected = model.draft_logits(
+            anchors,
+            features,
+            num_draft_tokens=width - 1,
             embed=embedding,
             project=embedding.as_linear,
         )

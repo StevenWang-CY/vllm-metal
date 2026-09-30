@@ -40,7 +40,13 @@ def compare(actual: mx.array, expected: mx.array) -> dict:
     }
 
 
-def qualify(target_path: Path, draft_path: Path, reference_path: Path) -> dict:
+def qualify(
+    target_path: Path,
+    draft_path: Path,
+    reference_path: Path,
+    *,
+    context_bucket_size: int = 256,
+) -> dict:
     # Loading arbitrary remote Python is deliberately not part of this tool.
     spec = importlib.util.spec_from_file_location("dflash_reference", reference_path)
     if spec is None or spec.loader is None:
@@ -75,7 +81,14 @@ def qualify(target_path: Path, draft_path: Path, reference_path: Path) -> dict:
         "Explain how a computer works in simple terms.",
         "Write a Python function that adds two numbers and explain it.",
     ]
-    widths = sorted({2, min(5, draft.config.block_size), draft.config.block_size})
+    # MLX switches from vector to full attention above eight block queries.
+    widths = sorted(
+        {
+            2,
+            *(min(n, draft.config.block_size) for n in (5, 8, 9)),
+            draft.config.block_size,
+        }
+    )
     forwards = {
         width: partial(
             draft.draft_logits, num_draft_tokens=width - 1, embed=embed, project=project
@@ -87,7 +100,10 @@ def qualify(target_path: Path, draft_path: Path, reference_path: Path) -> dict:
     }
     bucketed_forwards = {
         width: draft.compile_draft(
-            num_draft_tokens=width - 1, embed=embed, project=project
+            num_draft_tokens=width - 1,
+            embed=embed,
+            project=project,
+            context_bucket_size=context_bucket_size,
         )
         for width in widths
     }
@@ -178,6 +194,7 @@ def qualify(target_path: Path, draft_path: Path, reference_path: Path) -> dict:
                     flush=True,
                 )
     return {
+        "context_bucket_size": context_bucket_size,
         "target": str(target_path.resolve()),
         "draft": str(draft_path.resolve()),
         "reference_sha256": hashlib.sha256(reference_path.read_bytes()).hexdigest(),
@@ -200,12 +217,20 @@ def main() -> None:
     parser.add_argument("--draft", type=Path, required=True)
     parser.add_argument("--reference", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--context-bucket-size", type=int, default=256)
     args = parser.parse_args()
+    if args.context_bucket_size < 1:
+        parser.error("--context-bucket-size must be a positive integer")
     if args.output.exists():
         parser.error(
             "--output must name a new file, so a failed run cannot leave a stale pass"
         )
-    result = qualify(args.target, args.draft, args.reference)
+    result = qualify(
+        args.target,
+        args.draft,
+        args.reference,
+        context_bucket_size=args.context_bucket_size,
+    )
     args.output.write_text(json.dumps(result, indent=2) + "\n")
 
 

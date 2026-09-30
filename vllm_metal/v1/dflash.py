@@ -229,27 +229,34 @@ class _Attention(nn.Module):
         self.q_norm = nn.RMSNorm(config.head_dim, eps=config.rms_norm_eps)
         self.k_norm = nn.RMSNorm(config.head_dim, eps=config.rms_norm_eps)
 
+    def project_context(
+        self, context: mx.array, rope: nn.RoPE
+    ) -> tuple[mx.array, mx.array]:
+        batch, length, _ = context.shape
+        keys = self.k_norm(
+            self.k_proj(context).reshape(batch, length, self.n_kv_heads, -1)
+        ).transpose(0, 2, 1, 3)
+        values = (
+            self.v_proj(context)
+            .reshape(batch, length, self.n_kv_heads, -1)
+            .transpose(0, 2, 1, 3)
+        )
+        return rope(keys), values
+
     def __call__(
         self,
         x: mx.array,
-        context: mx.array,
+        context: tuple[mx.array, mx.array],
         rope: nn.RoPE,
         context_length: mx.array | None,
         mask: mx.array | None,
     ) -> mx.array:
         batch, width, _ = x.shape
-        length = context.shape[1]
+        ck, cv = context
+        length = ck.shape[2]
         q = self.q_norm(
             self.q_proj(x).reshape(batch, width, self.n_heads, -1)
         ).transpose(0, 2, 1, 3)
-        ck = self.k_norm(
-            self.k_proj(context).reshape(batch, length, self.n_kv_heads, -1)
-        ).transpose(0, 2, 1, 3)
-        cv = (
-            self.v_proj(context)
-            .reshape(batch, length, self.n_kv_heads, -1)
-            .transpose(0, 2, 1, 3)
-        )
         bk = self.k_norm(
             self.k_proj(x).reshape(batch, width, self.n_kv_heads, -1)
         ).transpose(0, 2, 1, 3)
@@ -259,7 +266,7 @@ class _Attention(nn.Module):
             .transpose(0, 2, 1, 3)
         )
         offset = length if context_length is None else context_length
-        q, ck, bk = rope(q, offset=offset), rope(ck), rope(bk, offset=offset)
+        q, bk = rope(q, offset=offset), rope(bk, offset=offset)
         keys = mx.concatenate([ck, bk], axis=2)
         values = mx.concatenate([cv, bv], axis=2)
         if context_length is not None:
@@ -294,7 +301,7 @@ class _DecoderLayer(nn.Module):
     def __call__(
         self,
         x: mx.array,
-        context: mx.array,
+        context: tuple[mx.array, mx.array],
         rope: nn.RoPE,
         context_length: mx.array | None,
         mask: mx.array | None,
@@ -334,7 +341,11 @@ class DFlashModel(nn.Module):
         Each feature is [batch, context length, hidden size], in capture order.
         There is no padding: every row in a call has the same context/block size.
         """
-        return self._forward(embeddings, features, logits_start=logits_start)
+        self._validate_embeddings(embeddings, logits_start)
+        self._validate_features(features, embeddings.shape[0], embeddings.shape[1])
+        return self._block_forward(
+            embeddings, self._project_context(features), logits_start=logits_start
+        )
 
     def _validate_features(
         self, features: Sequence[mx.array], batch: int, width: int
@@ -358,15 +369,7 @@ class DFlashModel(nn.Module):
             raise ValueError("DFlash context and block exceed max_position_embeddings")
         return shape[1]
 
-    def _forward(
-        self,
-        embeddings: mx.array,
-        features: Sequence[mx.array],
-        *,
-        logits_start: int,
-        context_length: mx.array | None = None,
-    ) -> mx.array:
-        # Only compile_draft supplies padded features and their logical length.
+    def _validate_embeddings(self, embeddings: mx.array, logits_start: int) -> None:
         if (
             embeddings.ndim != 3
             or embeddings.shape[0] < 1
@@ -379,18 +382,32 @@ class DFlashModel(nn.Module):
             raise ValueError("DFlash block exceeds the trained block_size")
         if type(logits_start) is not int or not 0 <= logits_start < embeddings.shape[1]:
             raise ValueError("DFlash logits_start must select a nonempty block suffix")
-        length = self._validate_features(
-            features, embeddings.shape[0], embeddings.shape[1]
+
+    def _project_context(
+        self, features: Sequence[mx.array]
+    ) -> tuple[tuple[mx.array, mx.array], ...]:
+        context = self.hidden_norm(self.fc(mx.concatenate(features, axis=-1)))
+        return tuple(
+            layer.self_attn.project_context(context, self.rope) for layer in self.layers
         )
+
+    def _block_forward(
+        self,
+        embeddings: mx.array,
+        contexts: Sequence[tuple[mx.array, mx.array]],
+        *,
+        logits_start: int,
+        context_length: mx.array | None = None,
+    ) -> mx.array:
+        length = contexts[0][0].shape[2]
         mask = None
         if context_length is not None:
             # All prefix and block keys precede the masked padding suffix.
             mask = mx.arange(length + embeddings.shape[1]) < (
                 context_length + embeddings.shape[1]
             )
-        context = self.hidden_norm(self.fc(mx.concatenate(features, axis=-1)))
         h = embeddings
-        for layer in self.layers:
+        for layer, context in zip(self.layers, contexts, strict=True):
             h = layer(h, context, self.rope, context_length, mask)
         # Slice before normalization, as in the reference. Normalization produces
         # contiguous rows for the borrowed head; a strided BF16 slice can select
@@ -412,29 +429,17 @@ class DFlashModel(nn.Module):
         For external inputs, call validate_anchors at the input boundary,
         outside the compiled/repeated drafting forward.
         """
-        return self._draft_logits(
-            anchors,
-            features,
-            num_draft_tokens=num_draft_tokens,
-            embed=embed,
-            project=project,
-        )
+        embeddings = self._draft_embeddings(anchors, num_draft_tokens, embed)
+        hidden = self(embeddings, features, logits_start=1)
+        return self._project_logits(hidden, project, anchors.shape[0], num_draft_tokens)
 
-    def _draft_logits(
+    def _draft_embeddings(
         self,
         anchors: mx.array,
-        features: Sequence[mx.array],
-        *,
         num_draft_tokens: int,
         embed: Callable[[mx.array], mx.array],
-        project: Callable[[mx.array], mx.array],
-        context_length: mx.array | None = None,
     ) -> mx.array:
-        if (
-            type(num_draft_tokens) is not int
-            or not 1 <= num_draft_tokens < self.config.block_size
-        ):
-            raise ValueError("DFlash requires 1 <= num_draft_tokens < block_size")
+        self._validate_num_draft_tokens(num_draft_tokens)
         self._validate_anchor_metadata(anchors)
         anchors = anchors.astype(mx.int64)
         masks = mx.full(
@@ -443,11 +448,26 @@ class DFlashModel(nn.Module):
             dtype=mx.int64,
         )
         inputs = mx.concatenate([anchors[:, None], masks], axis=1)
-        hidden = self._forward(
-            embed(inputs), features, logits_start=1, context_length=context_length
-        )
+        embeddings = embed(inputs)
+        self._validate_embeddings(embeddings, 1)
+        return embeddings
+
+    def _validate_num_draft_tokens(self, num_draft_tokens: int) -> None:
+        if (
+            type(num_draft_tokens) is not int
+            or not 1 <= num_draft_tokens < self.config.block_size
+        ):
+            raise ValueError("DFlash requires 1 <= num_draft_tokens < block_size")
+
+    def _project_logits(
+        self,
+        hidden: mx.array,
+        project: Callable[[mx.array], mx.array],
+        batch: int,
+        num_draft_tokens: int,
+    ) -> mx.array:
         logits = project(hidden)
-        if logits.shape != (anchors.shape[0], num_draft_tokens, self.config.vocab_size):
+        if logits.shape != (batch, num_draft_tokens, self.config.vocab_size):
             raise ValueError("DFlash target projection has an incompatible vocabulary")
         return logits
 
@@ -461,29 +481,25 @@ class DFlashModel(nn.Module):
     ) -> Callable[[mx.array, Sequence[mx.array]], mx.array]:
         """Build once, then reuse for growing full-prefix features.
 
-        The returned callable pads outside the compiled forward. Batch size,
-        dtype and context bucket determine its input shapes; the true prefix
+        The returned callable projects the real prefix and pads its K/V outside
+        the compiled block forward. Batch size, dtype and context bucket
+        determine its input shapes; the true prefix
         length is a device scalar used for masking and draft RoPE positions.
         All rows still require the same prefix length. Keep model weights and
         borrowed projections fixed for the lifetime of this callable.
         """
         if type(context_bucket_size) is not int or context_bucket_size < 1:
             raise ValueError("DFlash context_bucket_size must be a positive integer")
-        if (
-            type(num_draft_tokens) is not int
-            or not 1 <= num_draft_tokens < self.config.block_size
-        ):
-            raise ValueError("DFlash requires 1 <= num_draft_tokens < block_size")
+        self._validate_num_draft_tokens(num_draft_tokens)
         width = num_draft_tokens + 1
 
-        def forward(anchors, features, context_length):
-            return self._draft_logits(
-                anchors,
-                features,
-                num_draft_tokens=num_draft_tokens,
-                embed=embed,
-                project=project,
-                context_length=context_length,
+        def forward(anchors, contexts, context_length):
+            embeddings = self._draft_embeddings(anchors, num_draft_tokens, embed)
+            hidden = self._block_forward(
+                embeddings, contexts, logits_start=1, context_length=context_length
+            )
+            return self._project_logits(
+                hidden, project, anchors.shape[0], num_draft_tokens
             )
 
         compiled = mx.compile(forward)
@@ -503,9 +519,17 @@ class DFlashModel(nn.Module):
             span = length + width
             boundary = max(1024, 1 << (span - 1).bit_length())
             bucket = min(bucket, boundary - (span != boundary) - width)
+            # Project the real prefix before padding. Padding feature rows
+            # can select a different GEMM reduction and change BF16 values.
+            # These shape-dependent projections stay outside the compiled
+            # block graph; only their padded K/V enter that reusable graph.
+            contexts = self._project_context(features)
             padded = tuple(
-                mx.pad(feature, ((0, 0), (0, bucket - length), (0, 0)))
-                for feature in features
+                tuple(
+                    mx.pad(value, ((0, 0), (0, 0), (0, bucket - length), (0, 0)))
+                    for value in context
+                )
+                for context in contexts
             )
             return compiled(anchors, padded, mx.array(length, dtype=mx.int32))
 
