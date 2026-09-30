@@ -243,17 +243,14 @@ class _Attention(nn.Module):
         )
         return rope(keys), values
 
-    def __call__(
+    def project_block(
         self,
         x: mx.array,
-        context: tuple[mx.array, mx.array],
         rope: nn.RoPE,
-        context_length: mx.array | None,
-        mask: mx.array | None,
-    ) -> mx.array:
+        offset: int | mx.array,
+    ) -> tuple[mx.array, mx.array, mx.array]:
+        """Project the same Q/K/V for full-context and scheduler-paged drafting."""
         batch, width, _ = x.shape
-        ck, cv = context
-        length = ck.shape[2]
         q = self.q_norm(
             self.q_proj(x).reshape(batch, width, self.n_heads, -1)
         ).transpose(0, 2, 1, 3)
@@ -265,8 +262,21 @@ class _Attention(nn.Module):
             .reshape(batch, width, self.n_kv_heads, -1)
             .transpose(0, 2, 1, 3)
         )
+        return rope(q, offset=offset), rope(bk, offset=offset), bv
+
+    def __call__(
+        self,
+        x: mx.array,
+        context: tuple[mx.array, mx.array],
+        rope: nn.RoPE,
+        context_length: mx.array | None,
+        mask: mx.array | None,
+    ) -> mx.array:
+        batch, width, _ = x.shape
+        ck, cv = context
+        length = ck.shape[2]
         offset = length if context_length is None else context_length
-        q, bk = rope(q, offset=offset), rope(bk, offset=offset)
+        q, bk, bv = self.project_block(x, rope, offset)
         keys = mx.concatenate([ck, bk], axis=2)
         values = mx.concatenate([cv, bv], axis=2)
         if context_length is not None:
