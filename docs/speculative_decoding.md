@@ -14,7 +14,8 @@ for method behavior and configuration details.
 | Additional KV cache | None; reads target KV | Second scheduler-managed cache | None |
 
 Experimental [DFlash serving](dflash.md) is also available for a qualified Qwen3
-target/draft pair, with prefix caching disabled and a fixed draft width.
+target/draft pair, with prefix caching disabled. It supports fixed widths and
+vLLM's batch-size-based draft schedule, including K=0 pause/resume.
 
 These methods currently have these Metal-specific constraints:
 

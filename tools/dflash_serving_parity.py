@@ -34,6 +34,7 @@ def run_engine(args):
             "method": "dflash",
             "model": args.draft,
             "num_speculative_tokens": args.num_draft_tokens,
+            "num_speculative_tokens_per_batch_size": args.draft_schedule,
         }
     )
     llm = LLM(
@@ -51,7 +52,17 @@ def run_engine(args):
     runner = llm.llm_engine.model_executor.driver_worker.model_runner
     sample = runner._sample_paged_batch
     records, prompts = {}, {}
-    stats = {"drafted": 0, "accepted": 0}
+    stats = {"drafted": 0, "accepted": 0, "scheduled_widths": {}}
+    if runner._drafter is not None:
+        propose = runner._drafter.propose
+
+        def observe_width(ctx):
+            widths = stats["scheduled_widths"]
+            width = ctx.num_speculative_tokens
+            widths[width] = widths.get(width, 0) + 1
+            return propose(ctx)
+
+        runner._drafter.propose = observe_width
 
     def top(row):
         scores = row.astype(mx.float32)
@@ -95,7 +106,7 @@ def run_engine(args):
     runner._sample_paged_batch = observe
     try:
         for batch_size in args.batch_size:
-            stats.update(drafted=0, accepted=0)
+            stats.update(drafted=0, accepted=0, scheduled_widths={})
             outputs = []
             for start in range(0, len(reference), batch_size):
                 records.clear()
@@ -127,7 +138,11 @@ def run_engine(args):
                     )
             path = args.output_dir / f"{args.worker}-b{batch_size}.json"
             path.write_text(json.dumps({"outputs": outputs, "stats": stats}))
-            if args.worker == "dflash" and not stats["drafted"]:
+            if (
+                args.worker == "dflash"
+                and args.schedule_lookup[batch_size] > 0
+                and not stats["drafted"]
+            ):
                 raise AssertionError("Parity run did not exercise DFlash drafting")
     finally:
         llm.llm_engine.engine_core.shutdown()
@@ -140,6 +155,11 @@ def main():
     parser.add_argument("--num-draft-tokens", type=int, default=3)
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--batch-size", type=int, nargs="+", default=[1, 2])
+    parser.add_argument(
+        "--draft-schedule",
+        type=json.loads,
+        help="JSON batch-size schedule, e.g. '[[1,1,3],[2,2,1],[3,4,0]]'",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
         "--worker", choices=["native", "target", "dflash"], help=argparse.SUPPRESS
@@ -152,6 +172,18 @@ def main():
     ):
         parser.error("batch sizes must be positive and max-tokens must be 1–512")
     os.environ["MLX_ENABLE_TF32"] = "0"
+    from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
+
+    try:
+        args.schedule_lookup = build_dynamic_sd_schedule_lookup(
+            args.draft_schedule
+            if args.draft_schedule is not None
+            else [[1, max(args.batch_size), args.num_draft_tokens]],
+            max(args.batch_size),
+            args.num_draft_tokens,
+        )
+    except (TypeError, ValueError) as exc:
+        parser.error(str(exc))
     if args.worker == "native":
         reference = mlx_generate(args.target, PROMPTS, args.max_tokens, 5)
         (args.output_dir / "native.json").write_text(json.dumps(reference))
@@ -168,6 +200,7 @@ def main():
                 "num_draft_tokens": args.num_draft_tokens,
                 "max_tokens": args.max_tokens,
                 "batch_sizes": args.batch_size,
+                "draft_schedule": args.draft_schedule,
                 "versions": {
                     name: importlib.metadata.version(name)
                     for name in ("vllm", "mlx", "mlx-lm", "transformers")
