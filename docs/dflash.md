@@ -213,6 +213,7 @@ math and check that a causal block mask produces a different result.
 ## Remaining milestones
 
 This is DFlash serving, not full DSpark support. A smaller qualified checkpoint,
-DSpark-specific prediction heads, confidence/cost-based planning, sampled verification, prefix
+DSpark serving integration (following [model/head qualification](dspark.md)),
+confidence/cost-based planning, sampled verification, prefix
 reuse, and asynchronous execution remain separate roadmap items. Keep each
 change independently reviewable and qualify its lifecycle and serving behavior.

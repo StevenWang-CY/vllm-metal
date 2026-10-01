@@ -17,6 +17,9 @@ Experimental [DFlash serving](dflash.md) is also available for a qualified Qwen3
 target/draft pair, with prefix caching disabled. It supports fixed widths and
 vLLM's batch-size-based draft schedule, including K=0 pause/resume.
 
+[DSpark checkpoint qualification](dspark.md) provides a standalone model forward
+and reference comparison tool. DSpark serving is not enabled yet.
+
 These methods currently have these Metal-specific constraints:
 
 - Only plain greedy requests (`temperature=0`, without penalties, token
