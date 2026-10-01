@@ -55,9 +55,9 @@ class DFlashProposer:
             for i in range(model.config.num_hidden_layers)
         )
         self.cache: DFlashPagedCache | None = None
-        self._draft: (
-            Callable[[mx.array, Sequence[tuple[Sequence[int], int]]], mx.array] | None
-        ) = None
+        self._drafts: dict[
+            int, Callable[[mx.array, Sequence[tuple[Sequence[int], int]]], mx.array]
+        ] = {}
         self._group_index = 0
         self._valid_ends: dict[str, int] = {}
 
@@ -90,8 +90,6 @@ class DFlashProposer:
             raise NotImplementedError(
                 "DFlash on Metal requires a native attention block size"
             )
-        if spec.num_speculative_tokens_per_batch_size is not None:
-            raise NotImplementedError("DFlash on Metal requires a fixed draft width")
         path = get_model_download_path(
             spec.draft_model_config.model, revision=spec.draft_model_config.revision
         )
@@ -157,11 +155,7 @@ class DFlashProposer:
             max_model_len=min(max_model_len, self.max_model_len),
         )
         self._group_index = group_index
-        self._draft = self.cache.compile_draft(
-            num_draft_tokens=self.num_draft_tokens,
-            embed=self.embed,
-            project=self.project,
-        )
+        self._drafts.clear()
         self._valid_ends.clear()
 
     def needs_target_hidden_states(
@@ -199,8 +193,11 @@ class DFlashProposer:
 
     def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
         cache = self.cache
-        if cache is None or self._draft is None:
+        if cache is None:
             raise RuntimeError("DFlash must bind scheduler KV before proposing")
+        width = ctx.num_speculative_tokens
+        if not 0 <= width <= self.num_draft_tokens:
+            raise ValueError("DFlash draft width exceeds the configured token budget")
         features = ctx.target_aux_hidden_states
         if not features or any(f.shape[0] != ctx.cu_seqlens[-1] for f in features):
             raise RuntimeError(
@@ -262,16 +259,14 @@ class DFlashProposer:
             ctx.request_states,
         )
         req_ids, anchors, rows = [], [], []
-        if ctx.num_speculative_tokens not in (0, self.num_draft_tokens):
-            raise ValueError("DFlash serving requires the configured fixed draft width")
-        if ctx.num_speculative_tokens:
+        if width:
             for req_id, state in eligible:
                 # This stage does not qualify scheduler-invalid grammar drafts.
                 # Keep constrained requests on the target's grammar sampler.
                 if state.sampling_params.structured_outputs is not None:
                     continue
                 end = self._valid_ends.get(req_id, 0)
-                if end + self.num_draft_tokens + 1 > cache.max_model_len:
+                if end + width + 1 > cache.max_model_len:
                     continue
                 if end != len(state.token_ids) - 1:
                     raise RuntimeError(
@@ -283,7 +278,14 @@ class DFlashProposer:
         if not rows:
             mx.eval(*cache.storage.buffers)
             return None
-        logits = self._draft(mx.array(anchors, dtype=mx.int32), rows)
+        # The scheduler selects the next width from its batch-size schedule.
+        # Keep a compiled callable for each encountered nonzero width. K=0
+        # still commits features above, so later drafting needs no replay.
+        if width not in self._drafts:
+            self._drafts[width] = cache.compile_draft(
+                num_draft_tokens=width, embed=self.embed, project=self.project
+            )
+        logits = self._drafts[width](mx.array(anchors, dtype=mx.int32), rows)
         tokens = mx.argmax(logits, axis=-1)
         mx.eval(tokens, *cache.storage.buffers)
         return DraftTokenIds(req_ids=req_ids, draft_token_ids=tokens.tolist())

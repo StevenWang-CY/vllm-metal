@@ -189,9 +189,7 @@ def test_missing_and_discontinuous_features_fail_before_drafting():
         proposer.propose(_prefill(state, _features(1), 1, True))
 
 
-@pytest.mark.parametrize(
-    "restriction", ["prefix", "lora", "tp", "block_size", "dynamic"]
-)
+@pytest.mark.parametrize("restriction", ["prefix", "lora", "tp", "block_size"])
 def test_unsupported_configuration_fails_before_loading(restriction):
     config = SimpleNamespace(
         speculative_config=SimpleNamespace(
@@ -216,9 +214,135 @@ def test_unsupported_configuration_fails_before_loading(restriction):
         config.lora_config = object()
     elif restriction == "tp":
         config.parallel_config.tensor_parallel_size = 2
-    elif restriction == "block_size":
-        config.cache_config.block_size = 64
     else:
-        config.speculative_config.num_speculative_tokens_per_batch_size = [(1, 2, 3)]
+        config.cache_config.block_size = 64
     with pytest.raises(NotImplementedError):
         DFlashProposer.build(runner)
+
+
+def test_width_changes_commit_verified_rows_and_reuse_compiled_callables(monkeypatch):
+    proposer = _setup()
+    state = RequestState(
+        token_ids=[1] * 15 + [2],
+        prompt_len=15,
+        sampling_params=SamplingParams(temperature=0),
+        block_ids=[[0], [5, 2, 7, 1]],
+    )
+    compiled_widths = []
+    compile_draft = proposer.cache.compile_draft
+
+    def compile_width(**kwargs):
+        compiled_widths.append(kwargs["num_draft_tokens"])
+        return compile_draft(**kwargs)
+
+    monkeypatch.setattr(proposer.cache, "compile_draft", compile_width)
+    committed = _features(15)
+    result = proposer.propose(_prefill(state, committed, 0, True))
+    # Incoming verification and outgoing proposal widths are independent.
+    # Consecutive K=0 steps still grow committed context before K grows again.
+    for step, width in enumerate((1, 0, 0, 3, 1, 3)):
+        previous = result.draft_token_ids[0] if result is not None else []
+        accepted = min(step % 4, len(previous))
+        sampled = previous[:accepted] + [4]
+        start = len(state.token_ids) - 1
+        segment = PagedDecodeSegment(
+            req_id="r",
+            input_token_ids=(state.token_ids[-1], *previous),
+            start_row=0,
+            num_query_tokens=1 + len(previous),
+            draft_token_ids=tuple(previous),
+            cache_start_pos=start,
+            block_ids=tuple(tuple(g) for g in state.block_ids),
+        )
+        state.token_ids.extend(sampled)
+        feature = _features(segment.num_query_tokens)
+        result = proposer.propose(
+            replace(
+                _prefill(state, feature, 0, False),
+                decode_reqs=[("r", state)],
+                decode_segments=[segment],
+                decode_token_ids=[sampled],
+                prefill_reqs=[],
+                prefill_token_ids=[],
+                prefill_result_modes=[],
+                num_decode_segments=1,
+                num_speculative_tokens=width,
+            )
+        )
+        committed = tuple(
+            mx.concatenate([old, new[: len(sampled)]])
+            for old, new in zip(committed, feature, strict=True)
+        )
+        end = len(state.token_ids) - 1
+        assert proposer._valid_ends == {"r": end}
+        full_features = [f[None] for f in committed]
+        # Inspect actual KV: argmax agreement alone can hide a bad ingest.
+        for layer, (keys, values) in enumerate(
+            proposer.model._project_context(full_features)
+        ):
+            for stored, expected in (
+                (proposer.cache.cache.key_caches[layer], keys),
+                (proposer.cache.cache.value_caches[layer], values),
+            ):
+                actual = mx.stack(
+                    [stored[state.block_ids[1][p // 16], p % 16] for p in range(end)]
+                )
+                np.testing.assert_allclose(
+                    np.array(actual),
+                    np.array(expected[0].transpose(1, 0, 2)),
+                    atol=0.004,
+                    rtol=0.004,
+                )
+        if width == 0:
+            assert result is None
+        else:
+            expected = proposer.model.draft_logits(
+                mx.array([4]),
+                full_features,
+                num_draft_tokens=width,
+                embed=proposer.embed,
+                project=proposer.project,
+            )
+            assert result.draft_token_ids == mx.argmax(expected, -1).tolist()
+    assert compiled_widths == [3, 1]
+    # Rebinding storage must discard closures over the previous allocation.
+    proposer.bind_cache(proposer.cache.storage, group_index=1, max_model_len=64)
+    assert not proposer._drafts and not proposer._valid_ends
+
+
+@pytest.mark.parametrize("width", [-1, 4])
+def test_invalid_width_fails_before_committing_features(width):
+    proposer = _setup()
+    state = RequestState(
+        token_ids=[1, 2],
+        prompt_len=1,
+        sampling_params=SamplingParams(temperature=0),
+        block_ids=[[0], [5]],
+    )
+    ctx = replace(_prefill(state, _features(1), 0, True), num_speculative_tokens=width)
+    before = [np.array(buffer) for buffer in proposer.cache.storage.buffers]
+    with pytest.raises(ValueError, match="configured token budget"):
+        proposer.propose(ctx)
+    assert not proposer._valid_ends and not proposer._drafts
+    for actual, expected in zip(proposer.cache.storage.buffers, before, strict=True):
+        np.testing.assert_array_equal(np.array(actual), expected)
+
+
+@pytest.mark.parametrize("width", [1, 3])
+def test_context_limit_uses_selected_width(width):
+    proposer = _setup()
+    proposer.cache.max_model_len = 17
+    state = RequestState(
+        token_ids=[1] * 15 + [2],
+        prompt_len=15,
+        sampling_params=SamplingParams(temperature=0),
+        block_ids=[[0], [5, 2]],
+    )
+    result = proposer.propose(
+        replace(_prefill(state, _features(15), 0, True), num_speculative_tokens=width)
+    )
+    assert proposer._valid_ends == {"r": 15}
+    if width == 1:
+        assert len(result.draft_token_ids[0]) == 1
+    else:
+        assert result is None
