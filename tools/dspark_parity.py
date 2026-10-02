@@ -29,12 +29,13 @@ from transformers import Qwen3Config
 
 from tools.attention_bench_utils import package_versions
 from vllm_metal.v1.dflash import DFlashTargetCapture
+from vllm_metal.v1.draft_checkpoint import load_draft_weights
 from vllm_metal.v1.dspark import DSparkConfig, load_dspark
 
 
 def compare(actual, expected, *, atol, rtol):
     actual = np.array(actual.astype(mx.float32))
-    expected = expected.detach().float().numpy()
+    expected = expected.detach().float().cpu().numpy()
     if actual.shape != expected.shape or not actual.size:
         raise ValueError(f"Incomplete comparison: {actual.shape} != {expected.shape}")
     if not np.isfinite(actual).all() or not np.isfinite(expected).all():
@@ -47,7 +48,7 @@ def compare(actual, expected, *, atol, rtol):
 
 
 def check_tokens(actual, expected, actual_logits, expected_logits):
-    actual, expected = np.array(actual), expected.numpy()
+    actual, expected = np.array(actual), expected.detach().cpu().numpy()
     if actual.shape != expected.shape:
         raise AssertionError("DSpark proposal shapes differ")
     mismatches = np.argwhere(actual != expected)
@@ -55,7 +56,7 @@ def check_tokens(actual, expected, actual_logits, expected_logits):
         row, position = mismatches[0]
         a, b = int(actual[row, position]), int(expected[row, position])
         native = np.array(actual_logits[row, position].astype(mx.float32))
-        reference = expected_logits[row, position].float().numpy()
+        reference = expected_logits[row, position].detach().float().cpu().numpy()
         raise AssertionError(
             f"DSpark proposal mismatch at row {row}, position {position}: "
             f"native token {a}, reference token {b}; "
@@ -220,7 +221,7 @@ def qualify(args):
             Path(function.__code__.co_filename).name: hashlib.sha256(
                 Path(function.__code__.co_filename).read_bytes()
             ).hexdigest()
-            for function in (load_dspark, DFlashTargetCapture.run)
+            for function in (load_dspark, load_draft_weights, DFlashTargetCapture.run)
         },
         "versions": package_versions("mlx", "mlx-lm", "torch", "transformers"),
         "cases": rows,

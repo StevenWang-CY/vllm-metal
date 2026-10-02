@@ -43,3 +43,18 @@ def test_proposal_mismatch_is_not_accepted_as_a_near_tie():
 def test_proposal_shapes_must_match():
     with pytest.raises(AssertionError, match="shapes"):
         check_tokens(mx.array([[1]]), torch.tensor([[1, 2]]), None, None)
+
+
+@pytest.mark.parametrize("device", ["cpu", "mps", "cuda"])
+def test_reference_device_tensors_compare_and_report_mismatches(device):
+    if device == "mps" and not torch.backends.mps.is_available():
+        pytest.skip("MPS is unavailable")
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    native = mx.array([[[1.0, 2.0]]])
+    reference = torch.tensor([[[1.0, 2.0]]], device=device, requires_grad=True)
+    tokens = torch.tensor([[1]], device=device)
+    assert compare(native, reference, atol=0, rtol=0)["exact"]
+    check_tokens(mx.array([[1]]), tokens, native, reference)
+    with pytest.raises(AssertionError, match="native token 0, reference token 1"):
+        check_tokens(mx.array([[0]]), tokens, native, reference)

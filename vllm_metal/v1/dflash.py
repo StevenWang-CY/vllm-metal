@@ -38,11 +38,10 @@ from typing import Any, cast
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_flatten
 from mlx_lm.models.qwen3 import MLP
-from safetensors import safe_open
 
 from vllm_metal.patches.aux_hidden_states import AuxHiddenStateCapture, _Output
+from vllm_metal.v1.draft_checkpoint import load_draft_weights
 
 
 @dataclass(frozen=True)
@@ -351,7 +350,7 @@ class DFlashModel(nn.Module):
         Each feature is [batch, context length, hidden size], in capture order.
         There is no padding: every row in a call has the same context/block size.
         """
-        self._validate_embeddings(embeddings, logits_start)
+        self.validate_embeddings(embeddings, logits_start)
         self._validate_features(features, embeddings.shape[0], embeddings.shape[1])
         return self._block_forward(
             embeddings, self._project_context(features), logits_start=logits_start
@@ -379,7 +378,8 @@ class DFlashModel(nn.Module):
             raise ValueError("DFlash context and block exceed max_position_embeddings")
         return shape[1]
 
-    def _validate_embeddings(self, embeddings: mx.array, logits_start: int) -> None:
+    def validate_embeddings(self, embeddings: mx.array, logits_start: int) -> None:
+        """Check block-state metadata and the selected suffix without evaluating it."""
         if (
             embeddings.ndim != 3
             or embeddings.shape[0] < 1
@@ -450,7 +450,7 @@ class DFlashModel(nn.Module):
         embed: Callable[[mx.array], mx.array],
     ) -> mx.array:
         self._validate_num_draft_tokens(num_draft_tokens)
-        self._validate_anchor_metadata(anchors)
+        self.validate_anchor_metadata(anchors)
         anchors = anchors.astype(mx.int64)
         masks = mx.full(
             (anchors.shape[0], num_draft_tokens),
@@ -459,7 +459,7 @@ class DFlashModel(nn.Module):
         )
         inputs = mx.concatenate([anchors[:, None], masks], axis=1)
         embeddings = embed(inputs)
-        self._validate_embeddings(embeddings, 1)
+        self.validate_embeddings(embeddings, 1)
         return embeddings
 
     def _validate_num_draft_tokens(self, num_draft_tokens: int) -> None:
@@ -515,7 +515,7 @@ class DFlashModel(nn.Module):
         compiled = mx.compile(forward)
 
         def draft(anchors: mx.array, features: Sequence[mx.array]) -> mx.array:
-            self._validate_anchor_metadata(anchors)
+            self.validate_anchor_metadata(anchors)
             length = self._validate_features(features, anchors.shape[0], width)
             bucket = min(
                 ((length + context_bucket_size - 1) // context_bucket_size)
@@ -546,7 +546,8 @@ class DFlashModel(nn.Module):
         return draft
 
     @staticmethod
-    def _validate_anchor_metadata(anchors: mx.array) -> None:
+    def validate_anchor_metadata(anchors: mx.array) -> None:
+        """Check shape/dtype without reading token values; safe during compilation."""
         if (
             anchors.ndim != 1
             or anchors.size < 1
@@ -556,7 +557,7 @@ class DFlashModel(nn.Module):
 
     def validate_anchors(self, anchors: mx.array) -> None:
         """Synchronously validate external token IDs before entering the draft loop."""
-        self._validate_anchor_metadata(anchors)
+        self.validate_anchor_metadata(anchors)
         # Python integers avoid narrowing the vocabulary bound. Check wide IDs
         # before draft_logits converts them, so overflow cannot hide invalid IDs.
         min_anchor = cast(int, anchors.min().item())
@@ -570,35 +571,6 @@ def load_dflash(path: str | Path, *, target_config: Mapping[str, Any]) -> DFlash
     path = Path(path)
     config = DFlashConfig.from_dict(json.loads((path / "config.json").read_text()))
     config.validate_target(target_config)
-    files = sorted(path.glob("*.safetensors"))
-    if len(files) != 1 or (path / "model.safetensors.index.json").exists():
-        raise ValueError("DFlash qualification requires one unsharded safetensors file")
     model = DFlashModel(config)
-    parameters = cast(list[tuple[str, mx.array]], tree_flatten(model.parameters()))
-    expected = {name: tuple(t.shape) for name, t in parameters}
-    # Check headers before evaluating any checkpoint or randomly initialized weight.
-    with safe_open(files[0], framework="numpy") as stream:
-        if set(stream.keys()) != expected.keys():
-            raise ValueError("DFlash checkpoint tensor names do not match the model")
-        dtypes = set()
-        for name, shape in expected.items():
-            tensor = stream.get_slice(name)
-            dtypes.add(tensor.get_dtype())
-            if tuple(tensor.get_shape()) != shape or tensor.get_dtype() not in {
-                "F16",
-                "BF16",
-                "F32",
-            }:
-                raise ValueError(f"Invalid DFlash tensor shape or dtype: {name}")
-        if len(dtypes) != 1:
-            raise ValueError(
-                "DFlash qualification requires uniform checkpoint precision"
-            )
-    weights = cast(dict[str, mx.array], mx.load(files[0]))
-    model.load_weights(list(weights.items()), strict=True)
-    model.eval()
-    mx.eval(model.parameters())
-    parameters = cast(list[tuple[str, mx.array]], tree_flatten(model.parameters()))
-    if not all(bool(mx.all(mx.isfinite(t))) for _, t in parameters):
-        raise ValueError("DFlash checkpoint contains non-finite weights")
+    load_draft_weights(model, path, model_name="DFlash")
     return model

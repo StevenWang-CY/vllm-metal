@@ -21,7 +21,9 @@
 # SOFTWARE.
 """Qwen3 DSpark checkpoint forward, before scheduler/serving integration.
 
-Head semantics follow DeepSpec at 005e03b81cec38b7da6399833d609ee89a2587f2.
+Adapted from deepseek-ai/DeepSpec (deepspec/modeling/dspark/qwen3/modeling.py,
+markov_head.py, and common.py) at 005e03b81cec38b7da6399833d609ee89a2587f2.
+The upstream MIT copyright and permission notice are retained above.
 The full-context Qwen3 backbone is shared with DFlash. DSpark owns its embedding
 and output head and predicts from slot zero, with sequential Markov corrections.
 """
@@ -32,14 +34,13 @@ import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_flatten
-from safetensors import safe_open
 
 from vllm_metal.v1.dflash import DFlashConfig, DFlashModel
+from vllm_metal.v1.draft_checkpoint import load_draft_weights
 
 
 @dataclass(frozen=True)
@@ -190,7 +191,7 @@ class DSparkModel(nn.Module):
             or not 1 <= num_draft_tokens <= cfg.block_size
         ):
             raise ValueError("DSpark requires 1 <= num_draft_tokens <= block_size")
-        self.backbone._validate_anchor_metadata(anchors)
+        self.backbone.validate_anchor_metadata(anchors)
         inputs = mx.concatenate(
             [
                 anchors.astype(mx.int64)[:, None],
@@ -215,8 +216,8 @@ class DSparkModel(nn.Module):
         the target anchor first, then the actual preceding draft prediction.
         Confidence is not calibrated here and does not truncate the block.
         """
-        self.backbone._validate_anchor_metadata(anchors)
-        self.backbone._validate_embeddings(hidden, 0)
+        self.backbone.validate_anchor_metadata(anchors)
+        self.backbone.validate_embeddings(hidden, 0)
         if hidden.shape[0] != anchors.shape[0]:
             raise ValueError("DSpark requires one anchor per block")
         if hidden.dtype != self.lm_head.weight.dtype:
@@ -259,39 +260,6 @@ def load_dspark(path: str | Path, *, target_config: Mapping[str, Any]) -> DSpark
     path = Path(path)
     config = DSparkConfig.from_dict(json.loads((path / "config.json").read_text()))
     config.backbone.validate_target(target_config)
-    files = sorted(path.glob("*.safetensors"))
-    if len(files) != 1 or (path / "model.safetensors.index.json").exists():
-        raise ValueError("DSpark qualification requires one unsharded safetensors file")
     model = DSparkModel(config)
-    parameters = cast(list[tuple[str, mx.array]], tree_flatten(model.parameters()))
-    names = {name.removeprefix("backbone."): name for name, _ in parameters}
-    expected = {
-        name.removeprefix("backbone."): tuple(t.shape) for name, t in parameters
-    }
-    with safe_open(files[0], framework="numpy") as stream:
-        if set(stream.keys()) != expected.keys():
-            raise ValueError("DSpark checkpoint tensor names do not match the model")
-        dtypes = set()
-        for name, shape in expected.items():
-            tensor = stream.get_slice(name)
-            dtypes.add(tensor.get_dtype())
-            if tuple(tensor.get_shape()) != shape or tensor.get_dtype() not in {
-                "F16",
-                "BF16",
-                "F32",
-            }:
-                raise ValueError(f"Invalid DSpark tensor shape or dtype: {name}")
-        if len(dtypes) != 1:
-            raise ValueError(
-                "DSpark qualification requires uniform checkpoint precision"
-            )
-    weights = cast(dict[str, mx.array], mx.load(files[0]))
-    model.load_weights(
-        [(names[name], value) for name, value in weights.items()], strict=True
-    )
-    model.eval()
-    mx.eval(model.parameters())
-    parameters = cast(list[tuple[str, mx.array]], tree_flatten(model.parameters()))
-    if not all(bool(mx.all(mx.isfinite(t))) for _, t in parameters):
-        raise ValueError("DSpark checkpoint contains non-finite weights")
+    load_draft_weights(model, path, model_name="DSpark", strip_prefix="backbone.")
     return model

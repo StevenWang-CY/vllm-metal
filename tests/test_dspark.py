@@ -12,6 +12,7 @@ import torch.nn.functional as functional
 from mlx.utils import tree_flatten
 
 from tests.test_dflash import _config, _target_config, _torch_forward
+from vllm_metal.v1.draft_checkpoint import load_draft_weights
 from vllm_metal.v1.dspark import DSparkConfig, DSparkModel, load_dspark
 
 
@@ -262,6 +263,17 @@ def test_checkpoint_round_trip_preserves_all_heads_and_precision(
         expected = weights[name.removeprefix("backbone.")]
         assert value.dtype == dtype
         np.testing.assert_array_equal(array(value), array(expected))
+
+
+def test_checkpoint_rename_rejects_colliding_model_parameters(tmp_path):
+    cfg, _ = checkpoint(tmp_path)
+    model = DSparkModel(cfg)
+    # A top-level fc would alias backbone.fc in the checkpoint namespace.
+    model.fc = model.backbone.fc
+    with pytest.raises(ValueError, match="collide"):
+        load_draft_weights(
+            model, tmp_path, model_name="DSpark", strip_prefix="backbone."
+        )
 
 
 @pytest.mark.parametrize(

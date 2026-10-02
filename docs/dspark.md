@@ -6,6 +6,10 @@ full-context DFlash backbone. Serving integration, scheduler-owned DSpark KV,
 confidence-based planning, and sampled verification remain subsequent work.
 This module does not enable `--speculative-config '{"method":"dspark", ...}'`.
 
+`vllm_metal/v1/dspark.py` adapts the [MIT-licensed DeepSpec implementation](https://github.com/deepseek-ai/DeepSpec/blob/005e03b81cec38b7da6399833d609ee89a2587f2/LICENSE).
+It retains DeepSpec's copyright and full MIT permission notice, following the
+existing DFlash module's approach to third-party attribution.
+
 ## Forward contract
 
 The initial checkpoint is
@@ -31,6 +35,7 @@ since matching dimensions alone do not establish training/tokenizer compatibilit
   Confidence uses that same predecessor and does not truncate the proposal.
 - The loader accepts local, unsharded, uniform FP32/FP16/BF16 safetensors and
   preserves their precision. Tensor names/shapes and finite weights are checked.
+  DFlash and DSpark share these checks in `draft_checkpoint.py`.
   Quantized, gated/RNN-head, GIDD, scaled/partial-RoPE, and non-Qwen3 checkpoints
   are rejected. Confidence heads may be absent or may use hidden states with
   or without Markov embeddings.

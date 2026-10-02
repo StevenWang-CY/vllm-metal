@@ -591,23 +591,31 @@ def test_loader_validates_target_before_reading_weights(tmp_path, field, missing
         load_dflash(tmp_path, target_config=target)
 
 
-def _checkpoint(tmp_path):
+def _checkpoint(tmp_path, dtype=mx.float32):
     model = DFlashModel(_config())
+    model.set_dtype(dtype)
     weights = dict(tree_flatten(model.parameters()))
     (tmp_path / "config.json").write_text(json.dumps(_raw()))
     mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
     return model, weights
 
 
-def test_loading_roundtrip_preserves_checkpoint_and_forward(tmp_path):
-    model, weights = _checkpoint(tmp_path)
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+def test_loading_roundtrip_preserves_checkpoint_and_forward(tmp_path, dtype):
+    model, weights = _checkpoint(tmp_path, dtype)
     loaded = load_dflash(tmp_path, target_config=_target_config())
+    assert not loaded.training
     for name, tensor in tree_flatten(loaded.parameters()):
-        np.testing.assert_array_equal(np.array(tensor), np.array(weights[name]))
-    embeddings = mx.random.normal((1, 4, 32))
-    features = [mx.random.normal((1, 7, 32)) for _ in range(3)]
+        assert tensor.dtype == dtype
+        np.testing.assert_array_equal(
+            np.array(tensor.astype(mx.float32)),
+            np.array(weights[name].astype(mx.float32)),
+        )
+    embeddings = mx.random.normal((1, 4, 32)).astype(dtype)
+    features = [mx.random.normal((1, 7, 32)).astype(dtype) for _ in range(3)]
     np.testing.assert_array_equal(
-        np.array(model(embeddings, features)), np.array(loaded(embeddings, features))
+        np.array(model(embeddings, features).astype(mx.float32)),
+        np.array(loaded(embeddings, features).astype(mx.float32)),
     )
 
 
@@ -624,7 +632,7 @@ def test_loading_roundtrip_preserves_checkpoint_and_forward(tmp_path):
         "index",
     ],
 )
-def test_loading_rejects_incompatible_weights(tmp_path, corruption):
+def test_loading_rejects_incompatible_weights(tmp_path, corruption, monkeypatch):
     _, weights = _checkpoint(tmp_path)
     if corruption == "missing":
         weights.pop("fc.weight")
@@ -643,6 +651,12 @@ def test_loading_rejects_incompatible_weights(tmp_path, corruption):
     else:
         (tmp_path / "model.safetensors.index.json").write_text("{}")
     mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+    if corruption != "nonfinite":
+
+        def fail_load(*args, **kwargs):
+            raise AssertionError("Invalid checkpoint headers must fail before mx.load")
+
+        monkeypatch.setattr(mx, "load", fail_load)
     with pytest.raises(ValueError):
         load_dflash(tmp_path, target_config=_target_config())
 

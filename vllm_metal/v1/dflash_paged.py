@@ -185,7 +185,7 @@ class DFlashPagedCache:
         compiled = mx.compile(forward)
 
         def draft(anchors, rows):
-            model._validate_anchor_metadata(anchors)
+            model.validate_anchor_metadata(anchors)
             if len(rows) != anchors.shape[0]:
                 raise ValueError("DFlash needs one block table per anchor")
             tables, offsets, slots, ranges = [], [], [], []
