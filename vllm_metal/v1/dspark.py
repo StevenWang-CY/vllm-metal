@@ -40,7 +40,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from vllm_metal.v1.dflash import DFlashConfig, DFlashModel
-from vllm_metal.v1.draft_checkpoint import load_draft_weights
+from vllm_metal.v1.draft_checkpoint import COMMON_DRAFT_OPTIONS, load_draft_weights
 
 
 @dataclass(frozen=True)
@@ -70,24 +70,12 @@ class DSparkConfig:
         if raw.get("markov_head_type") != "vanilla":
             raise ValueError("DSpark requires an explicit vanilla markov_head_type")
         supported = {
-            "hidden_act": "silu",
-            "attention_bias": False,
-            "attention_dropout": 0.0,
-            "use_sliding_window": False,
-            "sliding_window": None,
-            "rope_scaling": None,
+            **COMMON_DRAFT_OPTIONS,
             "partial_rotary_factor": 1.0,
             "tie_word_embeddings": False,
-            "quantization": None,
-            "quantization_config": None,
-            "is_causal": False,
             "dflash_query_causal": False,
             "log_snr_conditioning": False,
             "enable_qwen35_gated_q_proj": False,
-            "input_embedding_scale": 1.0,
-            "output_multiplier": 1.0,
-            "final_logit_softcapping": None,
-            "sample_from_anchor": False,
         }
         for name, expected in supported.items():
             if raw.get(name, expected) != expected:
@@ -143,9 +131,6 @@ class _MarkovHead(nn.Module):
         self.markov_w1 = nn.Embedding(vocab_size, rank)
         self.markov_w2 = nn.Linear(rank, vocab_size, bias=False)
 
-    def __call__(self, previous_ids: mx.array) -> mx.array:
-        return self.markov_w2(self.markov_w1(previous_ids))
-
 
 class _ConfidenceHead(nn.Module):
     def __init__(self, input_dim: int) -> None:
@@ -185,6 +170,12 @@ class DSparkModel(nn.Module):
         (excluding the anchor), using the shared HF target-capture convention.
         External token IDs must first pass validate_anchors outside compilation.
         """
+        if any(f.dtype != self.embed_tokens.weight.dtype for f in features):
+            raise ValueError("DSpark features must use the checkpoint precision")
+        return self.backbone(self.block_embeddings(anchors, num_draft_tokens), features)
+
+    def block_embeddings(self, anchors: mx.array, num_draft_tokens: int) -> mx.array:
+        """Embed the anchor and K-1 masks for dense or paged block attention."""
         cfg = self.config.backbone
         if (
             type(num_draft_tokens) is not int
@@ -203,9 +194,7 @@ class DSparkModel(nn.Module):
             ],
             axis=1,
         )
-        if any(f.dtype != self.embed_tokens.weight.dtype for f in features):
-            raise ValueError("DSpark features must use the checkpoint precision")
-        return self.backbone(self.embed_tokens(inputs), features)
+        return self.embed_tokens(inputs)
 
     def greedy_proposal(
         self, hidden: mx.array, anchors: mx.array
@@ -224,10 +213,11 @@ class DSparkModel(nn.Module):
             raise ValueError("DSpark block states must use the checkpoint precision")
         logits = self.lm_head(hidden)
         previous = anchors.astype(mx.int64)
-        tokens, corrected, predecessors = [], [], []
+        tokens, corrected, previous_embeddings = [], [], []
         for i in range(hidden.shape[1]):
-            predecessors.append(previous)
-            step_logits = logits[:, i] + self.markov_head(previous)
+            embedding = self.markov_head.markov_w1(previous)
+            previous_embeddings.append(embedding)
+            step_logits = logits[:, i] + self.markov_head.markov_w2(embedding)
             previous = mx.argmax(step_logits, axis=-1)
             tokens.append(previous)
             corrected.append(step_logits)
@@ -238,7 +228,7 @@ class DSparkModel(nn.Module):
                 inputs = mx.concatenate(
                     [
                         hidden,
-                        self.markov_head.markov_w1(mx.stack(predecessors, axis=1)),
+                        mx.stack(previous_embeddings, axis=1),
                     ],
                     axis=-1,
                 )

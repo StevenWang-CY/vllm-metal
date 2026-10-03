@@ -41,7 +41,7 @@ import mlx.nn as nn
 from mlx_lm.models.qwen3 import MLP
 
 from vllm_metal.patches.aux_hidden_states import AuxHiddenStateCapture, _Output
-from vllm_metal.v1.draft_checkpoint import load_draft_weights
+from vllm_metal.v1.draft_checkpoint import COMMON_DRAFT_OPTIONS, load_draft_weights
 
 
 @dataclass(frozen=True)
@@ -110,19 +110,7 @@ class DFlashConfig:
             or raw.get("model_type") != "qwen3"
         ):
             raise ValueError("Expected a z-lab Qwen3 DFlashDraftModel checkpoint")
-        supported = {
-            "hidden_act": "silu",
-            "attention_bias": False,
-            "attention_dropout": 0.0,
-            "use_sliding_window": False,
-            "sliding_window": None,
-            "rope_scaling": None,
-            "rope_parameters": None,
-            "quantization": None,
-            "quantization_config": None,
-            "is_causal": False,
-            "sample_from_anchor": False,
-        }
+        supported = {**COMMON_DRAFT_OPTIONS, "rope_parameters": None}
         for name, expected in supported.items():
             if raw.get(name, expected) != expected:
                 raise ValueError(f"Unsupported DFlash {name}: {raw[name]!r}")
@@ -135,10 +123,7 @@ class DFlashConfig:
             "final_logit_softcapping": None,
             "sample_from_anchor": False,
         }.items():
-            if (
-                raw.get(name, expected) != expected
-                or draft.get(name, expected) != expected
-            ):
+            if draft.get(name, expected) != expected:
                 raise ValueError(f"Unsupported DFlash {name}")
         try:
             values = {

@@ -12,7 +12,7 @@ import torch.nn.functional as functional
 from mlx.utils import tree_flatten
 
 from tests.test_dflash import _config, _target_config, _torch_forward
-from vllm_metal.v1.draft_checkpoint import load_draft_weights
+from vllm_metal.v1.draft_checkpoint import COMMON_DRAFT_OPTIONS, load_draft_weights
 from vllm_metal.v1.dspark import DSparkConfig, DSparkModel, load_dspark
 
 
@@ -359,3 +359,44 @@ def test_sharded_checkpoint_rejected(tmp_path, extra_file):
     (tmp_path / extra_file).write_text("{}")
     with pytest.raises(ValueError, match="unsharded"):
         load_dspark(tmp_path, target_config=_target_config(cfg.backbone))
+
+
+@pytest.mark.parametrize("name", list(COMMON_DRAFT_OPTIONS))
+def test_shared_unsupported_semantics_rejected_by_both_drafters(name):
+    from tests.test_dflash import _raw
+    from vllm_metal.v1.dflash import DFlashConfig
+
+    expected = COMMON_DRAFT_OPTIONS[name]
+    invalid = (
+        not expected
+        if isinstance(expected, bool)
+        else (
+            "unsupported"
+            if expected is None or isinstance(expected, str)
+            else expected + 1
+        )
+    )
+    for parse, raw in (
+        (DFlashConfig.from_dict, _raw()),
+        (DSparkConfig.from_dict, raw_config(config())),
+    ):
+        with pytest.raises(ValueError, match=name):
+            parse({**raw, name: invalid})
+
+
+def test_confidence_reuses_each_markov_embedding(monkeypatch):
+    import mlx.nn as nn
+
+    model = DSparkModel(config())
+    original = nn.Embedding.__call__
+    calls = []
+
+    def counted(self, ids):
+        if self is model.markov_head.markov_w1:
+            calls.append(ids.shape)
+        return original(self, ids)
+
+    monkeypatch.setattr(nn.Embedding, "__call__", counted)
+    result = model.greedy_proposal(mx.ones((2, 7, 32)), mx.array([3, 5]))
+    mx.eval(result)
+    assert calls == [(2,)] * 7

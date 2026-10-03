@@ -24,13 +24,31 @@
 Extracted from the MIT-licensed loader in dflash.py.
 """
 
+from collections.abc import Mapping
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten
 from safetensors import safe_open
+
+# Full-attention Qwen3 semantics shared by DFlash and DSpark checkpoints.
+COMMON_DRAFT_OPTIONS: Mapping[str, Any] = {
+    "hidden_act": "silu",
+    "attention_bias": False,
+    "attention_dropout": 0.0,
+    "use_sliding_window": False,
+    "sliding_window": None,
+    "rope_scaling": None,
+    "quantization": None,
+    "quantization_config": None,
+    "is_causal": False,
+    "sample_from_anchor": False,
+    "input_embedding_scale": 1.0,
+    "output_multiplier": 1.0,
+    "final_logit_softcapping": None,
+}
 
 
 def load_draft_weights(
