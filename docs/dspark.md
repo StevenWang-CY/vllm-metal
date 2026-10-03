@@ -1,9 +1,10 @@
-# DSpark checkpoint qualification
+# DSpark checkpoint and paged drafting
 
 This is the DSpark model-forward stage of [RFC #825](https://github.com/vllm-project/vllm-metal/issues/825).
 It implements the Qwen3 DSpark Markov and confidence heads on the shared
-full-context DFlash backbone. Serving integration, scheduler-owned DSpark KV,
-confidence-based planning, and sampled verification remain subsequent work.
+full-context DFlash backbone, with a cache binding for scheduler-owned DSpark KV.
+Serving integration, confidence-based planning, and sampled verification remain
+subsequent work.
 This module does not enable `--speculative-config '{"method":"dspark", ...}'`.
 
 `vllm_metal/v1/dspark.py` adapts the [MIT-licensed DeepSpec implementation](https://github.com/deepseek-ai/DeepSpec/blob/005e03b81cec38b7da6399833d609ee89a2587f2/LICENSE).
@@ -84,3 +85,56 @@ qualification, and serving losslessness therefore remain unestablished.
 Small independent CPU-math tests cover block attention, Markov recurrence,
 confidence predecessor alignment, optional heads, malformed checkpoints, and
 compiled replay. Run them with `pytest tests/test_dspark.py`.
+
+## Scheduler-owned draft KV
+
+`DSparkPagedCache` binds the draft layers' views of a `KVCacheStorage` allocation.
+It shares context projection, scatter, and block attention with `DFlashPagedCache`;
+each adapter keeps its checkpoint's embeddings, prediction alignment, and heads.
+The binding consumes scheduler block tables and never allocates request pages.
+
+- `write_context(features, spans)` takes packed target features and
+  `(block_ids, first_position, row_count)` spans. Commit only verified target rows.
+  After verification, overwrite temporary block KV with those target-feature
+  projections, including for accepted draft tokens.
+- `compile_draft(num_draft_tokens=K)` returns a callable taking anchor IDs and
+  `(block_ids, committed_length)` rows. It returns IDs, corrected logits, and
+  optional raw confidence. It reserves **K slots**, including the anchor, and
+  predicts from every slot. DFlash retains its separate K+1-slot contract.
+- Each block query sees its entire committed prefix and the full draft block.
+  K=1 uses ordinary paged decode because its prefix plus anchor is already the
+  complete block. Larger blocks use explicit bidirectional ranges.
+- Fixed-size block tables and device offsets let a compiled block replay as
+  context grows. Cache writes retain dependencies through shared storage.
+  The caller owns committed lengths, page ownership, and invalidation after
+  preemption or request reuse; the cache does not track request identities.
+
+`pytest tests/test_dspark_paged.py` exercises actual Metal kernels with FP16/BF16,
+cache blocks 8/16/32, widths 1/3/7, optional confidence heads, ragged requests,
+incremental verified commits, rejected tails, and reused pages. Independent CPU
+attention checks logits and confidence. Exact-ID assertions use well-separated
+Markov choices so numerical near ties do not obscure cache errors. Tests also
+check page bounds, untouched target storage, and replay without retracing.
+
+The full-checkpoint diagnostic compares paged proposals against native dense
+DSpark at the same precision, using the snapshots above:
+
+```bash
+python -m tools.dspark_paged_parity \
+    --target /path/to/target/snapshot \
+    --draft /path/to/draft/snapshot \
+    --dtype float16 \
+    --output /path/to/new-paged-results.json
+```
+
+It records all 42 cases, source hashes, tensor errors, and exact-token checks,
+and exits unsuccessfully if any gate fails. On the qualified pair, FP16 matches
+all 231 proposal IDs, but six one-token-prefix cases exceed the strict final-logit
+bound (`atol=0.015`, `rtol=0.02`; maximum absolute error 0.04004).
+The bound is retained and these cases remain failures. This cache binding does
+not establish reduced-precision checkpoint equivalence or serving losslessness;
+those remain gates for the serving adapter.
+
+`--dtype bfloat16` passes 41 of the 42 native comparisons, but fails at batch 2,
+context 1, K=7: the dense path ties at 16.75, while paged attention produces
+16.75 versus 16.625. The changed choice affects subsequent Markov corrections.

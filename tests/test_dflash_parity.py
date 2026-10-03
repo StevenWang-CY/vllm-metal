@@ -8,6 +8,7 @@ import mlx.core as mx
 import pytest
 
 import tools.dflash_parity as dflash_parity
+import tools.dspark_paged_parity as dspark_paged_parity
 import tools.dspark_parity as dspark_parity
 from tools.attention_bench_utils import native_source_hashes
 from tools.dflash_parity import compare
@@ -40,8 +41,12 @@ def test_comparison_distinguishes_numerical_tolerance_from_exact_identity():
 
 @pytest.mark.parametrize(
     "sources",
-    [dflash_parity.NATIVE_SOURCES, dspark_parity.NATIVE_SOURCES],
-    ids=["dflash", "dspark"],
+    [
+        dflash_parity.NATIVE_SOURCES,
+        dspark_parity.NATIVE_SOURCES,
+        dspark_paged_parity.NATIVE_SOURCES,
+    ],
+    ids=["dflash", "dspark", "dspark-paged"],
 )
 def test_reports_hash_the_module_that_admits_the_weights(sources) -> None:
     # The report offers these hashes as evidence for the numbers it records.

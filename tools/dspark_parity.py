@@ -17,8 +17,10 @@ import sys
 from functools import partial
 from pathlib import Path
 
-# Set before importing MLX, including through the target loader.
-os.environ["MLX_ENABLE_TF32"] = "0"
+# Configure only CLI execution, before importing MLX or the target loader.
+# Importing comparison helpers must not alter the caller's environment.
+if __name__ == "__main__":
+    os.environ["MLX_ENABLE_TF32"] = "0"
 
 import mlx.core as mx
 import numpy as np
@@ -68,21 +70,17 @@ def check_tokens(actual, expected, actual_logits, expected_logits):
         )
 
 
-def qualify(args):
-    raw = json.loads((args.draft / "config.json").read_text())
-    config = DSparkConfig.from_dict(raw)
-    target_config = json.loads((args.target / "config.json").read_text())
-    config.backbone.validate_target(target_config)
-    # Capture before loading both drafters to avoid retaining three models.
-    target, tokenizer = load(str(args.target))
-    capture = DFlashTargetCapture(target, config.backbone)
+def capture_samples(target_path, backbone, context_lengths):
+    """Capture native target features/anchors, then release the target weights."""
+    target, tokenizer = load(str(target_path))
+    capture = DFlashTargetCapture(target, backbone)
     samples = []
     prompts = [
         "Explain how a computer works in simple terms. ",
         "Write a Python function that adds two numbers. ",
     ]
     for batch in (1, 2):
-        for length in args.context_lengths:
+        for length in context_lengths:
             ids = [
                 tokenizer.encode(prompts[i] * (length + 1))[:length]
                 for i in range(batch)
@@ -103,6 +101,16 @@ def qualify(args):
     del target, tokenizer, capture, logits, features, anchors
     gc.collect()
     mx.clear_cache()
+
+    return samples
+
+
+def qualify(args):
+    raw = json.loads((args.draft / "config.json").read_text())
+    config = DSparkConfig.from_dict(raw)
+    target_config = json.loads((args.target / "config.json").read_text())
+    config.backbone.validate_target(target_config)
+    samples = capture_samples(args.target, config.backbone, args.context_lengths)
 
     reference_root = args.reference.resolve()
     reference_file = reference_root / "deepspec/modeling/dspark/qwen3/modeling.py"
