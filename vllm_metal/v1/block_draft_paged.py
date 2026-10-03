@@ -37,15 +37,36 @@ class BlockDraftPagedCache:
         self.model = model
         self.storage = storage
         cfg = model.config
-        if len(layer_names) != cfg.num_hidden_layers or any(
-            name not in storage.specs
-            or storage.specs[name].num_kv_heads != cfg.num_key_value_heads
-            or storage.specs[name].head_size != cfg.head_dim
-            or storage.specs[name].head_size_v != cfg.head_dim
-            for name in layer_names
+        if (
+            len(layer_names) != cfg.num_hidden_layers
+            or len(set(layer_names)) != len(layer_names)
+            or any(
+                name not in storage.specs
+                or storage.specs[name].num_kv_heads != cfg.num_key_value_heads
+                or storage.specs[name].head_size != cfg.head_dim
+                or storage.specs[name].head_size_v != cfg.head_dim
+                for name in layer_names
+            )
         ):
             raise ValueError(
-                "Block draft cache layers must match the checkpoint geometry"
+                "Block draft cache layers must be distinct and match the checkpoint geometry"
+            )
+        groups = [
+            group
+            for group in storage.config.kv_cache_groups
+            if any(name in group.layer_names for name in layer_names)
+        ]
+        # Every forward receives ONE scheduler table. Different groups own
+        # different block IDs and may overlay the same physical cache bytes.
+        if len(groups) != 1:
+            raise ValueError("Block draft layers must share one scheduler cache group")
+        layouts = {
+            (storage.specs[name].block_size, storage.specs[name].dtype)
+            for name in layer_names
+        }
+        if len(layouts) != 1:
+            raise ValueError(
+                "Block draft layers must share KV block size and precision"
             )
         self.cache = MetalPagedKVCache.from_upstream(storage, layer_names)
         self.block_size = self.cache.block_size

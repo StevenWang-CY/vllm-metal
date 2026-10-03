@@ -12,10 +12,12 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
+    UniformTypeKVCacheSpecs,
 )
 
 from tests.test_dflash import _config, _torch_forward
 from vllm_metal.attention.caches.storage import KVCacheStorage
+from vllm_metal.v1.dflash_paged import DFlashPagedCache
 from vllm_metal.v1.dspark import DSparkConfig, DSparkModel
 from vllm_metal.v1.dspark_paged import DSparkPagedCache
 
@@ -237,3 +239,62 @@ def test_compiled_block_replays_without_retracing_as_context_grows(monkeypatch):
             rtol=0.006,
         )
     assert len(traces) == 1
+
+
+@pytest.mark.parametrize("drafter", ["dflash", "dspark"])
+@pytest.mark.parametrize("layout", ["duplicate", "separate_groups", "mixed_precision"])
+def test_binding_rejects_layers_that_cannot_share_one_block_table(drafter, layout):
+    model, valid = make_cache()
+    names = ("dspark_layers.0.self_attn", "dspark_layers.1.self_attn")
+    spec = valid.storage.specs[names[0]]
+    storage = valid.storage
+    if layout == "duplicate":
+        names = (names[0], names[0])
+    else:
+        layer_bytes = 12 * spec.page_size_bytes
+        if layout == "separate_groups":
+            groups = [
+                KVCacheGroupSpec(layer_names=[name], kv_cache_spec=spec)
+                for name in names
+            ]
+        else:
+            groups = [
+                KVCacheGroupSpec(
+                    layer_names=list(names),
+                    kv_cache_spec=UniformTypeKVCacheSpecs(
+                        block_size=16,
+                        kv_cache_specs={
+                            names[0]: spec,
+                            names[1]: replace(spec, dtype=torch.bfloat16),
+                        },
+                    ),
+                )
+            ]
+        storage = KVCacheStorage(
+            KVCacheConfig(
+                num_blocks=12,
+                kv_cache_groups=groups,
+                kv_cache_tensors=[
+                    KVCacheTensor(
+                        size=2 * layer_bytes,
+                        layers=[name],
+                        layer_stride=layer_bytes,
+                        block_stride=spec.page_size_bytes,
+                        # Different groups may overlay the same physical bytes;
+                        # they require different scheduler block tables.
+                        offset=0 if layout == "separate_groups" else i * layer_bytes,
+                    )
+                    for i, name in enumerate(names)
+                ],
+                kv_cache_layout="LBNHC",
+            )
+        )
+        if layout == "separate_groups":
+            assert (
+                storage.tensors[names[0]].data_ptr()
+                == storage.tensors[names[1]].data_ptr()
+            )
+    binding = DSparkPagedCache if drafter == "dspark" else DFlashPagedCache
+    backbone = model if drafter == "dspark" else model.backbone
+    with pytest.raises(ValueError):
+        binding(backbone, storage, names, max_model_len=64)

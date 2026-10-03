@@ -92,6 +92,8 @@ compiled replay. Run them with `pytest tests/test_dspark.py`.
 It shares context projection, scatter, and block attention with `DFlashPagedCache`;
 each adapter keeps its checkpoint's embeddings, prediction alignment, and heads.
 The binding consumes scheduler block tables and never allocates request pages.
+Bound layers must be distinct, belong to one scheduler group, and share the
+cache block size and precision. Incompatible bindings are rejected before writes.
 
 - `write_context(features, spans)` takes packed target features and
   `(block_ids, first_position, row_count)` spans. Commit only verified target rows.
