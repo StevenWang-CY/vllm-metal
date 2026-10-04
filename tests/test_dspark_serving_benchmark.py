@@ -1,0 +1,204 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Reject misleading serving evidence and isolate consecutive server arms."""
+
+import contextlib
+import json
+import os
+import signal
+import subprocess
+import sys
+from copy import deepcopy
+
+import pytest
+
+from tools.benchmark.dspark_serving_benchmark import (
+    COUNTERS,
+    metric_counts,
+    scheduler_capacity,
+    stop_server,
+    summarize,
+    validate_measurement,
+)
+
+
+def measurement():
+    result = {
+        "completed": 2,
+        "failed": 0,
+        "input_lens": [3, 5],
+        "output_lens": [8, 8],
+        "total_input_tokens": 8,
+        "total_output_tokens": 16,
+        "errors": ["", ""],
+        "duration": 2.0,
+        "output_throughput": 8.0,
+        "mean_ttft_ms": 10.0,
+        "mean_tpot_ms": 20.0,
+        "p95_ttft_ms": 12.0,
+        "p95_tpot_ms": 25.0,
+        "mean_e2el_ms": 200.0,
+        "p95_e2el_ms": 220.0,
+    }
+    before = dict.fromkeys(COUNTERS, 0.0)
+    before.update(requests=2.0, drafts=3.0, draft_tokens=21.0, accepted_tokens=9.0)
+    after = {
+        "requests": 4.0,
+        "drafts": 10.0,
+        "draft_tokens": 40.0,
+        "accepted_tokens": 15.0,
+        "preemptions": 1.0,
+    }
+    return result, before, after
+
+
+def test_counts_exclude_created_series_and_per_position_acceptance():
+    text = """# TYPE vllm:spec_decode_num_accepted_tokens counter
+vllm:spec_decode_num_accepted_tokens_total{model_name="some model"} 10
+vllm:spec_decode_num_accepted_tokens_created{model_name="some model"} 123
+vllm:spec_decode_num_accepted_tokens_per_pos_total{position="0"} 10
+vllm:request_success_total{finished_reason="length"} 2
+vllm:request_success_total{finished_reason="stop"} 3
+"""
+    counts = metric_counts(text)
+    assert counts["requests"] == 5
+    assert counts["accepted_tokens"] == 10
+    assert counts["draft_tokens"] == 0
+
+
+def test_measurement_uses_only_completed_timed_requests():
+    result, before, after = measurement()
+    assert validate_measurement(
+        result, before, after, input_lens=[3, 5], output_len=8, arm="dspark"
+    ) == {
+        "requests": 2.0,
+        "drafts": 7.0,
+        "draft_tokens": 19.0,
+        "accepted_tokens": 6.0,
+        "preemptions": 1.0,
+    }
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("completed", 1),
+        ("failed", 1),
+        ("input_lens", [5, 3]),
+        ("output_lens", [8, 7]),
+        ("total_output_tokens", 15),
+        ("errors", ["", "truncated"]),
+        ("errors", []),
+        ("output_throughput", float("nan")),
+        ("mean_tpot_ms", float("inf")),
+        ("duration", 0.0),
+    ],
+)
+def test_rejects_partial_or_mismatched_benchmark(key, value):
+    result, before, after = measurement()
+    result[key] = value
+    with pytest.raises(ValueError):
+        validate_measurement(
+            result, before, after, input_lens=[3, 5], output_len=8, arm="dspark"
+        )
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("requests", 5.0),  # an extra warmup/test request contaminated the window
+        ("draft_tokens", 21.0),  # spec configured, but only the warmup drafted
+        ("drafts", -1.0),
+        ("accepted_tokens", 50.0),
+        ("preemptions", float("nan")),
+        ("requests", 4.5),
+    ],
+)
+def test_rejects_invalid_or_non_drafting_server_evidence(key, value):
+    result, before, after = measurement()
+    after[key] = value
+    with pytest.raises(ValueError):
+        validate_measurement(
+            result, before, after, input_lens=[3, 5], output_len=8, arm="dspark"
+        )
+
+
+def test_baseline_cannot_include_drafting():
+    result, before, after = measurement()
+    with pytest.raises(ValueError, match="baseline unexpectedly drafted"):
+        validate_measurement(
+            result, before, after, input_lens=[3, 5], output_len=8, arm="target"
+        )
+
+
+def test_summary_pairs_repeats_and_preserves_token_divergence():
+    result, _, _ = measurement()
+    rows = []
+    for repeat in (1, 2):
+        for arm, rate, tokens in (
+            ("target", 8 * repeat, [1, 2]),
+            ("dspark", 6 * repeat, [1, 3]),
+            ("draft_model", 10 * repeat, [1, 2]),
+        ):
+            bench = deepcopy(result)
+            bench["output_throughput"] = rate
+            rows.append(
+                {
+                    "repeat": repeat,
+                    "arm": arm,
+                    "concurrency": 1,
+                    "benchmark": bench,
+                    "tokens": [{"tokens": tokens}],
+                }
+            )
+    # A reversed execution order must still compare each repeat to its own baseline.
+    summary = summarize(rows[::-1])
+    dspark = next(row for row in summary if row["arm"] == "dspark")
+    assert dspark["paired_throughput_ratio_vs_target"] == [0.75, 0.75]
+    assert dspark["exact_sequences_vs_target"] == [0, 0]
+    assert dspark["median_output_tokens_per_s"] == 9
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS process group lifecycle")
+def test_stop_server_reaps_workers_even_after_parent_exits():
+    # Model loading/startup failure can exit the API parent while a worker lives.
+    program = """
+import signal, subprocess, sys
+child = subprocess.Popen([sys.executable, '-c',
+    'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); print("ready",flush=True); time.sleep(60)'],
+    stdout=subprocess.PIPE, text=True)
+assert child.stdout.readline().strip() == 'ready'
+print(child.pid, flush=True)
+"""
+    server = subprocess.Popen(
+        [sys.executable, "-c", program],
+        start_new_session=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        child_pid = json.loads(server.stdout.readline())
+        server.wait(timeout=10)
+        stop_server(server)
+        import psutil
+
+        try:
+            child = psutil.Process(child_pid)
+            child.wait(timeout=10)
+        except psutil.NoSuchProcess:
+            pass
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(server.pid, signal.SIGKILL)
+        server.wait(timeout=10)
+
+
+def test_capacity_uses_scheduler_report_instead_of_physical_page_count():
+    log = "(EngineCore pid=123) INFO CPU KV cache size: 30,400 tokens, Maximum concurrency for 2,048 tokens per request: 14.84x"
+    assert scheduler_capacity(log) == {
+        "tokens": 30400,
+        "max_model_len": 2048,
+        "max_concurrency_rounded": 14.84,
+    }
+    for invalid in ("", log + "\n" + log):
+        with pytest.raises(ValueError, match="cache-capacity report"):
+            scheduler_capacity(invalid)
