@@ -92,6 +92,61 @@ they do not bypass target verification. Serving output checks and checkpoint
 candidate equivalence are separate requirements, and the experimental integration
 does not establish complete DSpark qualification or a speedup.
 
+## Measure HTTP serving and memory
+
+Run the matched three-way comparison from a source checkout on macOS:
+
+```bash
+python -m tools.benchmark.dspark_serving_benchmark \
+    --target /path/to/Qwen3-4B-4bit/snapshot \
+    --dspark /path/to/dspark_qwen3_4b_block7/snapshot \
+    --draft /path/to/Qwen3-0.6B/snapshot \
+    --concurrency 1 4 --repeats 2 --output-len 64 \
+    --output-dir /path/to/new-benchmark-results
+```
+
+Use the pinned target/DSpark pair above and a compatible ordinary draft model.
+All three arms use the same target, tokenizer, plain greedy prompts, output
+length, context/prefill limits, memory fraction, and disabled prefix caching.
+The default workload is the shared 40-prompt parity corpus. For representative
+longer contexts, supply `--prompt-file` with JSONL `{"prompt": "..."}` rows and
+`--num-prompts`; prompts must fit the context limit without truncation. Draft
+widths are recorded separately (`--dspark-width 7`, `--draft-width 3`).
+
+The tool starts fresh loopback-only `vllm serve` processes with multiprocessing
+enabled, reverses arm and concurrency order between repeats, and shuts down each
+server's process group before starting the next. Per concurrency, it performs
+an untimed token-ID comparison pass, a discarded streaming warmup pass, then
+measures with `vllm bench serve`. Full output IDs from the untimed pass are
+retained and compared to that repeat's target-only arm. Sample logprobs are
+never requested, since they disable drafting. Timings use the benchmark's
+streaming usage counts and latency definitions, not SSE chunk counts.
+
+`summary.json` retains every repeat's throughput and paired ratio, latency,
+and exact sequence counts. Each run also saves commands, detailed benchmark
+results, token IDs, server logs, source hashes, and before/after counters.
+Counter snapshots wait for completed requests and exclude both warmup passes;
+a speculative arm with no actual verified drafts fails. Failed, incomplete,
+or mismatched workloads cannot produce a successful summary. Token divergence
+is reported explicitly, without being relabeled as top-k agreement or exact
+losslessness; investigate it with the separate serving parity tool.
+
+Worker snapshots distinguish MLX active/peak allocation, allocator cache, worker
+RSS and lifetime peak RSS, and physical KV backing bytes. The startup snapshot
+includes model loading and profiling; the measured phase resets only the MLX
+peak counter. These are different accounting domains on unified memory and
+must not be added together. Worker RSS excludes the API/client processes;
+reserved KV bytes do not mean every page is resident. The scheduler's own
+reported token capacity accounts for cache groups and is saved separately.
+Equal memory fractions can yield different usable capacities across arms.
+
+Follow the [macOS benchmark guide](benchmarking-macos.md) for warmup, power,
+thermal state and desktop contention. Before/after machine observations are
+saved; they cannot rule out interference during a run. Natural continuations
+can differ even under greedy sampling, so these measurements do not establish
+bitwise losslessness or a general speedup. The RFC's Qwen3-8B/0.6B comparison
+requires its own matched DSpark checkpoint and separate run.
+
 ## Forward contract
 
 The initial checkpoint is
