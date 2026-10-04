@@ -118,18 +118,22 @@ enabled, reverses arm and concurrency order between repeats, and shuts down each
 server's process group before starting the next. Per concurrency, it performs
 an untimed token-ID comparison pass, a discarded streaming warmup pass, then
 measures with `vllm bench serve`. Full output IDs from the untimed pass are
-retained and compared to that repeat's target-only arm. Sample logprobs are
-never requested, since they disable drafting. Timings use the benchmark's
-streaming usage counts and latency definitions, not SSE chunk counts.
+retained and compared to that repeat's target-only arm. That pass submits
+batches of prompts in one completion request; the timed pass sends independent
+concurrent streaming requests. Exact-match counts describe only the untimed
+pass. Sample logprobs are never requested, since they disable drafting. Timings
+use the benchmark's streaming usage counts and latency definitions, not SSE
+chunk counts.
 
 `summary.json` retains every repeat's throughput and paired ratio, latency,
 and exact sequence counts. Each run also saves commands, detailed benchmark
 results, token IDs, server logs, source hashes, and before/after counters.
 Counter snapshots wait for completed requests and exclude both warmup passes;
-a speculative arm with no actual verified drafts fails. Failed, incomplete,
-or mismatched workloads cannot produce a successful summary. Token divergence
-is reported explicitly, without being relabeled as top-k agreement or exact
-losslessness; investigate it with the separate serving parity tool.
+a missing required counter or a speculative arm with no actual verified drafts
+fails. Failed, incomplete, or mismatched workloads cannot produce a successful
+summary. Token divergence is reported explicitly, without being relabeled as
+top-k agreement or exact losslessness; investigate it with the separate serving
+parity tool.
 
 Worker snapshots distinguish MLX active/peak allocation, allocator cache, worker
 RSS and lifetime peak RSS, and physical KV backing bytes. The startup snapshot

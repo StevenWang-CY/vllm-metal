@@ -13,6 +13,7 @@ import pytest
 
 from tools.benchmark.dspark_serving_benchmark import (
     COUNTERS,
+    machine_state,
     metric_counts,
     scheduler_capacity,
     stop_server,
@@ -58,11 +59,45 @@ vllm:spec_decode_num_accepted_tokens_created{model_name="some model"} 123
 vllm:spec_decode_num_accepted_tokens_per_pos_total{position="0"} 10
 vllm:request_success_total{finished_reason="length"} 2
 vllm:request_success_total{finished_reason="stop"} 3
+vllm:spec_decode_num_drafts_total 4
+vllm:spec_decode_num_draft_tokens_total 12
+vllm:num_preemptions_total 0
 """
-    counts = metric_counts(text)
+    counts = metric_counts(text, arm="dspark")
     assert counts["requests"] == 5
     assert counts["accepted_tokens"] == 10
-    assert counts["draft_tokens"] == 0
+    assert counts["draft_tokens"] == 12
+    assert counts["preemptions"] == 0
+
+
+def test_target_only_can_omit_speculation_counters():
+    text = "vllm:request_success_total 2\nvllm:num_preemptions_total 0\n"
+    assert metric_counts(text, arm="target") == dict.fromkeys(COUNTERS, 0) | {
+        "requests": 2
+    }
+
+
+@pytest.mark.parametrize("missing", COUNTERS)
+@pytest.mark.parametrize("arm", ("dspark", "draft_model"))
+def test_missing_counter_cannot_be_reported_as_zero(missing, arm):
+    text = "\n".join(f"{name} 0" for key, name in COUNTERS.items() if key != missing)
+    with pytest.raises(ValueError, match="Missing server counter"):
+        metric_counts(text, arm=arm)
+
+
+@pytest.mark.parametrize("missing", ("requests", "preemptions"))
+def test_target_only_still_requires_workload_counters(missing):
+    text = "\n".join(f"{name} 0" for key, name in COUNTERS.items() if key != missing)
+    with pytest.raises(ValueError, match="Missing server counter"):
+        metric_counts(text, arm="target")
+
+
+@pytest.mark.parametrize("value", ("NaN", "+Inf", "-1", "0.5"))
+def test_invalid_cumulative_counter_samples_are_rejected(value):
+    text = "\n".join(f"{name} 0" for name in COUNTERS.values())
+    text += f'\nvllm:num_preemptions_total{{engine="1"}} {value}\n'
+    with pytest.raises(ValueError, match="Invalid server counter"):
+        metric_counts(text, arm="dspark")
 
 
 def test_measurement_uses_only_completed_timed_requests():
@@ -202,3 +237,14 @@ def test_capacity_uses_scheduler_report_instead_of_physical_page_count():
     for invalid in ("", log + "\n" + log):
         with pytest.raises(ValueError, match="cache-capacity report"):
             scheduler_capacity(invalid)
+
+
+def test_machine_state_survives_stalled_system_tools(monkeypatch):
+    def stalled(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(subprocess, "run", stalled)
+    state = machine_state()
+    assert state["power"]["returncode"] is None
+    assert "TimeoutExpired" in state["thermal"]["stderr"]
+    assert state["gpu_device_utilization_percent"] is None

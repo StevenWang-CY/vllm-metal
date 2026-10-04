@@ -127,29 +127,37 @@ def memory_snapshot(base: str, *, reset: bool = False) -> dict:
     return result[0]
 
 
-def metric_counts(text: str) -> dict[str, float]:
+def metric_counts(text: str, *, arm: str) -> dict[str, float]:
     samples = [
         s for family in text_string_to_metric_families(text) for s in family.samples
     ]
-    return {
-        key: sum(s.value for s in samples if s.name == name)
-        for key, name in COUNTERS.items()
-    }
+    counts = {}
+    for key, name in COUNTERS.items():
+        values = [s.value for s in samples if s.name == name]
+        # Non-speculative servers do not register speculation counters. Every
+        # other missing series is unavailable evidence, not an observed zero.
+        if not values and not (
+            arm == "target" and key in ("drafts", "draft_tokens", "accepted_tokens")
+        ):
+            raise ValueError(f"Missing server counter: {name}")
+        if any(not math.isfinite(v) or v < 0 or not v.is_integer() for v in values):
+            raise ValueError(f"Invalid server counter: {name}")
+        counts[key] = sum(values)
+    return counts
 
 
-def settled_metrics(base: str, expected_requests: int, path: Path) -> dict:
-    # The API server publishes engine counters periodically. Wait until all
-    # finished requests are visible before taking either side of a delta.
+def settled_metrics(base: str, expected_requests: int, path: Path, *, arm: str) -> dict:
+    # Engine counters may lag the final HTTP response. Wait until all finished
+    # requests are visible before taking either side of a delta.
     deadline = time.monotonic() + 30
     while True:
         with urlopen(base + "/metrics", timeout=5) as response:
             text = response.read().decode()
-        counts = metric_counts(text)
+        path.write_text(text)
+        counts = metric_counts(text, arm=arm)
         if counts["requests"] == expected_requests:
-            path.write_text(text)
             return counts
         if counts["requests"] > expected_requests or time.monotonic() > deadline:
-            path.write_text(text)
             raise ValueError(f"Incomplete/unexpected request counters: {counts}")
         time.sleep(0.25)
 
@@ -219,7 +227,16 @@ def machine_state() -> dict:
     import psutil
 
     def observe(command):
-        result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+        # Observations are context, so a stalled or missing system tool must
+        # not discard a long benchmark run.
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return {
+                "returncode": None,
+                "stdout": "",
+                "stderr": f"{type(exc).__name__}: {exc}",
+            }
         return {
             "returncode": result.returncode,
             "stdout": result.stdout,
@@ -413,7 +430,7 @@ def run_arm(
                     phase_dir = run_dir / phase
                     phase_dir.mkdir()
                     before = settled_metrics(
-                        base, completed, phase_dir / "metrics-before.txt"
+                        base, completed, phase_dir / "metrics-before.txt", arm=arm
                     )
                     write_json(phase_dir / "machine-before.json", machine_state())
                     write_json(
@@ -437,7 +454,7 @@ def run_arm(
                     write_json(phase_dir / "machine-after.json", machine_state())
                     completed += len(reference)
                     after = settled_metrics(
-                        base, completed, phase_dir / "metrics-after.txt"
+                        base, completed, phase_dir / "metrics-after.txt", arm=arm
                     )
                     result = json.loads((phase_dir / "benchmark.json").read_text())
                     delta = validate_measurement(
@@ -467,7 +484,7 @@ def run_arm(
                     {k: v for k, v in row.items() if k not in ("benchmark", "tokens")},
                 )
                 print(
-                    f"{arm} r{repeat} c{concurrency}: {result['output_throughput']:.2f} output tokens/s; {delta['draft_tokens']:.0f} verified drafts",
+                    f"{arm} r{repeat} c{concurrency}: {result['output_throughput']:.2f} output tokens/s; {delta['draft_tokens']:.0f} verified draft tokens",
                     flush=True,
                 )
         finally:
