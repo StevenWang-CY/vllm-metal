@@ -85,10 +85,27 @@ def make_cache(dtype=mx.float16, *, block_size=16, confidence=True, with_markov=
 def test_ragged_proposals_commit_verified_features_and_reuse_pages(
     dtype, block_size, width, confidence, with_markov
 ):
+    _check_ragged_proposals(dtype, block_size, width, confidence, with_markov)
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("width", [1, 7])
+def test_candidate_limited_proposals_commit_features_and_reuse_pages(dtype, width):
+    _check_ragged_proposals(dtype, 16, width, True, True, draft_topk=8)
+
+
+def _check_ragged_proposals(
+    dtype, block_size, width, confidence, with_markov, draft_topk=None
+):
     model, cache = make_cache(
         dtype, block_size=block_size, confidence=confidence, with_markov=with_markov
     )
-    draft = cache.compile_draft(num_draft_tokens=width)
+    if draft_topk is not None:
+        # Separate candidate scores to avoid an unstable top-k boundary in
+        # reduced precision. The independent attention comparison remains.
+        model.lm_head.weight = mx.zeros((64, 64), dtype=dtype)
+        model.lm_head.weight[:, 0] = (mx.arange(64).astype(dtype) - 32) / 32
+    draft = cache.compile_draft(num_draft_tokens=width, draft_topk=draft_topk)
     tables = [[5, 2, 7, 1], [9, 3, 8, 4]]
     lengths = [block_size - 1, min(2 * block_size - 2, 47)]
     features = [
@@ -137,7 +154,9 @@ def test_ragged_proposals_commit_verified_features_and_reuse_pages(
                 model.backbone, model.block_embeddings(anchor, width), feature
             )
             expected = model.greedy_proposal(
-                mx.array(independent_hidden).astype(dtype), anchor
+                mx.array(independent_hidden).astype(dtype),
+                anchor,
+                draft_topk=draft_topk,
             )
             for observed, reference in zip(actual[1:], expected[1:], strict=True):
                 if reference is None:
@@ -197,6 +216,15 @@ def test_invalid_width_rejected_before_compilation(width):
     _, cache = make_cache()
     with pytest.raises(ValueError, match="width"):
         cache.compile_draft(num_draft_tokens=width)
+
+
+@pytest.mark.parametrize("draft_topk", [0, -1, 65, True, 1.5])
+def test_invalid_candidate_limit_rejected_before_compilation(draft_topk):
+    _, cache = make_cache()
+    with pytest.raises(ValueError, match="draft_topk"):
+        cache.compile_draft(num_draft_tokens=7, draft_topk=draft_topk)
+    for name in ("dspark_layers.0.self_attn", "dspark_layers.1.self_attn"):
+        assert torch.all(torch.isnan(cache.storage.tensors[name]))
 
 
 def test_feature_precision_rejected_before_any_cache_write():

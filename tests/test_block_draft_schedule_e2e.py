@@ -14,7 +14,9 @@ from tests.test_block_draft_serving_e2e import (
 )
 
 
-def _serve_scheduled(baseline_path, verify_window, method, pressure=False):
+def _serve_scheduled(
+    baseline_path, verify_window, method, pressure=False, draft_topk=None
+):
     _spawn_env(verify_window)
     from vllm import SamplingParams
 
@@ -31,12 +33,15 @@ def _serve_scheduled(baseline_path, verify_window, method, pressure=False):
                 [2, 2, 1],
                 [3, 3, 0],
             ],
+            **({"dspark_draft_topk": draft_topk} if draft_topk is not None else {}),
         },
     )
     engine = llm.llm_engine
     scheduler = engine.engine_core.engine_core.scheduler
     runner = engine.model_executor.driver_worker.model_runner
     proposer = runner._drafter
+    if draft_topk is not None:
+        assert proposer.draft_topk == draft_topk
     tokenizer = llm.get_tokenizer()
     prompts = [
         tokenizer.encode("Explain how a computer works. " * 20)[:n] for n in (13, 63)
@@ -172,15 +177,23 @@ def _serve_scheduled(baseline_path, verify_window, method, pressure=False):
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("method", ["dflash", "dspark"])
+@pytest.mark.parametrize(
+    "method,draft_topk", [("dflash", None), ("dspark", None), ("dspark", 64)]
+)
 @pytest.mark.parametrize("verify_window", [False, True])
 def test_block_draft_scheduler_width_transitions(
-    tmp_path, run_in_spawn_process, verify_window, method
+    tmp_path, run_in_spawn_process, verify_window, method, draft_topk
 ):
     baseline = tmp_path / "target.json"
     run_in_spawn_process(_serve, "target", baseline, verify_window, label="target")
     run_in_spawn_process(
-        _serve_scheduled, baseline, verify_window, method, label="scheduled"
+        _serve_scheduled,
+        baseline,
+        verify_window,
+        method,
+        False,
+        draft_topk,
+        label="scheduled",
     )
     run_in_spawn_process(
         _serve_scheduled,
@@ -188,5 +201,6 @@ def test_block_draft_scheduler_width_transitions(
         verify_window,
         method,
         True,
+        draft_topk,
         label="scheduled+pressure",
     )

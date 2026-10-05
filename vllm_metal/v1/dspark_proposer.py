@@ -35,13 +35,16 @@ class DSparkProposer(BlockDraftProposer):
         *,
         num_draft_tokens: int,
         controller: SpeculativeDecodeController,
+        draft_topk: int | None = None,
     ) -> None:
+        model.validate_draft_topk(draft_topk, model.config.backbone.vocab_size)
         super().__init__(
             model.backbone,
             num_draft_tokens=num_draft_tokens,
             controller=controller,
         )
         self.draft_model = model
+        self.draft_topk = draft_topk
 
     @classmethod
     def build(cls, runner: MetalModelRunner) -> DSparkProposer:
@@ -51,14 +54,17 @@ class DSparkProposer(BlockDraftProposer):
             spec.enable_adaptive_verification
             or spec.draft_sample_method != "greedy"
             or spec.rejection_sample_method != "standard"
-            or spec.dspark_draft_topk is not None
-            or getattr(spec.draft_model_config.hf_config, "dspark_draft_topk", None)
-            is not None
         ):
             raise NotImplementedError(
                 "DSpark on Metal requires greedy drafting and standard verification "
-                "without adaptive verification or dspark_draft_topk"
+                "without adaptive verification"
             )
+        hf_config = spec.draft_model_config.hf_config
+        draft_topk = spec.dspark_draft_topk
+        if draft_topk is None:
+            draft_topk = getattr(hf_config, "dspark_draft_topk", None)
+        if draft_topk is not None:
+            DSparkModel.validate_draft_topk(draft_topk, hf_config.vocab_size)
         if (
             spec.quantization is not None
             or spec.draft_model_config.quantization is not None
@@ -85,6 +91,7 @@ class DSparkProposer(BlockDraftProposer):
             model,
             num_draft_tokens=spec.num_speculative_tokens,
             controller=runner._spec_decode_controller,
+            draft_topk=draft_topk,
         )
         proposer.max_model_len = min(
             proposer.max_model_len, spec.draft_model_config.max_model_len
@@ -100,7 +107,9 @@ class DSparkProposer(BlockDraftProposer):
 
     def _compile_draft(self, width: int) -> DraftForward:
         assert isinstance(self.cache, DSparkPagedCache)
-        draft = self.cache.compile_draft(num_draft_tokens=width)
+        draft = self.cache.compile_draft(
+            num_draft_tokens=width, draft_topk=self.draft_topk
+        )
         # The paged adapter has already applied the sequential Markov head.
         # Return its IDs without enabling confidence-based truncation.
         return lambda anchors, rows: draft(anchors, rows)[0]
@@ -108,6 +117,9 @@ class DSparkProposer(BlockDraftProposer):
     def _profile_draft(self, anchors: mx.array, features: Sequence[mx.array]) -> None:
         mx.eval(
             self.draft_model.draft(
-                anchors, features, num_draft_tokens=self.num_draft_tokens
+                anchors,
+                features,
+                num_draft_tokens=self.num_draft_tokens,
+                draft_topk=self.draft_topk,
             )
         )

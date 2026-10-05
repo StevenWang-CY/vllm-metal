@@ -197,13 +197,21 @@ class DSparkModel(nn.Module):
         return self.embed_tokens(inputs)
 
     def greedy_proposal(
-        self, hidden: mx.array, anchors: mx.array
+        self,
+        hidden: mx.array,
+        anchors: mx.array,
+        *,
+        draft_topk: int | None = None,
     ) -> tuple[mx.array, mx.array, mx.array | None]:
         """Return token IDs, corrected logits, and optional raw confidence logits.
 
         Each correction and confidence prediction uses the preceding token:
         the target anchor first, then the actual preceding draft prediction.
         Confidence is not calibrated here and does not truncate the block.
+
+        With draft_topk, only the top base-logit candidates receive Markov
+        corrections; all other corrected logits are -inf. This approximates
+        the proposal, never the target's verification distribution.
         """
         self.backbone.validate_anchor_metadata(anchors)
         self.backbone.validate_embeddings(hidden, 0)
@@ -211,14 +219,40 @@ class DSparkModel(nn.Module):
             raise ValueError("DSpark requires one anchor per block")
         if hidden.dtype != self.lm_head.weight.dtype:
             raise ValueError("DSpark block states must use the checkpoint precision")
+        self.validate_draft_topk(draft_topk, self.config.backbone.vocab_size)
         logits = self.lm_head(hidden)
+        indices = values = None
+        if draft_topk is not None and draft_topk < logits.shape[-1]:
+            indices = mx.argpartition(-logits, kth=draft_topk - 1, axis=-1)[
+                ..., :draft_topk
+            ]
+            # Preserve dense argmax's lowest-token-ID tie break within the
+            # selected set, independent of argpartition's candidate order.
+            indices = mx.sort(indices, axis=-1)
+            values = mx.take_along_axis(logits, indices, axis=-1)
         previous = anchors.astype(mx.int64)
         tokens, corrected, previous_embeddings = [], [], []
         for i in range(hidden.shape[1]):
             embedding = self.markov_head.markov_w1(previous)
             previous_embeddings.append(embedding)
-            step_logits = logits[:, i] + self.markov_head.markov_w2(embedding)
-            previous = mx.argmax(step_logits, axis=-1)
+            if indices is None:
+                step_logits = logits[:, i] + self.markov_head.markov_w2(embedding)
+                previous = mx.argmax(step_logits, axis=-1)
+            else:
+                assert values is not None
+                weights = self.markov_head.markov_w2.weight[indices[:, i]]
+                bias = (weights @ embedding[..., None]).squeeze(-1)
+                candidate_logits = values[:, i] + bias
+                choice = mx.argmax(candidate_logits, axis=-1, keepdims=True)
+                previous = mx.take_along_axis(indices[:, i], choice, axis=-1).squeeze(
+                    -1
+                )
+                step_logits = mx.put_along_axis(
+                    mx.full_like(logits[:, i], -float("inf")),
+                    indices[:, i],
+                    candidate_logits,
+                    axis=-1,
+                )
             tokens.append(previous)
             corrected.append(step_logits)
         confidence = None
@@ -236,10 +270,22 @@ class DSparkModel(nn.Module):
         return mx.stack(tokens, axis=1), mx.stack(corrected, axis=1), confidence
 
     def draft(
-        self, anchors: mx.array, features: Sequence[mx.array], *, num_draft_tokens: int
+        self,
+        anchors: mx.array,
+        features: Sequence[mx.array],
+        *,
+        num_draft_tokens: int,
+        draft_topk: int | None = None,
     ) -> tuple[mx.array, mx.array, mx.array | None]:
         hidden = self.block_hidden(anchors, features, num_draft_tokens=num_draft_tokens)
-        return self.greedy_proposal(hidden, anchors)
+        return self.greedy_proposal(hidden, anchors, draft_topk=draft_topk)
+
+    @staticmethod
+    def validate_draft_topk(draft_topk: int | None, vocab_size: int) -> None:
+        if draft_topk is not None and (
+            type(draft_topk) is not int or not 1 <= draft_topk <= vocab_size
+        ):
+            raise ValueError("DSpark draft_topk must be an integer in [1, vocab_size]")
 
     def validate_anchors(self, anchors: mx.array) -> None:
         self.backbone.validate_anchors(anchors)

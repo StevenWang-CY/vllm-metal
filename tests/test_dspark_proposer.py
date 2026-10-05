@@ -14,16 +14,21 @@ from vllm.config import VllmConfig
 from tests.test_block_draft_proposer import _features, _prefill
 from tests.test_dspark_paged import make_cache
 from vllm_metal.patches.dspark_config import enable_dspark_for_metal_runner
+from vllm_metal.v1 import dspark_proposer
 from vllm_metal.v1.dspark_proposer import DSparkProposer
 from vllm_metal.v1.model_runner import RequestState
 from vllm_metal.v1.spec_decode import SpeculativeDecodeController
 
 
 @pytest.mark.parametrize("width", [1, 3, 7])
-def test_dspark_uses_exactly_k_slots_at_context_and_page_limit(width):
+@pytest.mark.parametrize("draft_topk", [None, 8])
+def test_dspark_uses_exactly_k_slots_at_context_and_page_limit(width, draft_topk):
     model, cache = make_cache()
     proposer = DSparkProposer(
-        model, num_draft_tokens=7, controller=SpeculativeDecodeController()
+        model,
+        num_draft_tokens=7,
+        controller=SpeculativeDecodeController(),
+        draft_topk=draft_topk,
     )
     proposer.bind_cache(cache.storage, group_index=1, max_model_len=16)
     length = 16 - width
@@ -39,7 +44,10 @@ def test_dspark_uses_exactly_k_slots_at_context_and_page_limit(width):
     )
     assert actual is not None and actual.req_ids == ["r"]
     expected = model.draft(
-        mx.array([4]), [f[None] for f in features], num_draft_tokens=width
+        mx.array([4]),
+        [f[None] for f in features],
+        num_draft_tokens=width,
+        draft_topk=draft_topk,
     )[0]
     assert actual.draft_token_ids == expected.tolist()
     assert len(actual.draft_token_ids[0]) == width
@@ -66,8 +74,6 @@ def test_dspark_rejects_width_outside_its_trained_block(width):
         ("draft_sample_method", "probabilistic"),
         ("rejection_sample_method", "block"),
         ("rejection_sample_method", "synthetic"),
-        ("dspark_draft_topk", 16),
-        ("checkpoint_topk", 16),
     ],
 )
 def test_unsupported_drafting_options_fail_before_loading(option, value):
@@ -78,12 +84,64 @@ def test_unsupported_drafting_options_fail_before_loading(option, value):
         rejection_sample_method="standard",
         dspark_draft_topk=None,
     )
-    if option == "checkpoint_topk":
-        spec.draft_model_config.hf_config.dspark_draft_topk = value
-    else:
-        setattr(spec, option, value)
+    setattr(spec, option, value)
     runner = SimpleNamespace(vllm_config=SimpleNamespace(speculative_config=spec))
     with pytest.raises(NotImplementedError, match="greedy drafting"):
+        DSparkProposer.build(runner)
+
+
+@pytest.mark.parametrize(
+    "explicit,checkpoint,expected",
+    [(None, None, None), (None, 8, 8), (16, 8, 16), (64, None, 64)],
+)
+def test_candidate_limit_resolves_explicit_option_before_checkpoint(
+    monkeypatch, explicit, checkpoint, expected
+):
+    model, _ = make_cache()
+    spec = SimpleNamespace(
+        draft_model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(vocab_size=64, dspark_draft_topk=checkpoint),
+            quantization=None,
+            max_model_len=32,
+        ),
+        enable_adaptive_verification=False,
+        draft_sample_method="greedy",
+        rejection_sample_method="standard",
+        dspark_draft_topk=explicit,
+        quantization=None,
+        kv_cache_dtype=None,
+        num_speculative_tokens=7,
+    )
+    runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(speculative_config=spec),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(to_dict=dict)),
+        kv_cache_dtype=mx.float16,
+        _spec_decode_controller=SpeculativeDecodeController(),
+    )
+    monkeypatch.setattr(DSparkProposer, "_checkpoint_path", lambda runner: "unused")
+    monkeypatch.setattr(dspark_proposer, "load_dspark", lambda *a, **kw: model)
+    proposer = DSparkProposer.build(runner)
+    assert proposer.draft_topk == expected
+    assert proposer.max_model_len == 32
+
+
+@pytest.mark.parametrize("source", ["explicit", "checkpoint"])
+@pytest.mark.parametrize("value", [0, -1, 65, True, 1.5])
+def test_invalid_candidate_limit_fails_before_checkpoint_loading(source, value):
+    spec = SimpleNamespace(
+        draft_model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                vocab_size=64,
+                dspark_draft_topk=value if source == "checkpoint" else None,
+            )
+        ),
+        enable_adaptive_verification=False,
+        draft_sample_method="greedy",
+        rejection_sample_method="standard",
+        dspark_draft_topk=value if source == "explicit" else None,
+    )
+    runner = SimpleNamespace(vllm_config=SimpleNamespace(speculative_config=spec))
+    with pytest.raises(ValueError, match="draft_topk"):
         DSparkProposer.build(runner)
 
 
@@ -136,21 +194,27 @@ def test_draft_precision_options_checked_before_loading(
 
 
 @pytest.mark.parametrize("confidence", [False, True])
-def test_profile_materializes_dspark_owned_heads(monkeypatch, confidence):
+@pytest.mark.parametrize("draft_topk", [None, 8])
+def test_profile_materializes_dspark_owned_heads(monkeypatch, confidence, draft_topk):
     model, _ = make_cache(confidence=confidence)
     proposer = DSparkProposer(
-        model, num_draft_tokens=7, controller=SpeculativeDecodeController()
+        model,
+        num_draft_tokens=7,
+        controller=SpeculativeDecodeController(),
+        draft_topk=draft_topk,
     )
     draft = model.draft
     observed = []
 
-    def record(anchors, features, *, num_draft_tokens):
-        observed.append((anchors.shape, num_draft_tokens))
-        return draft(anchors, features, num_draft_tokens=num_draft_tokens)
+    def record(anchors, features, *, num_draft_tokens, draft_topk):
+        observed.append((anchors.shape, num_draft_tokens, draft_topk))
+        return draft(
+            anchors, features, num_draft_tokens=num_draft_tokens, draft_topk=draft_topk
+        )
 
     monkeypatch.setattr(model, "draft", record)
     proposer.profile([f[None] for f in _features(4)], 2)
-    assert observed == [((2,), 7)]
+    assert observed == [((2,), 7, draft_topk)]
     assert proposer.kv_specs(16)[proposer.layer_names[0]].dtype == torch.float16
 
 

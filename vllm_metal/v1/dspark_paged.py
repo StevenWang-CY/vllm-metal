@@ -32,7 +32,7 @@ class DSparkPagedCache(BlockDraftPagedCache):
         self.draft_model = model
 
     def compile_draft(
-        self, *, num_draft_tokens: int
+        self, *, num_draft_tokens: int, draft_topk: int | None = None
     ) -> Callable[
         [mx.array, Sequence[tuple[Sequence[int], int]]],
         tuple[mx.array, mx.array, mx.array | None],
@@ -43,10 +43,11 @@ class DSparkPagedCache(BlockDraftPagedCache):
         before the repeated forward. Metadata validation remains in the graph.
         """
         model = self.draft_model
+        model.validate_draft_topk(draft_topk, model.config.backbone.vocab_size)
         return self.compile_block(
             width=num_draft_tokens,
             embed=lambda anchors: model.block_embeddings(anchors, num_draft_tokens),
             finish=lambda hidden, anchors: model.greedy_proposal(
-                model.backbone.norm(hidden), anchors
+                model.backbone.norm(hidden), anchors, draft_topk=draft_topk
             ),
         )

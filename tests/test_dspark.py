@@ -75,15 +75,20 @@ def test_backbone_uses_anchor_slot_and_matches_independent_attention(
 @pytest.mark.parametrize(
     "confidence,with_markov", [(False, False), (True, False), (True, True)]
 )
+@pytest.mark.parametrize("draft_topk", [None, 1, 8, 64])
 def test_greedy_heads_match_explicit_torch_math_and_compiled_replay(
-    confidence, with_markov
+    confidence, with_markov, draft_topk
 ):
     model = DSparkModel(config(confidence=confidence, with_markov=with_markov))
     weights = {
         name: torch.from_numpy(array(value))
         for name, value in tree_flatten(model.parameters())
     }
-    compiled = mx.compile(model.greedy_proposal)
+    compiled = mx.compile(
+        lambda hidden, anchors: model.greedy_proposal(
+            hidden, anchors, draft_topk=draft_topk
+        )
+    )
     for offset in (0, 11):
         hidden = mx.random.normal((2, 7, 32))
         anchors = mx.array([1 + offset, 4 + offset])
@@ -99,11 +104,16 @@ def test_greedy_heads_match_explicit_torch_math_and_compiled_replay(
                 weights["markov_head.markov_w2.weight"],
             )
             step = base[:, i] + correction
+            if draft_topk is not None:
+                # Independent dense correction followed by candidate masking.
+                selected = base[:, i].topk(draft_topk, dim=-1).indices
+                masked = torch.full_like(step, -torch.inf)
+                step = masked.scatter(-1, selected, step.gather(-1, selected))
             previous = step.argmax(-1)
             expected_logits.append(step)
             expected_tokens.append(previous)
         for result in (
-            model.greedy_proposal(hidden, anchors),
+            model.greedy_proposal(hidden, anchors, draft_topk=draft_topk),
             compiled(hidden, anchors),
         ):
             tokens, logits, actual_confidence = result
@@ -138,6 +148,58 @@ def test_greedy_heads_match_explicit_torch_math_and_compiled_replay(
                 )
             else:
                 assert actual_confidence is None
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+def test_full_vocabulary_topk_preserves_default_outputs(dtype):
+    model = DSparkModel(config())
+    model.set_dtype(dtype)
+    hidden = mx.random.normal((2, 7, 32)).astype(dtype)
+    anchors = mx.array([3, 5])
+    default = model.greedy_proposal(hidden, anchors)
+    full = model.greedy_proposal(hidden, anchors, draft_topk=64)
+    for actual, expected in zip(full, default, strict=True):
+        np.testing.assert_array_equal(array(actual), array(expected))
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+def test_candidate_limit_excludes_outside_winner_and_preserves_token_id_ties(dtype):
+    model = DSparkModel(config())
+    base = mx.full((64, 32), -10.0)
+    base[2, 0], base[5, 0] = 5, 4
+    model.lm_head.weight = base
+    embedding = mx.zeros((64, 4))
+    embedding[3, 0], embedding[5, 0], embedding[2, 1] = 1, -1, 1
+    model.markov_head.markov_w1.weight = embedding
+    correction = mx.zeros((64, 4))
+    correction[5, :2] = mx.array([2, -2])
+    correction[7, :2] = 100
+    model.markov_head.markov_w2.weight = correction
+    model.confidence_head.proj.weight = mx.zeros((1, 36))
+    model.confidence_head.proj.weight[0, 32:34] = mx.array([1, 2])
+    model.confidence_head.proj.bias = mx.zeros((1,))
+    model.set_dtype(dtype)
+    hidden = mx.zeros((1, 3, 32), dtype=dtype)
+    hidden[..., 0] = 1
+    anchor = mx.array([3])
+    tokens, logits, confidence = model.greedy_proposal(hidden, anchor, draft_topk=2)
+    assert tokens.tolist() == [[5, 2, 2]]
+    assert confidence.tolist() == [[1, -1, 2]]
+    assert mx.isneginf(logits[..., 7]).all().item()
+    assert model.greedy_proposal(hidden, anchor)[0][0, 0].item() == 7
+    assert model.greedy_proposal(hidden, anchor, draft_topk=1)[0].tolist() == [[2] * 3]
+    # Corrected candidates 2 and 5 tie: choose vocabulary ID 2, not the
+    # candidate's position in an unspecified partition ordering.
+    model.markov_head.markov_w2.weight[5, 0] = 1
+    assert model.greedy_proposal(hidden, anchor, draft_topk=2)[0][0, 0].item() == 2
+
+
+@pytest.mark.parametrize("draft_topk", [0, -1, 65, True, 1.5])
+def test_invalid_candidate_limit_is_rejected(draft_topk):
+    with pytest.raises(ValueError, match="draft_topk"):
+        DSparkModel(config()).greedy_proposal(
+            mx.zeros((1, 7, 32)), mx.array([3]), draft_topk=draft_topk
+        )
 
 
 def test_markov_and_confidence_follow_previous_prediction_not_anchor_or_current_token():
