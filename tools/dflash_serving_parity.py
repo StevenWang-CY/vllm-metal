@@ -41,6 +41,8 @@ def run_engine(args):
             "num_speculative_tokens_per_batch_size": args.draft_schedule,
         }
     )
+    if spec is not None and args.dspark_draft_topk is not None:
+        spec["dspark_draft_topk"] = args.dspark_draft_topk
     llm = LLM(
         model=args.target,
         max_model_len=1024,
@@ -158,6 +160,7 @@ def main():
     parser.add_argument("--method", choices=["dflash", "dspark"], default="dflash")
     parser.add_argument("--draft")
     parser.add_argument("--num-draft-tokens", type=int, default=3)
+    parser.add_argument("--dspark-draft-topk", type=int)
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--batch-size", type=int, nargs="+", default=[1, 2])
     parser.add_argument(
@@ -172,6 +175,12 @@ def main():
         help=argparse.SUPPRESS,
     )
     args = parser.parse_args()
+    if args.dspark_draft_topk is not None and (
+        args.method != "dspark" or args.dspark_draft_topk < 1
+    ):
+        parser.error(
+            "--dspark-draft-topk requires --method dspark and a positive value"
+        )
     if args.draft is None:
         args.draft = {
             "dflash": "z-lab/Qwen3-4B-DFlash-b16",
@@ -220,6 +229,7 @@ def main():
                 "draft": args.draft,
                 "method": args.method,
                 "num_draft_tokens": args.num_draft_tokens,
+                "dspark_draft_topk": args.dspark_draft_topk,
                 "max_tokens": args.max_tokens,
                 "batch_sizes": args.batch_size,
                 "draft_schedule": args.draft_schedule,

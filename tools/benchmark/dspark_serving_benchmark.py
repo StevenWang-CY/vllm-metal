@@ -366,17 +366,18 @@ def run_arm(
         "tools.benchmark.dspark_serving_benchmark.MemoryProbe",
     ]
     if arm != "target":
+        spec = {
+            "method": arm,
+            "model": str(args.dspark if arm == "dspark" else args.draft),
+            "num_speculative_tokens": args.dspark_width
+            if arm == "dspark"
+            else args.draft_width,
+        }
+        if arm == "dspark" and args.dspark_draft_topk is not None:
+            spec["dspark_draft_topk"] = args.dspark_draft_topk
         command += [
             "--speculative-config",
-            json.dumps(
-                {
-                    "method": arm,
-                    "model": str(args.dspark if arm == "dspark" else args.draft),
-                    "num_speculative_tokens": args.dspark_width
-                    if arm == "dspark"
-                    else args.draft_width,
-                }
-            ),
+            json.dumps(spec),
         ]
     write_json(directory / "server-command.json", command)
     rows = []
@@ -553,6 +554,11 @@ def main() -> None:
     parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 4])
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--dspark-width", type=int, default=7)
+    parser.add_argument(
+        "--dspark-draft-topk",
+        type=int,
+        help="Limit DSpark's Markov correction to this many base-logit candidates",
+    )
     parser.add_argument("--draft-width", type=int, default=3)
     parser.add_argument("--max-model-len", type=int, default=2048)
     parser.add_argument("--max-num-batched-tokens", type=int, default=256)
@@ -584,6 +590,7 @@ def main() -> None:
         or len(set(args.concurrency)) != len(args.concurrency)
         or max(args.concurrency) > args.num_prompts
         or not 0 < args.gpu_memory_utilization < 1
+        or (args.dspark_draft_topk is not None and args.dspark_draft_topk < 1)
     ):
         parser.error(
             "Use positive limits, >=2 output tokens/repeats, unique concurrency <= prompts, and memory fraction in (0,1)"
