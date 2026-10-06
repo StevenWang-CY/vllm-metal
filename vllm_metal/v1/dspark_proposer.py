@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import mlx.core as mx
+from vllm.logger import init_logger
 
 from vllm_metal.attention.caches.storage import KVCacheStorage
 from vllm_metal.v1.block_draft_proposer import BlockDraftProposer, DraftForward
@@ -16,6 +17,8 @@ from vllm_metal.v1.spec_decode import SpeculativeDecodeController
 
 if TYPE_CHECKING:
     from vllm_metal.v1.model_runner import MetalModelRunner
+
+logger = init_logger(__name__)
 
 
 class DSparkProposer(BlockDraftProposer):
@@ -88,6 +91,17 @@ class DSparkProposer(BlockDraftProposer):
         if model.backbone.fc.weight.dtype != runner.kv_cache_dtype:
             raise NotImplementedError(
                 "DSpark on Metal requires matching target and draft activation precision"
+            )
+        additional = runner.vllm_config.additional_config
+        if (
+            isinstance(additional, dict)
+            and additional.get("dspark_draft_quantization") == "q4"
+        ):
+            model.quantize_draft_linears()
+            logger.info(
+                "DSpark draft linears use affine Q4 (group_size=64); "
+                "activations and KV remain %s",
+                model.embed_tokens.weight.dtype,
             )
         proposer = cls(
             model,

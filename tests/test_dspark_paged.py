@@ -22,11 +22,19 @@ from vllm_metal.v1.dspark import DSparkConfig, DSparkModel
 from vllm_metal.v1.dspark_paged import DSparkPagedCache
 
 
-def make_cache(dtype=mx.float16, *, block_size=16, confidence=True, with_markov=True):
+def make_cache(
+    dtype=mx.float16,
+    *,
+    block_size=16,
+    confidence=True,
+    with_markov=True,
+    quantized=False,
+):
     cfg = DSparkConfig(
         backbone=replace(
             _config(),
             hidden_size=64,
+            intermediate_size=64 if quantized else 48,
             head_dim=64,
             max_position_embeddings=64,
             block_size=7,
@@ -45,6 +53,8 @@ def make_cache(dtype=mx.float16, *, block_size=16, confidence=True, with_markov=
     correction[mx.array([1, 2, 3, 0]), mx.arange(4)] = 8
     model.markov_head.markov_w2.weight = correction
     model.set_dtype(dtype)
+    if quantized:
+        model.quantize_draft_linears()
     spec = FullAttentionSpec(
         block_size=block_size,
         num_kv_heads=2,
@@ -95,16 +105,25 @@ def test_candidate_limited_proposals_commit_features_and_reuse_pages(dtype, widt
 
 
 def _check_ragged_proposals(
-    dtype, block_size, width, confidence, with_markov, draft_topk=None
+    dtype, block_size, width, confidence, with_markov, draft_topk=None, quantized=False
 ):
     model, cache = make_cache(
-        dtype, block_size=block_size, confidence=confidence, with_markov=with_markov
+        dtype,
+        block_size=block_size,
+        confidence=confidence,
+        with_markov=with_markov,
+        quantized=quantized,
     )
-    if draft_topk is not None:
+    if draft_topk is not None and not quantized:
         # Separate candidate scores to avoid an unstable top-k boundary in
         # reduced precision. The independent attention comparison remains.
         model.lm_head.weight = mx.zeros((64, 64), dtype=dtype)
         model.lm_head.weight[:, 0] = (mx.arange(64).astype(dtype) - 32) / 32
+    reference_model = model
+    if quantized:
+        from tests.test_dspark_quantization import dequantized_model
+
+        reference_model = dequantized_model(model)
     draft = cache.compile_draft(num_draft_tokens=width, draft_topk=draft_topk)
     tables = [[5, 2, 7, 1], [9, 3, 8, 4]]
     lengths = [block_size - 1, min(2 * block_size - 2, 47)]
@@ -151,7 +170,9 @@ def _check_ragged_proposals(
         for row, feature in enumerate(features):
             anchor = anchors[row : row + 1]
             independent_hidden = _torch_forward(
-                model.backbone, model.block_embeddings(anchor, width), feature
+                reference_model.backbone,
+                reference_model.block_embeddings(anchor, width),
+                feature,
             )
             expected = model.greedy_proposal(
                 mx.array(independent_hidden).astype(dtype),
@@ -267,6 +288,15 @@ def test_compiled_block_replays_without_retracing_as_context_grows(monkeypatch):
             rtol=0.006,
         )
     assert len(traces) == 1
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("block_size", [8, 16, 32])
+@pytest.mark.parametrize("width", [1, 7])
+def test_q4_backbone_preserves_committed_features_and_page_reuse(
+    dtype, block_size, width
+):
+    _check_ragged_proposals(dtype, block_size, width, True, True, quantized=True)
 
 
 @pytest.mark.parametrize("drafter", ["dflash", "dspark"])

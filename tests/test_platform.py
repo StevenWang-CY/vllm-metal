@@ -167,6 +167,24 @@ class TestMetalPlatform:
         name = MetalPlatform.get_device_name()
         assert "Apple Silicon" in name
 
+    @pytest.mark.parametrize("value", [None, True, 4, "q8", {"bits": 4}])
+    def test_dspark_quantization_rejects_invalid_mode(self, value):
+        config = self._platform_config(
+            speculative_config=SimpleNamespace(method="dspark")
+        )
+        config.additional_config = {"dspark_draft_quantization": value}
+        with pytest.raises(ValueError, match="dspark_draft_quantization must be 'q4'"):
+            MetalPlatform.check_and_update_config(config)
+
+    @pytest.mark.parametrize("method", [None, "dflash", "draft_model", "ngram"])
+    def test_dspark_quantization_rejects_other_serving_methods(self, method):
+        config = self._platform_config(
+            speculative_config=SimpleNamespace(method=method) if method else None
+        )
+        config.additional_config = {"dspark_draft_quantization": "q4"}
+        with pytest.raises(ValueError, match="requires method='dspark'"):
+            MetalPlatform.check_and_update_config(config)
+
     def test_set_device_valid(self) -> None:
         """Test setting valid device."""
         MetalPlatform.set_device(0)  # Should not raise

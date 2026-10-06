@@ -174,6 +174,37 @@ class DSparkModel(nn.Module):
             raise ValueError("DSpark features must use the checkpoint precision")
         return self.backbone(self.block_embeddings(anchors, num_draft_tokens), features)
 
+    def quantize_draft_linears(self) -> None:
+        """Convert backbone linears and the vocabulary projection to affine Q4.
+
+        Apply once after loading, before profiling or compiling. Embeddings,
+        feature fusion, norms and the Markov/confidence heads keep checkpoint
+        precision; activations and scheduler-owned KV keep that precision too.
+        """
+
+        def selected(path, module):
+            return path == "lm_head" or (
+                path.startswith("backbone.layers.") and isinstance(module, nn.Linear)
+            )
+
+        # Check all selected dimensions before replacing any module. Q4 is a
+        # runtime transform of a validated floating checkpoint, not a loader
+        # for pre-quantized checkpoints or a second quantization pass.
+        for path, module in self.named_modules():
+            if selected(path, module) and (
+                not isinstance(module, nn.Linear)
+                or module.weight.dtype not in (mx.float16, mx.bfloat16)
+                or module.weight.shape[-1] % 64
+            ):
+                raise ValueError(
+                    "DSpark Q4 requires unquantized FP16/BF16 linears with "
+                    f"input dimensions divisible by 64: {path}"
+                )
+        nn.quantize(
+            self, group_size=64, bits=4, mode="affine", class_predicate=selected
+        )
+        mx.eval(self.parameters())
+
     def block_embeddings(self, anchors: mx.array, num_draft_tokens: int) -> mx.array:
         """Embed the anchor and K-1 masks for dense or paged block attention."""
         cfg = self.config.backbone
@@ -222,7 +253,8 @@ class DSparkModel(nn.Module):
         self.backbone.validate_embeddings(hidden, 0)
         if hidden.shape[0] != anchors.shape[0]:
             raise ValueError("DSpark requires one anchor per block")
-        if hidden.dtype != self.lm_head.weight.dtype:
+        # The vocabulary projection may have packed integer weights.
+        if hidden.dtype != self.embed_tokens.weight.dtype:
             raise ValueError("DSpark block states must use the checkpoint precision")
         self.validate_draft_topk(draft_topk, self.config.backbone.vocab_size)
         logits = self.lm_head(hidden)
