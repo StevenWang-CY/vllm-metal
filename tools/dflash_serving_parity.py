@@ -5,6 +5,7 @@
 Unlike requesting sample logprobs, observing target rows inside the runner
 keeps greedy drafting enabled. This diagnostic is not a performance benchmark.
 Each engine runs in a separate process to release Metal allocations.
+Use --audit-continuations for strict native replay on every emitted prefix.
 """
 
 from __future__ import annotations
@@ -28,7 +29,10 @@ from tools.parity_prompts import PROMPTS
 def run_engine(args):
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     import mlx.core as mx
+    import numpy as np
     from vllm import LLM, SamplingParams
+
+    from tools.continuation_audit import decision_kinds, score_token
 
     reference = json.loads((args.output_dir / "native.json").read_text())
     spec = (
@@ -57,7 +61,7 @@ def run_engine(args):
     )
     runner = llm.llm_engine.model_executor.driver_worker.model_runner
     sample = runner._sample_paged_batch
-    records, prompts = {}, {}
+    records, prompts, decisions = {}, {}, {}
     stats = {"drafted": 0, "accepted": 0, "scheduled_widths": {}}
     if runner._drafter is not None:
         propose = runner._drafter.propose
@@ -84,10 +88,20 @@ def run_engine(args):
             for rank, token in enumerate(ids, start=1)
         ]
 
+    def record(req_id, row, token, kind, query_tokens):
+        if args.audit_continuations:
+            decision = score_token(np.array(row.astype(mx.float32)), token)
+            decision.update(kind=kind, query_tokens=query_tokens)
+            decisions[req_id].append(decision)
+            records[req_id].append(decision["top_logprobs"])
+        else:
+            records[req_id].append(top(row))
+
     def observe(*positional, **keywords):
         state = runner._execute_model_state
         for new in state.scheduler_output.scheduled_new_reqs:
             records[new.req_id] = []
+            decisions[new.req_id] = []
             prompts[new.req_id] = new.prompt_token_ids
         lengths = {req_id: len(req.token_ids) for req_id, req in state.decode_reqs}
         result = sample(*positional, **keywords)
@@ -98,15 +112,29 @@ def run_engine(args):
             if segment.draft_token_ids:
                 stats["drafted"] += len(segment.draft_token_ids)
                 stats["accepted"] += count - 1
-            records[req_id].extend(
-                top(state.logits[0, segment.start_row + i]) for i in range(count)
-            )
+            emitted = req.token_ids[lengths[req_id] :]
+            kinds = decision_kinds(list(segment.draft_token_ids), emitted)
+            for i, (token, kind) in enumerate(zip(emitted, kinds, strict=True)):
+                record(
+                    req_id,
+                    state.logits[0, segment.start_row + i],
+                    token,
+                    kind,
+                    segment.num_query_tokens,
+                )
         for i, (prefill, entry) in enumerate(
             zip(state.prefill_reqs, state.batch.paged_prefill_entries, strict=True)
         ):
             if entry.result_mode != "intermediate":
                 row = state.logits_cu_seqlens[len(state.decode_segments) + i + 1] - 1
-                records[prefill.req_id].append(top(state.logits[0, row]))
+                token = runner._request_states[prefill.req_id].token_ids[-1]
+                record(
+                    prefill.req_id,
+                    state.logits[0, row],
+                    token,
+                    "prefill",
+                    len(prefill.token_ids),
+                )
         return result
 
     runner._sample_paged_batch = observe
@@ -117,6 +145,7 @@ def run_engine(args):
             for start in range(0, len(reference), batch_size):
                 records.clear()
                 prompts.clear()
+                decisions.clear()
                 refs = reference[start : start + batch_size]
                 results = llm.generate(
                     [{"prompt_token_ids": r["input_ids"]} for r in refs],
@@ -137,9 +166,15 @@ def run_engine(args):
                         raise AssertionError("Missing target verification rows")
                     outputs.append(
                         {
+                            "input_ids": prompts[req_id],
                             "tokens": list(output.token_ids),
                             "text": output.text,
                             "top_logprobs": rows,
+                            **(
+                                {"decisions": decisions[req_id][: args.max_tokens]}
+                                if args.audit_continuations
+                                else {}
+                            ),
                         }
                     )
             path = args.output_dir / f"{args.worker}-b{batch_size}.json"
@@ -170,8 +205,13 @@ def main():
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
+        "--audit-continuations",
+        action="store_true",
+        help="Replay every emitted prefix natively; any greedy mismatch fails the strict audit",
+    )
+    parser.add_argument(
         "--worker",
-        choices=["native", "target", "dflash", "dspark"],
+        choices=["native", "target", "dflash", "dspark", "replay"],
         help=argparse.SUPPRESS,
     )
     args = parser.parse_args()
@@ -186,14 +226,19 @@ def main():
             "dflash": "z-lab/Qwen3-4B-DFlash-b16",
             "dspark": "deepseek-ai/dspark_qwen3_4b_block7",
         }[args.method]
-    if args.worker not in (None, "native", "target", args.method):
+    if args.worker not in (None, "native", "target", args.method, "replay"):
         parser.error("Draft worker must match --method")
+    if args.worker == "replay" and not args.audit_continuations:
+        parser.error("Replay requires --audit-continuations")
     if (
         min(args.batch_size) < 1
+        or len(set(args.batch_size)) != len(args.batch_size)
         or args.num_draft_tokens < 1
         or not 1 <= args.max_tokens <= 512
     ):
-        parser.error("batch sizes must be positive and max-tokens must be 1–512")
+        parser.error(
+            "batch sizes must be unique and positive and max-tokens must be 1–512"
+        )
     from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 
     try:
@@ -210,10 +255,28 @@ def main():
         reference = mlx_generate(args.target, PROMPTS, args.max_tokens, 5)
         (args.output_dir / "native.json").write_text(json.dumps(reference))
         return
+    if args.worker == "replay":
+        from tools.continuation_audit import audit_serving_run
+
+        report = audit_serving_run(args)
+        (args.output_dir / "continuation-audit.json").write_text(
+            json.dumps(report, indent=2, allow_nan=False)
+        )
+        return
     if args.worker:
         run_engine(args)
         return
     args.output_dir.mkdir(parents=True, exist_ok=False)
+    if args.audit_continuations:
+        from huggingface_hub import snapshot_download
+
+        # Resolve once: every serving and replay worker must load the same
+        # checkpoint even when the CLI was given a mutable Hub model name.
+        for name in ("target", "draft"):
+            path = Path(getattr(args, name))
+            if not path.is_dir():
+                path = Path(snapshot_download(getattr(args, name)))
+            setattr(args, name, str(path.resolve()))
     root = Path(__file__).resolve().parents[1]
     sources = sorted(
         p
@@ -233,6 +296,11 @@ def main():
                 "max_tokens": args.max_tokens,
                 "batch_sizes": args.batch_size,
                 "draft_schedule": args.draft_schedule,
+                "audit_continuations": args.audit_continuations,
+                "environment": {
+                    name: os.environ.get(name)
+                    for name in ("MLX_ENABLE_TF32", "VLLM_METAL_SPEC_VERIFY_WINDOW")
+                },
                 "versions": {
                     name: importlib.metadata.version(name)
                     for name in ("vllm", "mlx", "mlx-lm", "transformers")
@@ -241,7 +309,10 @@ def main():
             indent=2,
         )
     )
-    for worker in ("native", "target", args.method):
+    workers = ["native", "target", args.method]
+    if args.audit_continuations:
+        workers.append("replay")
+    for worker in workers:
         with (args.output_dir / f"{worker}.log").open("w") as log:
             subprocess.run(
                 [
@@ -249,13 +320,21 @@ def main():
                     "-m",
                     "tools.dflash_serving_parity",
                     *sys.argv[1:],
+                    "--target",
+                    args.target,
+                    "--draft",
+                    args.draft,
                     "--worker",
                     worker,
                 ],
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 check=True,
-                timeout=600,
+                # Replay includes a native control and both serving arms for
+                # every batch size, each with a full continuation per prompt.
+                timeout=600 * (1 + 2 * len(args.batch_size))
+                if worker == "replay"
+                else 600,
             )
     reference = json.loads((args.output_dir / "native.json").read_text())
     passed = True
@@ -268,6 +347,19 @@ def main():
             passed &= compare_results(
                 reference, result["outputs"], max_tokens=args.max_tokens, top_k=5
             )
+    if args.audit_continuations:
+        report = json.loads((args.output_dir / "continuation-audit.json").read_text())
+        for name, audit in report["reports"].items():
+            message = (
+                f"{name}: {audit['tokens']} tokens audited, "
+                f"{audit['native_argmax_mismatches']} native greedy mismatches"
+            )
+            if audit["serving_argmax_mismatches"] is not None:
+                message += (
+                    f", {audit['serving_argmax_mismatches']} serving greedy mismatches"
+                )
+            print(message)
+        passed &= report["passed"]
     if not passed:
         raise SystemExit(1)
 

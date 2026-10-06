@@ -109,6 +109,39 @@ they do not bypass target verification. Serving output checks and checkpoint
 candidate equivalence are separate requirements, and the experimental integration
 does not establish complete DSpark qualification or a speedup.
 
+### Full-continuation audit
+
+Use `--audit-continuations` for a strict check that also covers every token after
+the first divergence:
+
+```bash
+python -m tools.dflash_serving_parity \
+    --method dspark --num-draft-tokens 7 --dspark-draft-topk 64 \
+    --target /path/to/target/snapshot --draft /path/to/draft/snapshot \
+    --batch-size 1 4 --max-tokens 32 --audit-continuations \
+    --output-dir /path/to/new-continuation-audit
+```
+
+The tool observes the actual target verification rows without requesting sample
+logprobs, which would disable drafting. It then replays each emitted continuation
+through native mlx-lm with fresh KV, forcing the observed tokens so that every
+comparison uses the prefix serving actually produced. A native self-replay
+control checks this replay against the free-running reference.
+
+`continuation-audit.json` retains every position's emitted token, native argmax,
+candidate rank and score gap, and the serving verifier's own argmax. It labels
+prefill, ordinary decode, accepted draft, correction, and bonus decisions. The
+summary separates mismatches against native MLX from mismatches against the
+serving verifier; it also records exact free-running sequence counts. Checkpoint
+paths are resolved once for all workers and recorded with source hashes and
+package versions in `metadata.json`.
+
+Any greedy mismatch, including a tie with a different argmax, fails the strict
+audit and makes the command exit nonzero. Ranks and gaps are diagnostics, not
+tolerances. Missing or invalid evidence also fails. The legacy `TOP_K_MATCH`
+report cannot override these failures. This qualifies greedy decisions for the
+tested workload; it does not establish sampled verification or measure speed.
+
 ## Measure HTTP serving and memory
 
 Run the matched three-way comparison from a source checkout on macOS:

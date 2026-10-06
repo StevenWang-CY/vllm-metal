@@ -105,6 +105,13 @@ widths and verified drafts; a configured K=0 batch need not verify any drafts.
 Floating-point reduction differences between single-token and multi-token target
 forwards can change greedy choices near ties. Report exact matches separately
 from mutual top-k agreement; the latter checks only the first differing token.
+
+Add `--audit-continuations` to the parity command for the shared
+[full-continuation audit](dspark.md#full-continuation-audit). It checks every
+emitted token against both the serving verifier and a native replay of its
+actual prefix. Any greedy mismatch fails, including mismatches after an initial
+near tie; candidate ranks and score gaps remain diagnostics.
+
 Measure throughput for your target, draft width, and workload before enabling
 this experimental mode in a deployment.
 
