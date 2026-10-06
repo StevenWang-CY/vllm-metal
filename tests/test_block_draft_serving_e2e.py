@@ -42,7 +42,7 @@ def _block_draft_llm(**overrides):
     )
 
 
-def _serve(mode, baseline_path, verify_window):
+def _serve(mode, baseline_path, verify_window, draft_quantization=None):
     _spawn_env(verify_window)
     from vllm import SamplingParams
     from vllm.sampling_params import StructuredOutputsParams
@@ -56,7 +56,12 @@ def _serve(mode, baseline_path, verify_window):
             "num_speculative_tokens": DRAFT_WIDTHS[mode],
         }
     )
-    llm = _block_draft_llm(speculative_config=spec)
+    llm = _block_draft_llm(
+        speculative_config=spec,
+        additional_config={"dspark_draft_quantization": draft_quantization}
+        if draft_quantization is not None
+        else {},
+    )
     engine = llm.llm_engine
     runner = engine.model_executor.driver_worker.model_runner
     scheduler = engine.engine_core.engine_core.scheduler
@@ -123,6 +128,10 @@ def _serve(mode, baseline_path, verify_window):
         reference = json.loads(baseline_path.read_text())
         baseline = reference["outputs"]
         proposer = runner._drafter
+        if draft_quantization is not None:
+            import mlx.nn as nn
+
+            assert isinstance(proposer.draft_model.lm_head, nn.QuantizedLinear)
         assert proposer.cache.storage is runner.paged_attention_runtime.storage
         stats = {
             "drafted": 0,
@@ -304,11 +313,15 @@ def _serve(mode, baseline_path, verify_window):
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("method", ["dflash", "dspark"])
+@pytest.mark.parametrize(
+    "method,draft_quantization", [("dflash", None), ("dspark", None), ("dspark", "q4")]
+)
 @pytest.mark.parametrize("verify_window", [False, True])
 def test_block_draft_serving_parity_and_lifecycle(
-    tmp_path, run_in_spawn_process, verify_window, method
+    tmp_path, run_in_spawn_process, verify_window, method, draft_quantization
 ):
     baseline = tmp_path / "target.json"
     run_in_spawn_process(_serve, "target", baseline, verify_window, label="target")
-    run_in_spawn_process(_serve, method, baseline, verify_window, label=method)
+    run_in_spawn_process(
+        _serve, method, baseline, verify_window, draft_quantization, label=method
+    )

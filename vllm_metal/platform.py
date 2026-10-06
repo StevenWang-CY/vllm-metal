@@ -478,6 +478,7 @@ class MetalPlatform(Platform):
                 or vllm_config.speculative_config.method != "dspark"
             ):
                 raise ValueError("dspark_draft_quantization requires method='dspark'")
+
         # Apply TurboQuant config from --additional-config
         # Example: --additional-config '{"turboquant": true, "k_quant": "q4_0"}'
         if isinstance(add, dict) and add.get("turboquant"):

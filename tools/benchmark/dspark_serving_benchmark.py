@@ -379,6 +379,11 @@ def run_arm(
             "--speculative-config",
             json.dumps(spec),
         ]
+    if arm == "dspark" and args.dspark_draft_quantization is not None:
+        command += [
+            "--additional-config",
+            json.dumps({"dspark_draft_quantization": args.dspark_draft_quantization}),
+        ]
     write_json(directory / "server-command.json", command)
     rows = []
     with (directory / "server.log").open("w") as log:
@@ -554,6 +559,7 @@ def main() -> None:
     parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 4])
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--dspark-width", type=int, default=7)
+    parser.add_argument("--dspark-draft-quantization", choices=["q4"])
     parser.add_argument(
         "--dspark-draft-topk",
         type=int,

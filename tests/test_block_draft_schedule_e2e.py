@@ -15,7 +15,12 @@ from tests.test_block_draft_serving_e2e import (
 
 
 def _serve_scheduled(
-    baseline_path, verify_window, method, pressure=False, draft_topk=None
+    baseline_path,
+    verify_window,
+    method,
+    pressure=False,
+    draft_topk=None,
+    draft_quantization=None,
 ):
     _spawn_env(verify_window)
     from vllm import SamplingParams
@@ -24,6 +29,9 @@ def _serve_scheduled(
     llm = _block_draft_llm(
         max_num_seqs=3,
         num_gpu_blocks_override=10 if pressure else 14,
+        additional_config={"dspark_draft_quantization": draft_quantization}
+        if draft_quantization is not None
+        else {},
         speculative_config={
             "method": method,
             "model": DRAFT_MODELS[method],
@@ -178,11 +186,22 @@ def _serve_scheduled(
 
 @pytest.mark.slow
 @pytest.mark.parametrize(
-    "method,draft_topk", [("dflash", None), ("dspark", None), ("dspark", 64)]
+    "method,draft_topk,draft_quantization",
+    [
+        ("dflash", None, None),
+        ("dspark", None, None),
+        ("dspark", 64, None),
+        ("dspark", 64, "q4"),
+    ],
 )
 @pytest.mark.parametrize("verify_window", [False, True])
 def test_block_draft_scheduler_width_transitions(
-    tmp_path, run_in_spawn_process, verify_window, method, draft_topk
+    tmp_path,
+    run_in_spawn_process,
+    verify_window,
+    method,
+    draft_topk,
+    draft_quantization,
 ):
     baseline = tmp_path / "target.json"
     run_in_spawn_process(_serve, "target", baseline, verify_window, label="target")
@@ -193,6 +212,7 @@ def test_block_draft_scheduler_width_transitions(
         method,
         False,
         draft_topk,
+        draft_quantization,
         label="scheduled",
     )
     run_in_spawn_process(
@@ -202,5 +222,6 @@ def test_block_draft_scheduler_width_transitions(
         method,
         True,
         draft_topk,
+        draft_quantization,
         label="scheduled+pressure",
     )

@@ -33,8 +33,9 @@ The first stage requires a single-device Qwen3 text target without LoRA or
 TurboQuant, native cache blocks of 8/16/32, and matching target/draft activation
 precision. Draft weights load before memory profiling and share the device
 budget with target weights, activations, and scheduler-owned KV.
-Draft quantization and an explicit draft-cache precision that differs from the
-target activation precision are rejected.
+Pre-quantized draft checkpoints and an explicit draft-cache precision that differs
+from the target activation precision are rejected. An optional runtime Q4
+conversion is described below.
 
 Widths 1 through the checkpoint's trained width are supported. The optional
 `num_speculative_tokens_per_batch_size` schedule can use zero to pause drafting;
@@ -55,7 +56,7 @@ prefix data. Use `--no-enable-prefix-caching` for a cold-cache comparison.
 
 `enable_adaptive_verification`, non-greedy `draft_sample_method`, and nonstandard
 `rejection_sample_method` are rejected rather than ignored.
-The vLLM 0.30 compatibility bridge exempts only `MetalWorker` from the GPU V1
+The Metal compatibility bridge exempts only `MetalWorker` from the GPU V1
 runner's DSpark prohibition; all other upstream runner checks remain active.
 
 ### Limit Markov candidates
@@ -73,6 +74,32 @@ set, the existing full-vocabulary path is unchanged. A limit equal to the
 vocabulary size also uses that path. Smaller limits trade candidate coverage for
 less projection work; measure acceptance and end-to-end latency together.
 This option does not enable adaptive verification or change the proposal width.
+
+### Quantize draft linear layers
+
+Add `--additional-config '{"dspark_draft_quantization":"q4"}'` to the serve
+command to convert the draft backbone's linear layers and its vocabulary
+projection to MLX affine 4-bit weights with group size 64. Conversion runs once,
+after checkpoint validation and before memory profiling or compilation. Omit the
+option to retain the checkpoint weights. Only `q4` is supported, and the option
+requires `method="dspark"`.
+
+Embeddings, feature fusion, normalization, and Markov/confidence heads retain
+checkpoint precision. Draft activations and KV also retain FP16/BF16 precision;
+the target is unchanged. This reduces resident draft weight memory, but startup
+still loads the original floating checkpoint before conversion. Linear input
+dimensions must be divisible by 64.
+
+Q4 can change draft proposals and acceptance. The target still verifies each
+proposal against its full vocabulary. Measure acceptance and serving latency
+together; reduced draft memory does not establish a speedup or native greedy
+equivalence. The existing reduced-precision qualification limits still apply.
+
+Both `tools.dflash_serving_parity` and
+`tools.benchmark.dspark_serving_benchmark` accept
+`--dspark-draft-quantization q4`, including with `--dspark-draft-topk 64`.
+The option applies only to the DSpark arm; native, target-only and ordinary
+draft-model controls retain their existing settings.
 
 ## Serving validation
 
@@ -266,7 +293,7 @@ since matching dimensions alone do not establish training/tokenizer compatibilit
 - The loader accepts local, unsharded, uniform FP32/FP16/BF16 safetensors and
   preserves their precision. Tensor names/shapes and finite weights are checked.
   DFlash and DSpark share these checks in `draft_checkpoint.py`.
-  Quantized, gated/RNN-head, GIDD, scaled/partial-RoPE, and non-Qwen3 checkpoints
+  Pre-quantized, gated/RNN-head, GIDD, scaled/partial-RoPE, and non-Qwen3 checkpoints
   are rejected. Confidence heads may be absent or may use hidden states with
   or without Markov embeddings.
 - Validate external anchor IDs with `draft.validate_anchors(anchors)` outside

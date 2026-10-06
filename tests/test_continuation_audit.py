@@ -354,3 +354,60 @@ def test_cli_rejects_duplicate_batch_sizes_before_starting_workers(
         tool.main()
     assert caught.value.code == 2
     assert not (tmp_path / "results").exists()
+
+
+def test_cli_rejects_q4_for_other_drafting_methods(monkeypatch, tmp_path):
+    import tools.dflash_serving_parity as tool
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "parity",
+            "--method",
+            "dflash",
+            "--dspark-draft-quantization",
+            "q4",
+            "--output-dir",
+            str(tmp_path / "results"),
+        ],
+    )
+    with pytest.raises(SystemExit) as caught:
+        tool.main()
+    assert caught.value.code == 2
+    assert not (tmp_path / "results").exists()
+
+
+@pytest.mark.parametrize("worker", ["target", "dspark"])
+def test_q4_parity_option_only_applies_to_draft_worker(monkeypatch, tmp_path, worker):
+    import vllm
+
+    import tools.dflash_serving_parity as tool
+
+    (tmp_path / "native.json").write_text("[]")
+    args = SimpleNamespace(
+        worker=worker,
+        method="dspark",
+        target="target",
+        draft="draft",
+        num_draft_tokens=7,
+        draft_schedule=None,
+        dspark_draft_topk=64,
+        dspark_draft_quantization="q4",
+        batch_size=[1, 4],
+        output_dir=tmp_path,
+    )
+
+    class ConfigCapturedError(Exception):
+        pass
+
+    def llm(**kwargs):
+        assert kwargs["additional_config"] == (
+            {"dspark_draft_quantization": "q4"} if worker == "dspark" else {}
+        )
+        raise ConfigCapturedError
+
+    monkeypatch.setattr(vllm, "LLM", llm)
+    # run_engine owns its subprocess environment; restore it in this unit test.
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "1")
+    with pytest.raises(ConfigCapturedError):
+        tool.run_engine(args)

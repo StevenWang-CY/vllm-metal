@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 from copy import deepcopy
+from types import SimpleNamespace
 
 import pytest
 
@@ -15,11 +16,49 @@ from tools.benchmark.dspark_serving_benchmark import (
     COUNTERS,
     machine_state,
     metric_counts,
+    run_arm,
     scheduler_capacity,
     stop_server,
     summarize,
     validate_measurement,
 )
+
+
+@pytest.mark.parametrize("arm", ["target", "dspark", "draft_model"])
+@pytest.mark.parametrize("quantization", [None, "q4"])
+def test_q4_server_option_only_applies_to_dspark(
+    monkeypatch, tmp_path, arm, quantization
+):
+    args = SimpleNamespace(
+        output_dir=tmp_path,
+        target="target",
+        dspark="dspark",
+        draft="draft",
+        max_model_len=128,
+        concurrency=[1, 4],
+        max_num_batched_tokens=32,
+        gpu_memory_utilization=0.3,
+        dspark_width=7,
+        draft_width=3,
+        dspark_draft_topk=64,
+        dspark_draft_quantization=quantization,
+    )
+
+    class CommandCapturedError(Exception):
+        pass
+
+    def popen(command, **kwargs):
+        if arm == "dspark" and quantization is not None:
+            assert json.loads(command[command.index("--additional-config") + 1]) == {
+                "dspark_draft_quantization": "q4"
+            }
+        else:
+            assert "--additional-config" not in command
+        raise CommandCapturedError
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    with pytest.raises(CommandCapturedError):
+        run_arm(args, arm, 1, [], {})
 
 
 def measurement():
