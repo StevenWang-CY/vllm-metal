@@ -10,6 +10,11 @@ import mlx.core as mx
 from vllm.logger import init_logger
 
 from vllm_metal.attention.caches.storage import KVCacheStorage
+from vllm_metal.config import (
+    DSPARK_DRAFT_QUANTIZATION_KEY,
+    DSPARK_DRAFT_QUANTIZATION_Q4,
+    DSPARK_Q4_GROUP_SIZE,
+)
 from vllm_metal.v1.block_draft_proposer import BlockDraftProposer, DraftForward
 from vllm_metal.v1.dspark import DSparkModel, load_dspark
 from vllm_metal.v1.dspark_paged import DSparkPagedCache
@@ -87,20 +92,26 @@ class DSparkProposer(BlockDraftProposer):
                     "DSpark on Metal requires draft KV in the target activation precision"
                 )
         path = cls._checkpoint_path(runner)
-        model = load_dspark(path, target_config=runner.model_config.hf_config.to_dict())
+        additional = runner.vllm_config.additional_config
+        draft_quantization = (
+            additional.get(DSPARK_DRAFT_QUANTIZATION_KEY)
+            if isinstance(additional, dict)
+            else None
+        )
+        model = load_dspark(
+            path,
+            target_config=runner.model_config.hf_config.to_dict(),
+            draft_quantization=draft_quantization,
+        )
         if model.backbone.fc.weight.dtype != runner.kv_cache_dtype:
             raise NotImplementedError(
                 "DSpark on Metal requires matching target and draft activation precision"
             )
-        additional = runner.vllm_config.additional_config
-        if (
-            isinstance(additional, dict)
-            and additional.get("dspark_draft_quantization") == "q4"
-        ):
-            model.quantize_draft_linears()
+        if draft_quantization == DSPARK_DRAFT_QUANTIZATION_Q4:
             logger.info(
-                "DSpark draft linears use affine Q4 (group_size=64); "
+                "DSpark draft linears use affine Q4 (group_size=%d); "
                 "activations and KV remain %s",
+                DSPARK_Q4_GROUP_SIZE,
                 model.embed_tokens.weight.dtype,
             )
         proposer = cls(

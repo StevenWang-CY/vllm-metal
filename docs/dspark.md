@@ -88,7 +88,8 @@ Embeddings, feature fusion, normalization, and Markov/confidence heads retain
 checkpoint precision. Draft activations and KV also retain FP16/BF16 precision;
 the target is unchanged. This reduces resident draft weight memory, but startup
 still loads the original floating checkpoint before conversion. Linear input
-dimensions must be divisible by 64.
+dimensions must be divisible by 64; incompatible checkpoint dimensions are
+rejected before allocating the draft model or loading its weights.
 
 Q4 can change draft proposals and acceptance. The target still verifies each
 proposal against its full vocabulary. Measure acceptance and serving latency

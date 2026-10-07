@@ -11,7 +11,11 @@ import torch
 from vllm.platforms.interface import Platform, PlatformEnum
 
 import vllm_metal.envs as envs
-from vllm_metal.config import get_config
+from vllm_metal.config import (
+    DSPARK_DRAFT_QUANTIZATION_KEY,
+    DSPARK_DRAFT_QUANTIZATION_Q4,
+    get_config,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -467,17 +471,20 @@ class MetalPlatform(Platform):
         model_config = vllm_config.model_config
 
         add = vllm_config.additional_config
-        if isinstance(add, dict) and "dspark_draft_quantization" in add:
-            if add["dspark_draft_quantization"] != "q4":
+        if isinstance(add, dict) and DSPARK_DRAFT_QUANTIZATION_KEY in add:
+            if add[DSPARK_DRAFT_QUANTIZATION_KEY] != DSPARK_DRAFT_QUANTIZATION_Q4:
                 raise ValueError(
-                    "dspark_draft_quantization must be 'q4', got "
-                    f"{add['dspark_draft_quantization']!r}"
+                    f"{DSPARK_DRAFT_QUANTIZATION_KEY} must be "
+                    f"{DSPARK_DRAFT_QUANTIZATION_Q4!r}, got "
+                    f"{add[DSPARK_DRAFT_QUANTIZATION_KEY]!r}"
                 )
             if (
                 vllm_config.speculative_config is None
                 or vllm_config.speculative_config.method != "dspark"
             ):
-                raise ValueError("dspark_draft_quantization requires method='dspark'")
+                raise ValueError(
+                    f"{DSPARK_DRAFT_QUANTIZATION_KEY} requires method='dspark'"
+                )
 
         # Apply TurboQuant config from --additional-config
         # Example: --additional-config '{"turboquant": true, "k_quant": "q4_0"}'

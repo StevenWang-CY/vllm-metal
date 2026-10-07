@@ -24,6 +24,10 @@ if __name__ == "__main__":
 from tools.attention_bench_utils import source_file_hashes
 from tools.check_parity import compare_results, mlx_generate
 from tools.parity_prompts import PROMPTS
+from vllm_metal.config import (
+    DSPARK_DRAFT_QUANTIZATION_KEY,
+    DSPARK_DRAFT_QUANTIZATION_Q4,
+)
 
 
 def run_engine(args):
@@ -59,7 +63,7 @@ def run_engine(args):
         async_scheduling=False,
         speculative_config=spec,
         additional_config=(
-            {"dspark_draft_quantization": args.dspark_draft_quantization}
+            {DSPARK_DRAFT_QUANTIZATION_KEY: args.dspark_draft_quantization}
             if spec is not None and args.dspark_draft_quantization is not None
             else {}
         ),
@@ -201,7 +205,9 @@ def main():
     parser.add_argument("--draft")
     parser.add_argument("--num-draft-tokens", type=int, default=3)
     parser.add_argument("--dspark-draft-topk", type=int)
-    parser.add_argument("--dspark-draft-quantization", choices=["q4"])
+    parser.add_argument(
+        "--dspark-draft-quantization", choices=[DSPARK_DRAFT_QUANTIZATION_Q4]
+    )
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--batch-size", type=int, nargs="+", default=[1, 2])
     parser.add_argument(

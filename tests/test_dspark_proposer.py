@@ -103,7 +103,6 @@ def test_unsupported_drafting_options_fail_before_loading(option, value):
 def test_candidate_limit_resolves_explicit_option_before_checkpoint(
     monkeypatch, explicit, checkpoint, expected, quantized
 ):
-    # Build owns the conversion and must perform it before profiling/binding.
     model = make_model(mx.float16)
     spec = SimpleNamespace(
         draft_model_config=SimpleNamespace(
@@ -130,7 +129,14 @@ def test_candidate_limit_resolves_explicit_option_before_checkpoint(
         _spec_decode_controller=SpeculativeDecodeController(),
     )
     monkeypatch.setattr(DSparkProposer, "_checkpoint_path", lambda runner: "unused")
-    monkeypatch.setattr(dspark_proposer, "load_dspark", lambda *a, **kw: model)
+
+    def load(*args, draft_quantization, **kwargs):
+        assert draft_quantization == ("q4" if quantized else None)
+        if draft_quantization is not None:
+            model.quantize_draft_linears()
+        return model
+
+    monkeypatch.setattr(dspark_proposer, "load_dspark", load)
     proposer = DSparkProposer.build(runner)
     assert proposer.draft_topk == expected
     assert proposer.max_model_len == 32

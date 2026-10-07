@@ -29,6 +29,10 @@ from prometheus_client.parser import text_string_to_metric_families
 from tools.attention_bench_utils import package_versions, source_file_hashes
 from tools.check_parity import http_generate
 from tools.parity_prompts import PROMPTS
+from vllm_metal.config import (
+    DSPARK_DRAFT_QUANTIZATION_KEY,
+    DSPARK_DRAFT_QUANTIZATION_Q4,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 ARMS = ("target", "dspark", "draft_model")
@@ -382,7 +386,7 @@ def run_arm(
     if arm == "dspark" and args.dspark_draft_quantization is not None:
         command += [
             "--additional-config",
-            json.dumps({"dspark_draft_quantization": args.dspark_draft_quantization}),
+            json.dumps({DSPARK_DRAFT_QUANTIZATION_KEY: args.dspark_draft_quantization}),
         ]
     write_json(directory / "server-command.json", command)
     rows = []
@@ -559,7 +563,9 @@ def main() -> None:
     parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 4])
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--dspark-width", type=int, default=7)
-    parser.add_argument("--dspark-draft-quantization", choices=["q4"])
+    parser.add_argument(
+        "--dspark-draft-quantization", choices=[DSPARK_DRAFT_QUANTIZATION_Q4]
+    )
     parser.add_argument(
         "--dspark-draft-topk",
         type=int,

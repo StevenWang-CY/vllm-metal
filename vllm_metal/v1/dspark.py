@@ -39,6 +39,11 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 
+from vllm_metal.config import (
+    DSPARK_DRAFT_QUANTIZATION_KEY,
+    DSPARK_DRAFT_QUANTIZATION_Q4,
+    DSPARK_Q4_GROUP_SIZE,
+)
 from vllm_metal.v1.dflash import DFlashConfig, DFlashModel
 from vllm_metal.v1.draft_checkpoint import COMMON_DRAFT_OPTIONS, load_draft_weights
 
@@ -124,6 +129,21 @@ class DSparkConfig:
             raise ValueError("DSpark requires confidence_head_with_markov")
         return config
 
+    def validate_q4_dimensions(self) -> None:
+        """Check quantized linear input widths before allocating or loading weights."""
+        cfg = self.backbone
+        widths = {
+            "hidden_size": cfg.hidden_size,
+            "num_attention_heads * head_dim": cfg.num_attention_heads * cfg.head_dim,
+            "intermediate_size": cfg.intermediate_size,
+        }
+        for name, width in widths.items():
+            if width % DSPARK_Q4_GROUP_SIZE:
+                raise ValueError(
+                    "DSpark Q4 requires linear input dimensions divisible by "
+                    f"{DSPARK_Q4_GROUP_SIZE}: {name}={width}"
+                )
+
 
 class _MarkovHead(nn.Module):
     def __init__(self, vocab_size: int, rank: int) -> None:
@@ -194,14 +214,18 @@ class DSparkModel(nn.Module):
             if selected(path, module) and (
                 not isinstance(module, nn.Linear)
                 or module.weight.dtype not in (mx.float16, mx.bfloat16)
-                or module.weight.shape[-1] % 64
+                or module.weight.shape[-1] % DSPARK_Q4_GROUP_SIZE
             ):
                 raise ValueError(
                     "DSpark Q4 requires unquantized FP16/BF16 linears with "
-                    f"input dimensions divisible by 64: {path}"
+                    f"input dimensions divisible by {DSPARK_Q4_GROUP_SIZE}: {path}"
                 )
         nn.quantize(
-            self, group_size=64, bits=4, mode="affine", class_predicate=selected
+            self,
+            group_size=DSPARK_Q4_GROUP_SIZE,
+            bits=4,
+            mode="affine",
+            class_predicate=selected,
         )
         mx.eval(self.parameters())
 
@@ -343,11 +367,28 @@ class DSparkModel(nn.Module):
         self.backbone.validate_anchors(anchors)
 
 
-def load_dspark(path: str | Path, *, target_config: Mapping[str, Any]) -> DSparkModel:
-    """Load a local unsharded checkpoint without changing its trained precision."""
+def load_dspark(
+    path: str | Path,
+    *,
+    target_config: Mapping[str, Any],
+    draft_quantization: str | None = None,
+) -> DSparkModel:
+    """Load a validated floating checkpoint, optionally converting its linears to Q4."""
+    if (
+        draft_quantization is not None
+        and draft_quantization != DSPARK_DRAFT_QUANTIZATION_Q4
+    ):
+        raise ValueError(
+            f"{DSPARK_DRAFT_QUANTIZATION_KEY} must be "
+            f"{DSPARK_DRAFT_QUANTIZATION_Q4!r}, got {draft_quantization!r}"
+        )
     path = Path(path)
     config = DSparkConfig.from_dict(json.loads((path / "config.json").read_text()))
     config.backbone.validate_target(target_config)
+    if draft_quantization == DSPARK_DRAFT_QUANTIZATION_Q4:
+        config.validate_q4_dimensions()
     model = DSparkModel(config)
     load_draft_weights(model, path, model_name="DSpark", strip_prefix="backbone.")
+    if draft_quantization == DSPARK_DRAFT_QUANTIZATION_Q4:
+        model.quantize_draft_linears()
     return model

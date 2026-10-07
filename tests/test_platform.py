@@ -185,6 +185,25 @@ class TestMetalPlatform:
         with pytest.raises(ValueError, match="requires method='dspark'"):
             MetalPlatform.check_and_update_config(config)
 
+    @pytest.mark.parametrize("quantization", [None, "q4"])
+    def test_dspark_quantization_accepts_supported_configuration(self, quantization):
+        config = self._platform_config(
+            speculative_config=SimpleNamespace(
+                method="dspark",
+                use_heterogeneous_vocab=False,
+                num_speculative_tokens=7,
+            ),
+        )
+        additional = (
+            {"dspark_draft_quantization": quantization}
+            if quantization is not None
+            else {}
+        )
+        config.additional_config = additional.copy()
+        MetalPlatform.check_and_update_config(config)
+        assert config.additional_config == additional
+        assert config.speculative_config.method == "dspark"
+
     def test_set_device_valid(self) -> None:
         """Test setting valid device."""
         MetalPlatform.set_device(0)  # Should not raise
