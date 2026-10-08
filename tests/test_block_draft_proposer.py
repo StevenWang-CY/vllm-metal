@@ -198,6 +198,114 @@ def test_non_drafting_rows_still_commit_features(kind, proposer):
     assert proposer._valid_ends == {"r": 15}
 
 
+@pytest.mark.parametrize("generated,max_tokens", [(1, 1), (4, 4), (4, 2)])
+def test_exhausted_output_budget_commits_features_without_drafting(
+    proposer, monkeypatch, generated, max_tokens
+):
+    state = RequestState(
+        token_ids=[1] * 15 + [2],
+        prompt_len=15,
+        sampling_params=SamplingParams(temperature=0, max_tokens=max_tokens),
+        generated_tokens=1,
+        block_ids=[[0], [5, 2, 7, 1]],
+    )
+    prefix = _features(15)
+    ctx = _prefill(state, prefix, 0, True)
+    features = prefix
+    if generated > 1:
+        assert proposer.propose(ctx) is not None
+        state.token_ids.extend([3] * (generated - 1))
+        state.generated_tokens = generated
+        # The final verification can emit more tokens than the output budget;
+        # the scheduler will truncate them after this worker step.
+        tail = _features(3)
+        ctx = replace(
+            ctx,
+            target_aux_hidden_states=tail,
+            decode_reqs=[("r", state)],
+            decode_segments=[
+                PagedDecodeSegment(
+                    req_id="r",
+                    input_token_ids=(2, 3, 3),
+                    start_row=0,
+                    num_query_tokens=3,
+                    draft_token_ids=(3, 3),
+                    cache_start_pos=15,
+                    block_ids=tuple(tuple(group) for group in state.block_ids),
+                )
+            ],
+            decode_token_ids=[[3] * 3],
+            prefill_reqs=[],
+            prefill_token_ids=[],
+            prefill_result_modes=[],
+            cu_seqlens=[0, 3],
+            num_decode_segments=1,
+        )
+        features = [mx.concatenate([a, b]) for a, b in zip(prefix, tail, strict=True)]
+
+    def unexpected_draft(*args):
+        pytest.fail("An exhausted request must not execute another draft forward")
+
+    monkeypatch.setattr(proposer, "_compile_draft", unexpected_draft)
+    if generated > 1:
+        monkeypatch.setitem(proposer._drafts, 3, unexpected_draft)
+    assert proposer.propose(ctx) is None
+    assert proposer._valid_ends == {"r": len(features[0])}
+    _assert_committed(proposer, state.block_ids[1], features)
+
+
+@pytest.mark.parametrize("max_tokens", [2, None])
+def test_exhausted_row_does_not_suppress_live_drafts(proposer, monkeypatch, max_tokens):
+    finished = RequestState(
+        token_ids=[1] * 15 + [2],
+        prompt_len=15,
+        sampling_params=SamplingParams(temperature=0, max_tokens=1),
+        generated_tokens=1,
+        block_ids=[[0], [5, 2, 7, 1]],
+    )
+    live = replace(
+        finished,
+        sampling_params=SamplingParams(temperature=0, max_tokens=max_tokens),
+        block_ids=[[0], [9, 3, 8, 4]],
+    )
+    features = _features(30)
+    ctx = _prefill(finished, [f[:15] for f in features], 0, True)
+    ctx = replace(
+        ctx,
+        target_aux_hidden_states=features,
+        prefill_reqs=[
+            ctx.prefill_reqs[0],
+            ctx.prefill_reqs[0]._replace(
+                req_id="live",
+                sampling_params=live.sampling_params,
+                block_ids=live.block_ids,
+            ),
+        ],
+        prefill_token_ids=[2, 2],
+        prefill_result_modes=["final", "final"],
+        request_states={"r": finished, "live": live},
+        cu_seqlens=[0, 15, 30],
+    )
+    forward = proposer._compile_draft(3)
+    calls = []
+
+    def record_forward(anchors, rows):
+        calls.append((anchors.tolist(), rows))
+        return forward(anchors, rows)
+
+    monkeypatch.setitem(proposer._drafts, 3, record_forward)
+    result = proposer.propose(ctx)
+    assert result is not None and result.req_ids == ["live"]
+    assert calls == [([2], [(live.block_ids[1], 15)])]
+    expected = _dense_tokens(
+        proposer, mx.array([2]), [f[None, 15:] for f in features], 3
+    )
+    assert result.draft_token_ids == expected.tolist()
+    assert proposer._valid_ends == {"r": 15, "live": 15}
+    _assert_committed(proposer, finished.block_ids[1], [f[:15] for f in features])
+    _assert_committed(proposer, live.block_ids[1], [f[15:] for f in features])
+
+
 def test_missing_and_discontinuous_features_fail_before_drafting(proposer):
     state = RequestState(
         token_ids=[1, 2],
