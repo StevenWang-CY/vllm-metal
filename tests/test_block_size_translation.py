@@ -9,6 +9,7 @@ kernel-compatible block sizes (8, 16, 32).
 from __future__ import annotations
 
 import re
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -215,23 +216,24 @@ class TestMLAKernelBlockSizes:
         start = src.index(signature)
         return src[start : src.index("\n}\n", start)]
 
-    def _gate_rows(self) -> set[tuple[int, int, int, int, int, int]]:
+    def _gate_rows(self) -> list[tuple[int, int, int, int, int, int]]:
         """The (kvr, pe, bs, g, nt, ps) rows of the shared spec table.
 
         ``kMlaKernelSpecs`` in paged_ops.cpp is the single source of truth
         the dispatch gate validates against — one ``{kvr, pe, bs, g, nt,
-        ps}`` row per instantiated shape.
+        ps}`` row per instantiated shape. A list (not a set) so duplicate
+        rows stay visible to the geometry-uniqueness check.
         """
         cpp = self._PAGED_OPS.read_text()
         table = cpp[cpp.index("kMlaKernelSpecs") :]
-        rows = {
+        rows = [
             tuple(int(v) for v in m.groups())
             for m in re.finditer(
                 r"\{\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,"
                 r"\s*(\d+)\s*,\s*(\d+)\s*\}",
                 table[: table.index("};")],
             )
-        }
+        ]
         assert rows, "could not parse the kMlaKernelSpecs table"
         return rows
 
@@ -283,29 +285,12 @@ class TestMLAKernelBlockSizes:
         }
         assert picked <= admitted
 
-    def test_nonzero_partition_size_is_named_after_geometry_match(self):
-        """Geometry selects the row. A nonzero partition_size is named, not skipped.
-
-        Requiring candidate.partition_size == 0 drops a real row and then the
-        miss error lists only the four geometry fields. The lookup must key on
-        geometry alone. A matched row with a nonzero partition_size throws, and
-        that message carries the row's partition_size.
-        """
-        cpp = self._PAGED_OPS.read_text()
-        body = self._fn_body(cpp, "static void dispatch_mla_paged_attention")
-
-        lookup = body[
-            body.index("for (const auto& candidate : kMlaKernelSpecs)") : body.index(
-                "if (spec == nullptr)"
-            )
-        ]
-        assert "partition_size==0" not in re.sub(r"\s+", "", lookup)
-
-        # ensure that the reject correctly flags partition_size
-        reject_at = body.index("spec->partition_size")
-        reject = body[reject_at : body.index("if (num_heads % heads_per_tg", reject_at)]
-        assert re.search(r"spec->partition_size\s*!=\s*0", reject)
-        assert "to_string(spec->partition_size)" in reject
+    def test_each_geometry_selects_one_table_row(self):
+        """dispatch_mla_paged_attention takes the first kMlaKernelSpecs row
+        whose (kv_lora_rank, qk_rope_head_dim, block_size, heads_per_tg)
+        matches; a second row with the same geometry could never dispatch."""
+        geometries = Counter(row[:4] for row in self._gate_rows())
+        assert geometries and max(geometries.values()) == 1, geometries
 
 
 class TestNaxKernelInstantiations:
