@@ -99,9 +99,17 @@ class DiffusionSettings:
                 "stability_threshold must be a positive integer "
                 f"(got {stability_threshold})."
             )
-        max_denoising_steps = int(
-            diffusion_config.max_denoising_steps or gen.get("max_denoising_steps") or 48
-        )
+        max_denoising_steps = diffusion_config.max_denoising_steps
+        if max_denoising_steps is None:
+            max_denoising_steps = gen.get("max_denoising_steps")
+        if max_denoising_steps is None:
+            max_denoising_steps = 48
+        max_denoising_steps = int(max_denoising_steps)
+        if max_denoising_steps <= 0:
+            raise ValueError(
+                "max_denoising_steps must be a positive integer "
+                f"(got {max_denoising_steps})."
+            )
         return cls(
             canvas_length=int(diffusion_config.canvas_length),
             max_denoising_steps=max_denoising_steps,

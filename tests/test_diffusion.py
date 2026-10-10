@@ -111,6 +111,30 @@ class TestDiffusionSettings:
         with pytest.raises(ValueError, match="stability_threshold"):
             DiffusionSettings.from_vllm_config(_vllm_config(gen_config=gen))
 
+    @pytest.mark.parametrize("value", [0, -1])
+    def test_rejects_non_positive_cli_max_denoising_steps(self, value) -> None:
+        # An explicit 0 used to fall back to the default of 48 silently, and a
+        # negative value ended every canvas after one step.
+        with pytest.raises(ValueError, match="max_denoising_steps"):
+            DiffusionSettings.from_vllm_config(_vllm_config(max_denoising_steps=value))
+
+    @pytest.mark.parametrize("value", [0, -1])
+    def test_rejects_non_positive_generation_max_denoising_steps(self, value) -> None:
+        gen = {**_GEN_CONFIG, "max_denoising_steps": value}
+
+        with pytest.raises(ValueError, match="max_denoising_steps"):
+            DiffusionSettings.from_vllm_config(_vllm_config(gen_config=gen))
+
+    @pytest.mark.parametrize("missing", ["absent", "null"])
+    def test_defaults_max_denoising_steps_when_unset(self, missing) -> None:
+        gen = {k: v for k, v in _GEN_CONFIG.items() if k != "max_denoising_steps"}
+        if missing == "null":
+            gen["max_denoising_steps"] = None
+
+        settings = DiffusionSettings.from_vllm_config(_vllm_config(gen_config=gen))
+
+        assert settings.max_denoising_steps == 48
+
 
 class TestSamplerMath:
     def test_temperature_schedule_runs_from_t_max_to_t_min(self) -> None:
