@@ -169,9 +169,11 @@ class TestNgramProposePropose:
 
         assert proposer.propose(ctx) is None
 
-    def test_skips_non_greedy_request(self) -> None:
+    @pytest.mark.parametrize("temperature,max_tokens", [(0.8, 16), (0.0, 1)])
+    def test_skips_ineligible_request(self, temperature, max_tokens) -> None:
         proposer = _proposer(prompt_lookup_min=2)
-        state = _request_state([1, 2, 3, 1, 2, 3, 1, 2], temperature=0.8)
+        state = _request_state([1, 2, 3, 1, 2, 3, 1, 2], temperature=temperature)
+        state.sampling_params.max_tokens = max_tokens
         ctx = _context(decode_reqs=[("r0", state)])
 
         assert proposer.propose(ctx) is None

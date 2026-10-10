@@ -24,9 +24,13 @@ def _state(token_ids: list[int], block_ids: list[int]) -> SimpleNamespace:
 
 def _request_state(
     temperature: float = 0.0,
+    *,
+    max_tokens: int | None = 16,
+    generated_tokens: int = 1,
 ) -> SimpleNamespace:
     return SimpleNamespace(
-        sampling_params=SamplingParams(temperature=temperature),
+        sampling_params=SamplingParams(temperature=temperature, max_tokens=max_tokens),
+        generated_tokens=generated_tokens,
     )
 
 
@@ -180,6 +184,16 @@ class TestBuildPagedDecodeSegments:
 
 
 class TestSpecDecodePolicy:
+    @pytest.mark.parametrize(
+        "generated,max_tokens,eligible",
+        [(1, 1, False), (4, 4, False), (4, 2, False), (1, 2, True), (32, None, True)],
+    )
+    def test_output_budget_controls_draft_eligibility(
+        self, generated, max_tokens, eligible
+    ) -> None:
+        state = _request_state(generated_tokens=generated, max_tokens=max_tokens)
+        assert SpeculativeDecodeController().can_draft_greedy("r0", state) is eligible
+
     def test_empty_scheduled_tokens_are_supported(self) -> None:
         SpeculativeDecodeController().validate_supported(
             _scheduler_output(scheduled_spec_decode_tokens={}),
@@ -253,11 +267,18 @@ class TestSpecDecodePolicy:
 
 
 class TestGemma4MTPDraftSeeds:
-    def test_decode_seeds_use_last_accepted_target_row(self) -> None:
+    @pytest.mark.parametrize("skip_reason", ["sampled", "output_budget"])
+    def test_decode_seeds_use_last_accepted_target_row(self, skip_reason) -> None:
         seeds = SpeculativeDecodeController().build_gemma4_mtp_draft_seeds(
             decode_reqs=[
                 ("r0", _request_state()),
-                ("r1", _request_state(temperature=0.7)),
+                (
+                    "r1",
+                    _request_state(
+                        temperature=0.7 if skip_reason == "sampled" else 0.0,
+                        max_tokens=1 if skip_reason == "output_budget" else 16,
+                    ),
+                ),
             ],
             decode_segments=[
                 PagedDecodeSegment(
@@ -298,7 +319,8 @@ class TestGemma4MTPDraftSeeds:
             ),
         )
 
-    def test_prefill_seeds_skip_intermediate_chunks(self) -> None:
+    @pytest.mark.parametrize("skip_reason", ["intermediate", "output_budget"])
+    def test_prefill_seeds_skip_ineligible_rows(self, skip_reason) -> None:
         final_prefill = SimpleNamespace(
             req_id="p0",
             token_ids=[1, 2, 3],
@@ -318,10 +340,15 @@ class TestGemma4MTPDraftSeeds:
             decode_token_ids=[],
             prefill_reqs=[final_prefill, intermediate_prefill],
             prefill_token_ids=[11, 12],
-            prefill_result_modes=["new_final", "intermediate"],
+            prefill_result_modes=[
+                "new_final",
+                "intermediate" if skip_reason == "intermediate" else "new_final",
+            ],
             request_states={
                 "p0": _request_state(),
-                "p1": _request_state(),
+                "p1": _request_state(
+                    max_tokens=1 if skip_reason == "output_budget" else 16
+                ),
             },
             cu_seqlens=[0, 3, 5],
             num_decode_segments=0,
@@ -344,7 +371,8 @@ class TestVerifyGreedySpecDecode:
             sampling_params=SamplingParams(
                 temperature=0.0,
                 logprob_token_ids=[0, 3],
-            )
+            ),
+            generated_tokens=1,
         )
 
         assert not SpeculativeDecodeController().can_draft_greedy("r0", state)

@@ -262,11 +262,6 @@ class BlockDraftProposer(ABC):
         req_ids, anchors, rows = [], [], []
         if width:
             for req_id, state in eligible:
-                # Sampling updates the output count before the scheduler can
-                # finish the request. Its verified features still commit above.
-                max_tokens = state.sampling_params.max_tokens
-                if max_tokens is not None and state.generated_tokens >= max_tokens:
-                    continue
                 # This stage does not qualify scheduler-invalid grammar drafts.
                 # Keep constrained requests on the target's grammar sampler.
                 if state.sampling_params.structured_outputs is not None:

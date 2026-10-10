@@ -173,11 +173,13 @@ def test_chunked_prefill_then_rejection_overwrites_temporary_kv(accepted, propos
 
 
 @pytest.mark.parametrize(
-    "kind", ["sampled", "logprobs", "grammar", "zero_k", "context_limit"]
+    "kind",
+    ["sampled", "logprobs", "grammar", "zero_k", "context_limit", "output_budget"],
 )
 def test_non_drafting_rows_still_commit_features(kind, proposer):
     params = SamplingParams(
         temperature=0.7 if kind == "sampled" else 0,
+        max_tokens=1 if kind == "output_budget" else 16,
         logprobs=1 if kind == "logprobs" else None,
         structured_outputs=StructuredOutputsParams(choice=["yes", "no"])
         if kind == "grammar"
@@ -187,6 +189,7 @@ def test_non_drafting_rows_still_commit_features(kind, proposer):
         token_ids=[1] * 15 + [2],
         prompt_len=15,
         sampling_params=params,
+        generated_tokens=1,
         block_ids=[[0], [5, 2, 7, 1]],
     )
     ctx = _prefill(state, _features(15), 0, True)
@@ -195,12 +198,14 @@ def test_non_drafting_rows_still_commit_features(kind, proposer):
     if kind == "context_limit":
         proposer.cache.max_model_len = 17
     assert proposer.propose(ctx) is None
+    assert not proposer._drafts
     assert proposer._valid_ends == {"r": 15}
+    _assert_committed(proposer, state.block_ids[1], ctx.target_aux_hidden_states)
 
 
-@pytest.mark.parametrize("generated,max_tokens", [(1, 1), (4, 4), (4, 2)])
+@pytest.mark.parametrize("max_tokens", [4, 2])
 def test_exhausted_output_budget_commits_features_without_drafting(
-    proposer, monkeypatch, generated, max_tokens
+    proposer, monkeypatch, max_tokens
 ):
     state = RequestState(
         token_ids=[1] * 15 + [2],
@@ -211,44 +216,41 @@ def test_exhausted_output_budget_commits_features_without_drafting(
     )
     prefix = _features(15)
     ctx = _prefill(state, prefix, 0, True)
-    features = prefix
-    if generated > 1:
-        assert proposer.propose(ctx) is not None
-        state.token_ids.extend([3] * (generated - 1))
-        state.generated_tokens = generated
-        # The final verification can emit more tokens than the output budget;
-        # the scheduler will truncate them after this worker step.
-        tail = _features(3)
-        ctx = replace(
-            ctx,
-            target_aux_hidden_states=tail,
-            decode_reqs=[("r", state)],
-            decode_segments=[
-                PagedDecodeSegment(
-                    req_id="r",
-                    input_token_ids=(2, 3, 3),
-                    start_row=0,
-                    num_query_tokens=3,
-                    draft_token_ids=(3, 3),
-                    cache_start_pos=15,
-                    block_ids=tuple(tuple(group) for group in state.block_ids),
-                )
-            ],
-            decode_token_ids=[[3] * 3],
-            prefill_reqs=[],
-            prefill_token_ids=[],
-            prefill_result_modes=[],
-            cu_seqlens=[0, 3],
-            num_decode_segments=1,
-        )
-        features = [mx.concatenate([a, b]) for a, b in zip(prefix, tail, strict=True)]
+    assert proposer.propose(ctx) is not None
+    state.token_ids.extend([3] * 3)
+    state.generated_tokens = 4
+    # The final verification can emit more tokens than the output budget;
+    # the scheduler will truncate them after this worker step.
+    tail = _features(3)
+    ctx = replace(
+        ctx,
+        target_aux_hidden_states=tail,
+        decode_reqs=[("r", state)],
+        decode_segments=[
+            PagedDecodeSegment(
+                req_id="r",
+                input_token_ids=(2, 3, 3),
+                start_row=0,
+                num_query_tokens=3,
+                draft_token_ids=(3, 3),
+                cache_start_pos=15,
+                block_ids=tuple(tuple(group) for group in state.block_ids),
+            )
+        ],
+        decode_token_ids=[[3] * 3],
+        prefill_reqs=[],
+        prefill_token_ids=[],
+        prefill_result_modes=[],
+        cu_seqlens=[0, 3],
+        num_decode_segments=1,
+    )
+    features = [mx.concatenate([a, b]) for a, b in zip(prefix, tail, strict=True)]
 
     def unexpected_draft(*args):
         pytest.fail("An exhausted request must not execute another draft forward")
 
     monkeypatch.setattr(proposer, "_compile_draft", unexpected_draft)
-    if generated > 1:
-        monkeypatch.setitem(proposer._drafts, 3, unexpected_draft)
+    monkeypatch.setitem(proposer._drafts, 3, unexpected_draft)
     assert proposer.propose(ctx) is None
     assert proposer._valid_ends == {"r": len(features[0])}
     _assert_committed(proposer, state.block_ids[1], features)
