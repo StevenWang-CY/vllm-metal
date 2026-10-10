@@ -26,6 +26,7 @@ class _PagedDecodeStateLike(Protocol):
 
 class _SpecDecodeRequestStateLike(Protocol):
     sampling_params: Any
+    generated_tokens: int
 
 
 class _SpecDecodePrefillLike(Protocol):
@@ -345,6 +346,10 @@ class SpeculativeDecodeController:
         request_state: _SpecDecodeRequestStateLike,
     ) -> bool:
         """Whether a request may be drafted under greedy-only spec decode."""
+        # Sampling updates the output count before the scheduler retires a request.
+        max_tokens = request_state.sampling_params.max_tokens
+        if max_tokens is not None and request_state.generated_tokens >= max_tokens:
+            return False
         try:
             self._validate_greedy_sampling([(req_id, request_state)])
         except NotImplementedError:
@@ -361,16 +366,16 @@ class SpeculativeDecodeController:
     ) -> Sequence[tuple[str, RequestState]]:
         """Filter ``ctx`` to requests eligible for drafting this step.
 
-        Shared eligibility filter used by the draft-model and n-gram proposers
-        that draft greedily: skip decode rows that did not sample this step,
-        skip non-greedy requests via :meth:`can_draft_greedy`, skip
+        Shared eligibility filter for block-draft, draft-model and n-gram
+        proposers: skip decode rows that did not sample this step, skip
+        exhausted or non-greedy requests via :meth:`can_draft_greedy`, skip
         intermediate prefill chunks, and de-duplicate prefill rows whose
         ``req_id`` was already admitted through decode.
 
         Callers post-process the returned pairs (e.g. the draft-model
         proposer maps each to its per-step ingest plan and drops rows with
         no newly-committed tokens), but the eligibility decisions live here
-        so the two proposers cannot drift out of sync.
+        so the proposers cannot drift out of sync.
         """
         eligible: list[tuple[str, RequestState]] = []
         seen: set[str] = set()

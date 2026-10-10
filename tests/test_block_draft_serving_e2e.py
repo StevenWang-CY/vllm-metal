@@ -140,6 +140,17 @@ def _serve(mode, baseline_path, verify_window, draft_quantization=None):
             "preemptions": 0,
             "resumed": 0,
         }
+        propose = proposer.propose
+
+        def check_propose(ctx):
+            result = propose(ctx)
+            for req_id in () if result is None else result.req_ids:
+                state = ctx.request_states[req_id]
+                limit = state.sampling_params.max_tokens
+                assert limit is None or state.generated_tokens < limit
+            return result
+
+        proposer.propose = check_propose
         verify, schedule = (
             runner._spec_decode_controller.verify_greedy,
             scheduler.schedule,
@@ -161,6 +172,13 @@ def _serve(mode, baseline_path, verify_window, draft_quantization=None):
 
         runner._spec_decode_controller.verify_greedy = record_verify
         scheduler.schedule = record_schedule
+        # The prefill's first output can finish the request by itself.
+        assert (
+            generate(
+                prompts[0], SamplingParams(temperature=0, max_tokens=1, ignore_eos=True)
+            )
+            == baseline[0][:1]
+        )
         # Boundary cases stay within 32 outputs; pressure/cancellation cases
         # continue for 48. Longer repetitive continuations can hit BF16 ties
         # between punctuation tokens across different target batch shapes.
