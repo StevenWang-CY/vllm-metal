@@ -9,6 +9,7 @@ from tests.gqa_test_utils import (
     _assert_close,
     _assert_fallback,
     _dispatch_family,
+    _primitive,
     _run_primitive,
 )
 from tests.test_gqa_paged_decode import GQA_GEOMETRIES, GQA_PARTITIONS
@@ -107,26 +108,18 @@ def test_generic_admission_counts_static_reducer_memory(
     )
     outputs = []
     for disabled in (True, False):
-        out = mx.array(0)
-        ops.paged_attention_primitive(
+        out = _primitive(
             query,
             keys,
             values,
-            kv,
-            head**-0.5,
-            0.0,
             tables,
             mx.array(lengths, mx.int32),
-            mx.arange(batch + 1, dtype=mx.int32),
             block,
             maximum,
-            -1,
-            out,
-            num_decode_requests=batch,
-            num_decode_tokens=batch,
-            max_decode_context_len=length,
-            gqa_context_lens=lengths,
+            lengths,
+            preplanned=False,
             gqa_disabled=disabled,
+            max_decode_context_len=length,
         )
         mx.eval(out)
         selected = 0 if disabled else expected
@@ -631,30 +624,19 @@ def test_ragged_scratch_budget_falls_back_before_allocation(dtype):
     values = mx.full(keys.shape, 2, dtype)
     tables = mx.zeros((batch, max(lengths) // block), mx.int32)
     gpu_lengths = mx.array(lengths, mx.int32)
-    cu = mx.arange(batch + 1, dtype=mx.int32)
-    mx.eval(query, keys, values, tables, gpu_lengths, cu)
+    mx.eval(query, keys, values, tables, gpu_lengths)
     mx.synchronize()
     before = mx.get_active_memory()
     mx.reset_peak_memory()
-    out = mx.array(0)
-    ops.paged_attention_primitive(
+    out = _primitive(
         query,
         keys,
         values,
-        kv,
-        head**-0.5,
-        0.0,
         tables,
         gpu_lengths,
-        cu,
         block,
         max(lengths),
-        -1,
-        out,
-        num_decode_requests=batch,
-        num_decode_tokens=batch,
-        max_decode_context_len=max(lengths),
-        gqa_length_plan=ops.gqa_decode_length_plan(lengths),
+        lengths,
     )
     mx.eval(out)
     assert ops.last_paged_dispatch() == "per_token_ps0"

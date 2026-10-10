@@ -5,6 +5,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
+from tests.gqa_test_utils import _primitive
 from vllm_metal.metal import get_ops
 
 M3_ARCH = "applegpu_g15g"
@@ -158,31 +159,6 @@ def test_m3_smaller_partition_respects_the_allocation_bound(maximum, expected):
         )
         == expected
     )
-
-
-def _primitive(query, keys, values, tables, lengths, block, maximum, host_lengths):
-    out = mx.array(0)
-    batch, _, head = query.shape
-    get_ops().paged_attention_primitive(
-        query,
-        keys,
-        values,
-        keys.shape[2],
-        head**-0.5,
-        0.0,
-        tables,
-        lengths,
-        mx.arange(batch + 1, dtype=mx.int32),
-        block,
-        maximum,
-        -1,
-        out,
-        num_decode_requests=batch,
-        num_decode_tokens=batch,
-        max_decode_context_len=maximum,
-        gqa_length_plan=get_ops().gqa_decode_length_plan(host_lengths),
-    )
-    return out
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])

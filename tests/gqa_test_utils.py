@@ -12,6 +12,54 @@ from vllm_metal.metal import get_ops
 NUM_QUERY_HEADS, NUM_KV_HEADS, HEAD_SIZE, BLOCK_SIZE = 32, 8, 128, 16
 
 
+def _primitive(
+    query,
+    keys,
+    values,
+    tables,
+    lengths,
+    block,
+    maximum,
+    host_lengths,
+    *,
+    preplanned=True,
+    gqa_disabled=False,
+    max_decode_context_len=None,
+):
+    """Build an ordinary decode node without evaluating its lazy output."""
+    ops = get_ops()
+    batch, _, head = query.shape
+    routing = (
+        {"gqa_length_plan": ops.gqa_decode_length_plan(host_lengths)}
+        if preplanned
+        else {"gqa_context_lens": host_lengths}
+    )
+    out = mx.array(0)
+    ops.paged_attention_primitive(
+        query,
+        keys,
+        values,
+        keys.shape[2],
+        head**-0.5,
+        0.0,
+        tables,
+        lengths,
+        mx.arange(batch + 1, dtype=mx.int32),
+        block,
+        maximum,
+        -1,
+        out,
+        num_decode_requests=batch,
+        num_decode_tokens=batch,
+        max_decode_context_len=(
+            maximum if max_decode_context_len is None else max_decode_context_len
+        ),
+        gqa_disabled=gqa_disabled,
+        **routing,
+    )
+    return out
+
+
 def _interleaved_table(n_blocks: int) -> list[int]:
     """Non-contiguous logical pages within a compact physical allocation."""
     return np.random.default_rng(715).permutation(n_blocks).tolist()
