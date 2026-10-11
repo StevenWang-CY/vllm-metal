@@ -144,10 +144,16 @@ def _serve(mode, baseline_path, verify_window, draft_quantization=None):
 
         def check_propose(ctx):
             result = propose(ctx)
-            for req_id in () if result is None else result.req_ids:
+            if result is None:
+                return result
+            for req_id, drafts in zip(
+                result.req_ids, result.draft_token_ids, strict=True
+            ):
                 state = ctx.request_states[req_id]
                 limit = state.sampling_params.max_tokens
-                assert limit is None or state.generated_tokens < limit
+                assert (
+                    limit is None or len(drafts) + 1 <= limit - state.generated_tokens
+                )
             return result
 
         proposer.propose = check_propose
@@ -158,7 +164,11 @@ def _serve(mode, baseline_path, verify_window, draft_quantization=None):
 
         def record_verify(logits, requests, segments):
             result = verify(logits, requests, segments)
+            states = dict(requests)
             for segment, tokens in zip(segments, result, strict=True):
+                state = states[segment.req_id]
+                limit = state.sampling_params.max_tokens
+                assert limit is None or len(tokens) <= limit - state.generated_tokens
                 stats["drafted"] += len(segment.draft_token_ids)
                 stats["accepted"] += len(tokens) - 1
                 stats["rejected"] += len(segment.draft_token_ids) - len(tokens) + 1
@@ -250,6 +260,7 @@ def _serve(mode, baseline_path, verify_window, draft_quantization=None):
         # Finishing inside a speculative block must not leak extra tokens or
         # leave pages unavailable for the next request.
         for budget in (1, 2, 3, 5):
+            drafted = stats["drafted"]
             assert (
                 generate(
                     prompts[0],
@@ -257,7 +268,24 @@ def _serve(mode, baseline_path, verify_window, draft_quantization=None):
                 )
                 == baseline[0][:budget]
             )
+            if budget <= 2:
+                assert stats["drafted"] == drafted
             assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == free
+        # A short request must not truncate its neighbor's proposal or inherit
+        # that neighbor's remaining budget in the shared draft batch.
+        results = llm.generate(
+            [{"prompt_token_ids": prompt} for prompt in prompts[:2]],
+            [
+                SamplingParams(temperature=0, max_tokens=budget, ignore_eos=True)
+                for budget in (3, 9)
+            ],
+            use_tqdm=False,
+        )
+        assert [list(output.outputs[0].token_ids) for output in results] == [
+            baseline[0][:3],
+            baseline[1][:9],
+        ]
+        assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == free
         stop_index = next(
             i for i in range(4, 16) if baseline[0][i] not in baseline[0][:i]
         )

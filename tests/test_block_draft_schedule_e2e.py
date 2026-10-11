@@ -77,7 +77,12 @@ def _serve_scheduled(
         if width == 0:
             assert result is None
         elif result is not None:
-            assert all(len(tokens) == width for tokens in result.draft_token_ids)
+            for req_id, tokens in zip(
+                result.req_ids, result.draft_token_ids, strict=True
+            ):
+                state = ctx.request_states[req_id]
+                remaining = state.sampling_params.max_tokens - state.generated_tokens
+                assert len(tokens) == min(width, remaining - 1)
             if not stats["injected_rejection"]:
                 # Require a real rejection even when the trained checkpoint
                 # predicts this short workload perfectly. The replacement is
@@ -161,7 +166,7 @@ def _serve_scheduled(
         assert {(max_width, 1), (1, 0), (0, 0), (0, 1), (1, max_width)} <= handoffs, (
             handoffs
         )
-        assert set(proposer._drafts) == {1, max_width}
+        assert {1, max_width} <= set(proposer._drafts) <= set(range(1, max_width + 1))
         assert free_blocks() == free
 
         # Resume speculation on freshly allocated pages under a cancelled ID.

@@ -174,12 +174,20 @@ def test_chunked_prefill_then_rejection_overwrites_temporary_kv(accepted, propos
 
 @pytest.mark.parametrize(
     "kind",
-    ["sampled", "logprobs", "grammar", "zero_k", "context_limit", "output_budget"],
+    [
+        "sampled",
+        "logprobs",
+        "grammar",
+        "zero_k",
+        "context_limit",
+        "output_budget",
+        "last_output",
+    ],
 )
 def test_non_drafting_rows_still_commit_features(kind, proposer):
     params = SamplingParams(
         temperature=0.7 if kind == "sampled" else 0,
-        max_tokens=1 if kind == "output_budget" else 16,
+        max_tokens={"output_budget": 1, "last_output": 2}.get(kind, 16),
         logprobs=1 if kind == "logprobs" else None,
         structured_outputs=StructuredOutputsParams(choice=["yes", "no"])
         if kind == "grammar"
@@ -216,7 +224,8 @@ def test_exhausted_output_budget_commits_features_without_drafting(
     )
     prefix = _features(15)
     ctx = _prefill(state, prefix, 0, True)
-    assert proposer.propose(ctx) is not None
+    result = proposer.propose(ctx)
+    assert (result is not None) == (max_tokens > 2)
     state.token_ids.extend([3] * 3)
     state.generated_tokens = 4
     # The final verification can emit more tokens than the output budget;
@@ -256,7 +265,7 @@ def test_exhausted_output_budget_commits_features_without_drafting(
     _assert_committed(proposer, state.block_ids[1], features)
 
 
-@pytest.mark.parametrize("max_tokens", [2, None])
+@pytest.mark.parametrize("max_tokens", [5, None])
 def test_exhausted_row_does_not_suppress_live_drafts(proposer, monkeypatch, max_tokens):
     finished = RequestState(
         token_ids=[1] * 15 + [2],
@@ -306,6 +315,102 @@ def test_exhausted_row_does_not_suppress_live_drafts(proposer, monkeypatch, max_
     assert proposer._valid_ends == {"r": 15, "live": 15}
     _assert_committed(proposer, finished.block_ids[1], [f[:15] for f in features])
     _assert_committed(proposer, live.block_ids[1], [f[15:] for f in features])
+
+
+@pytest.mark.parametrize(
+    "max_tokens,expected_width", [(None, 3), (1, 0), (2, 0), (3, 1), (4, 2), (8, 3)]
+)
+def test_remaining_output_budget_bounds_draft_forward(
+    proposer, monkeypatch, max_tokens, expected_width
+):
+    state = RequestState(
+        token_ids=[1] * 15 + [2],
+        prompt_len=15,
+        sampling_params=SamplingParams(temperature=0, max_tokens=max_tokens),
+        generated_tokens=1,
+        block_ids=[[0], [5, 2, 7, 1]],
+    )
+    features = _features(15)
+    widths = []
+    compile_draft = proposer._compile_draft
+
+    def record_compile(width):
+        widths.append(width)
+        return compile_draft(width)
+
+    monkeypatch.setattr(proposer, "_compile_draft", record_compile)
+    result = proposer.propose(_prefill(state, features, 0, True))
+    _assert_committed(proposer, state.block_ids[1], features)
+    if not expected_width:
+        assert result is None and not widths
+        return
+    assert widths == [expected_width]
+    expected = _dense_tokens(
+        proposer, mx.array([2]), [f[None] for f in features], expected_width
+    )
+    assert result.req_ids == ["r"]
+    assert result.draft_token_ids == expected.tolist()
+
+
+@pytest.mark.parametrize("long_budget", [4, 8])
+def test_mixed_output_budgets_share_one_bounded_draft_batch(
+    proposer, monkeypatch, long_budget
+):
+    states = {
+        name: RequestState(
+            token_ids=[1] * 15 + [anchor],
+            prompt_len=15,
+            sampling_params=SamplingParams(temperature=0, max_tokens=budget),
+            generated_tokens=1,
+            block_ids=[[0], [2 * i, 2 * i + 1]],
+        )
+        for i, (name, anchor, budget) in enumerate(
+            [("r", 2, 2), ("short", 3, 3), ("long", 4, long_budget)]
+        )
+    }
+    features = _features(45)
+    ctx = _prefill(states["r"], [f[:15] for f in features], 0, True)
+    ctx = replace(
+        ctx,
+        target_aux_hidden_states=features,
+        prefill_reqs=[
+            ctx.prefill_reqs[0]._replace(
+                req_id=name,
+                sampling_params=state.sampling_params,
+                block_ids=state.block_ids,
+            )
+            for name, state in states.items()
+        ],
+        prefill_token_ids=[2, 3, 4],
+        prefill_result_modes=["final"] * 3,
+        request_states=states,
+        cu_seqlens=[0, 15, 30, 45],
+    )
+    width = 2 if long_budget == 4 else 3
+    calls = []
+    compile_draft = proposer._compile_draft
+
+    def record_compile(selected_width):
+        forward = compile_draft(selected_width)
+
+        def record_forward(anchors, rows):
+            calls.append((selected_width, anchors.tolist(), rows))
+            return forward(anchors, rows)
+
+        return record_forward
+
+    monkeypatch.setattr(proposer, "_compile_draft", record_compile)
+    result = proposer.propose(ctx)
+    assert result.req_ids == ["short", "long"]
+    assert calls == [(width, [3, 4], [([2, 3], 15), ([4, 5], 15)])]
+    expected = _dense_tokens(
+        proposer, mx.array([3, 4]), [f[15:].reshape(2, 15, 64) for f in features], width
+    ).tolist()
+    assert result.draft_token_ids == [expected[0][:1], expected[1]]
+    for i, state in enumerate(states.values()):
+        _assert_committed(
+            proposer, state.block_ids[1], [f[15 * i : 15 * (i + 1)] for f in features]
+        )
 
 
 def test_missing_and_discontinuous_features_fail_before_drafting(proposer):
