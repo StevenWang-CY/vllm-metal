@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Qualify DSpark HTTP serving against target-only and ordinary draft decoding.
+"""Measure DSpark HTTP serving against target-only and optional draft decoding.
 
-Uses vllm bench serve for timings; token-ID checks and worker memory snapshots
-run outside that window. Each comparison arm owns a fresh server process group.
+Uses vllm bench serve for timings; worker memory snapshots run outside that
+window. Qualify correctness separately with tools.check_parity.
+Each comparison arm owns a fresh server process group.
 Run from the source checkout with local, pinned checkpoint directories.
 """
 
@@ -27,7 +28,6 @@ from urllib.request import Request, urlopen
 from prometheus_client.parser import text_string_to_metric_families
 
 from tools.attention_bench_utils import package_versions, source_file_hashes
-from tools.check_parity import http_generate
 from tools.parity_prompts import PROMPTS
 from vllm_metal.config import (
     DSPARK_DRAFT_QUANTIZATION_KEY,
@@ -421,21 +421,6 @@ def run_arm(
             for concurrency in concurrencies:
                 run_dir = directory / f"c{concurrency}"
                 run_dir.mkdir()
-                # Includes token IDs and validates the server's prompt IDs. No
-                # sample logprobs: requesting them would silently disable drafting.
-                outputs = http_generate(
-                    base + "/v1",
-                    "bench",
-                    reference,
-                    args.output_len,
-                    batch_size=concurrency,
-                )
-                write_json(run_dir / "tokens.json", outputs)
-                if any(len(row["tokens"]) != args.output_len for row in outputs):
-                    raise ValueError(
-                        "Untimed generation returned an incomplete sequence"
-                    )
-                completed += len(reference)
                 for phase in ("warmup", "timed"):
                     phase_dir = run_dir / phase
                     phase_dir.mkdir()
@@ -486,12 +471,11 @@ def run_arm(
                     "memory": memory,
                     "scheduler_capacity": capacity,
                     "benchmark": result,
-                    "tokens": outputs,
                 }
                 rows.append(row)
                 write_json(
                     phase_dir / "measurement.json",
-                    {k: v for k, v in row.items() if k not in ("benchmark", "tokens")},
+                    {k: v for k, v in row.items() if k != "benchmark"},
                 )
                 print(
                     f"{arm} r{repeat} c{concurrency}: {result['output_throughput']:.2f} output tokens/s; {delta['draft_tokens']:.0f} verified draft tokens",
@@ -503,44 +487,54 @@ def run_arm(
 
 
 def summarize(rows: list[dict]) -> list[dict]:
+    """Pair every arm with its own repeat's target baseline; never pool repeats."""
+    if not rows:
+        raise ValueError("No serving measurements to summarize")
+    indexed = {}
+    for row in rows:
+        key = (row["concurrency"], row["arm"], row["repeat"])
+        if key in indexed:
+            raise ValueError(f"Duplicate serving measurement: {key}")
+        if row["arm"] not in ARMS:
+            raise ValueError(f"Unknown benchmark arm: {row['arm']}")
+        rate = row["benchmark"]["output_throughput"]
+        if not math.isfinite(rate) or rate <= 0:
+            raise ValueError("Throughput must be finite and positive")
+        indexed[key] = row
+    arms = [arm for arm in ARMS if any(r["arm"] == arm for r in rows)]
+    if "target" not in arms or len(arms) < 2:
+        raise ValueError("A target baseline and a speculative arm are required")
+    repeats = sorted({r["repeat"] for r in rows})
     summary = []
     for concurrency in sorted({r["concurrency"] for r in rows}):
-        for arm in ARMS:
-            selected = sorted(
-                (
-                    r
-                    for r in rows
-                    if r["arm"] == arm and r["concurrency"] == concurrency
-                ),
-                key=lambda r: r["repeat"],
-            )
-            rates, ratios, exact = [], [], []
+        for arm in arms:
+            keys = [(concurrency, arm, repeat) for repeat in repeats]
+            if any(key not in indexed for key in keys):
+                raise ValueError(f"Missing paired measurement for {arm} c{concurrency}")
+            selected = [indexed[key] for key in keys]
+            rates, ratios = [], []
             for row in selected:
-                baseline = next(
-                    r
-                    for r in rows
-                    if r["arm"] == "target"
-                    and r["repeat"] == row["repeat"]
-                    and r["concurrency"] == concurrency
-                )
-                rates.append(row["benchmark"]["output_throughput"])
-                ratios.append(rates[-1] / baseline["benchmark"]["output_throughput"])
-                exact.append(
-                    sum(
-                        a["tokens"] == b["tokens"]
-                        for a, b in zip(row["tokens"], baseline["tokens"], strict=True)
-                    )
-                )
+                baseline = indexed[(concurrency, "target", row["repeat"])]["benchmark"]
+                result = row["benchmark"]
+                if any(
+                    result[key] != baseline[key]
+                    for key in ("input_lens", "output_lens")
+                ):
+                    raise ValueError("Paired arms measured different workloads")
+                rates.append(result["output_throughput"])
+                ratios.append(rates[-1] / baseline["output_throughput"])
             summary.append(
                 {
                     "arm": arm,
                     "concurrency": concurrency,
-                    "repeat_ids": [r["repeat"] for r in selected],
+                    "repeat_ids": repeats,
                     "output_tokens_per_s": rates,
                     "median_output_tokens_per_s": statistics.median(rates),
                     "paired_throughput_ratio_vs_target": ratios,
-                    "exact_sequences_vs_target": exact,
-                    "sequences_per_repeat": len(selected[0]["tokens"]),
+                    "median_paired_throughput_ratio_vs_target": statistics.median(
+                        ratios
+                    ),
+                    "sequences_per_repeat": selected[0]["benchmark"]["completed"],
                     "mean_ttft_ms": [r["benchmark"]["mean_ttft_ms"] for r in selected],
                     "mean_tpot_ms": [r["benchmark"]["mean_tpot_ms"] for r in selected],
                     "p95_e2el_ms": [r["benchmark"]["p95_e2el_ms"] for r in selected],
@@ -549,10 +543,15 @@ def summarize(rows: list[dict]) -> list[dict]:
     return summary
 
 
+def write_summary(output_dir: Path, rows: list[dict]) -> None:
+    write_json(output_dir / "summary.json", summarize(rows))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("target", "dspark", "draft", "output-dir"):
+    for name in ("target", "dspark", "output-dir"):
         parser.add_argument(f"--{name}", type=Path, required=True)
+    parser.add_argument("--draft", type=Path, help="Optional ordinary draft-model arm")
     parser.add_argument(
         "--prompt-file",
         type=Path,
@@ -607,7 +606,8 @@ def main() -> None:
         parser.error(
             "Use positive limits, >=2 output tokens/repeats, unique concurrency <= prompts, and memory fraction in (0,1)"
         )
-    for name in ("target", "dspark", "draft"):
+    checkpoint_names = ["target", "dspark"] + (["draft"] if args.draft else [])
+    for name in checkpoint_names:
         path = getattr(args, name).resolve()
         if not (path / "config.json").is_file():
             parser.error(f"--{name} must be a local checkpoint directory")
@@ -652,8 +652,9 @@ def main() -> None:
         MLX_ENABLE_TF32="0",
     )
     env["PYTHONPATH"] = str(ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    arms = ARMS if args.draft is not None else ARMS[:2]
     order = [
-        list(ARMS if repeat % 2 else ARMS[::-1])
+        list(arms if repeat % 2 else arms[::-1])
         for repeat in range(1, args.repeats + 1)
     ]
     import mlx.core as mx
@@ -679,7 +680,7 @@ def main() -> None:
             },
             "checkpoint_configs": {
                 name: json.loads((getattr(args, name) / "config.json").read_text())
-                for name in ("target", "dspark", "draft")
+                for name in checkpoint_names
             },
             "python": platform.python_version(),
             "run_order": order,
@@ -709,7 +710,7 @@ def main() -> None:
             raise ValueError(
                 "Source changed during the benchmark; repeat from a fixed checkout"
             )
-        write_json(args.output_dir / "summary.json", summarize(rows))
+        write_summary(args.output_dir, rows)
     except BaseException as exc:
         write_json(
             args.output_dir / "failure.json",

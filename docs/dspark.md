@@ -100,7 +100,7 @@ proposal against its full vocabulary. Measure acceptance and serving latency
 together; reduced draft memory does not establish a speedup or native greedy
 equivalence. The existing reduced-precision qualification limits still apply.
 
-Both `tools.dflash_serving_parity` and
+Both `tools.check_parity` and
 `tools.benchmark.dspark_serving_benchmark` accept
 `--dspark-draft-quantization q4`, including with `--dspark-draft-topk 64`.
 The option applies only to the DSpark arm; native, target-only and ordinary
@@ -117,9 +117,9 @@ reuse, stop/EOS handling, and scheduler-driven width changes through zero.
 ```bash
 pytest -m slow tests/test_block_draft_serving_e2e.py tests/test_block_draft_schedule_e2e.py
 pytest -m slow tests/test_block_draft_prefix_caching_e2e.py -k dspark
-python -m tools.dflash_serving_parity \
+python -m tools.check_parity \
     --method dspark --num-draft-tokens 7 \
-    --target /path/to/target/snapshot --draft /path/to/draft/snapshot \
+    --model /path/to/target/snapshot --draft /path/to/draft/snapshot \
     --batch-size 1 2 --max-tokens 32 --output-dir /path/to/new-serving-results
 ```
 
@@ -173,9 +173,9 @@ Use `--audit-continuations` for a strict check that also covers every token afte
 the first divergence:
 
 ```bash
-python -m tools.dflash_serving_parity \
+python -m tools.check_parity \
     --method dspark --num-draft-tokens 7 --dspark-draft-topk 64 \
-    --target /path/to/target/snapshot --draft /path/to/draft/snapshot \
+    --model /path/to/target/snapshot --draft /path/to/draft/snapshot \
     --batch-size 1 4 --max-tokens 32 --audit-continuations \
     --output-dir /path/to/new-continuation-audit
 ```
@@ -202,48 +202,44 @@ tested workload; it does not establish sampled verification or measure speed.
 
 ## Measure HTTP serving and memory
 
-Run the matched three-way comparison from a source checkout on macOS:
+Run the matched target-only/DSpark comparison from a source checkout on macOS:
 
 ```bash
 python -m tools.benchmark.dspark_serving_benchmark \
     --target /path/to/Qwen3-4B-4bit/snapshot \
     --dspark /path/to/dspark_qwen3_4b_block7/snapshot \
-    --draft /path/to/Qwen3-0.6B/snapshot \
     --concurrency 1 4 --repeats 2 --output-len 64 \
     --output-dir /path/to/new-benchmark-results
 ```
 
-Use the pinned target/DSpark pair above and a compatible ordinary draft model.
-All three arms use the same target, tokenizer, plain greedy prompts, output
-length, context/prefill limits, memory fraction, and disabled prefix caching.
-The default workload is the shared 40-prompt parity corpus. For representative
-longer contexts, supply `--prompt-file` with JSONL `{"prompt": "..."}` rows and
-`--num-prompts`; prompts must fit the context limit without truncation. Draft
-widths are recorded separately (`--dspark-width 7`, `--draft-width 3`).
-Use `--dspark-draft-topk 64` to measure candidate limiting in the DSpark arm;
-the target-only and ordinary-draft arms retain their original configuration.
+Add `--draft /path/to/Qwen3-0.6B/snapshot` for an ordinary draft-model arm.
+All arms use the same target, tokenizer, plain greedy prompts, output length,
+context/prefill limits, memory fraction, and disabled prefix caching.
+The default workload is the shared 40-prompt corpus. For representative serving
+measurements, supply natural prompts as `--prompt-file` JSONL `{"prompt": "..."}` rows and `--num-prompts`.
+Prompts must fit the context limit without truncation.
+Use `--dspark-draft-topk 64` for candidate limiting; draft widths are recorded
+separately (`--dspark-width 7`, `--draft-width 3`).
 
-The tool starts fresh loopback-only `vllm serve` processes with multiprocessing
-enabled, reverses arm and concurrency order between repeats, and shuts down each
-server's process group before starting the next. Per concurrency, it performs
-an untimed token-ID comparison pass, a discarded streaming warmup pass, then
-measures with `vllm bench serve`. Full output IDs from the untimed pass are
-retained and compared to that repeat's target-only arm. That pass submits
-batches of prompts in one completion request; the timed pass sends independent
-concurrent streaming requests. Exact-match counts describe only the untimed
-pass. Sample logprobs are never requested, since they disable drafting. Timings
-use the benchmark's streaming usage counts and latency definitions, not SSE
-chunk counts.
+Each arm runs in a fresh loopback-only server process group, with arm and
+concurrency order reversed between repeats. Each timed `vllm bench serve` run
+follows a discarded full-workload streaming warmup. Both use independent
+concurrent requests, with identical input and output lengths in every arm.
+No parity pass or inference instrumentation runs in the timing window.
 
-`summary.json` retains every repeat's throughput and paired ratio, latency,
-and exact sequence counts. Each run also saves commands, detailed benchmark
-results, token IDs, server logs, source hashes, and before/after counters.
-Counter snapshots wait for completed requests and exclude both warmup passes;
-a missing required counter or a speculative arm with no actual verified drafts
-fails. Failed, incomplete, or mismatched workloads cannot produce a successful
-summary. Token divergence is reported explicitly, without being relabeled as
-top-k agreement or exact losslessness; investigate it with the separate serving
-parity tool.
+`summary.json` contains throughput, latency, and ratios paired with the same
+repeat's target-only baseline, including the median of those paired ratios.
+Missing or duplicate pairs and mismatched workloads fail comparison.
+Commands, detailed measurements, source hashes, server logs, and memory/counter
+snapshots are retained. Counters exclude warmup and must show actual verified
+drafts in speculative arms; incomplete requests or missing counters fail the run.
+
+Benchmark success means the requested workload completed and its measurements
+are valid. It does **not** qualify output parity. Run `tools.check_parity --method
+dspark --top-k 5` separately with the same checkpoints and draft settings; add
+`--method draft_model` in a separate run when measuring that arm. The former
+untimed token pass and exact-match fields have been removed from the benchmark:
+correctness reports now belong to the shared parity tool.
 
 Worker snapshots distinguish MLX active/peak allocation, allocator cache, worker
 RSS and lifetime peak RSS, and physical KV backing bytes. The startup snapshot

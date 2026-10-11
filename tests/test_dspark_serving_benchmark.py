@@ -21,6 +21,7 @@ from tools.benchmark.dspark_serving_benchmark import (
     stop_server,
     summarize,
     validate_measurement,
+    write_summary,
 )
 
 
@@ -204,32 +205,87 @@ def test_baseline_cannot_include_drafting():
         )
 
 
-def test_summary_pairs_repeats_and_preserves_token_divergence():
+@pytest.fixture
+def serving_rows():
     result, _, _ = measurement()
     rows = []
-    for repeat in (1, 2):
-        for arm, rate, tokens in (
-            ("target", 8 * repeat, [1, 2]),
-            ("dspark", 6 * repeat, [1, 3]),
-            ("draft_model", 10 * repeat, [1, 2]),
-        ):
-            bench = deepcopy(result)
-            bench["output_throughput"] = rate
-            rows.append(
-                {
-                    "repeat": repeat,
-                    "arm": arm,
-                    "concurrency": 1,
-                    "benchmark": bench,
-                    "tokens": [{"tokens": tokens}],
-                }
-            )
-    # A reversed execution order must still compare each repeat to its own baseline.
-    summary = summarize(rows[::-1])
+    for concurrency in (1, 4):
+        for repeat in (1, 2):
+            for arm, rate in (
+                ("target", 8 * repeat),
+                ("dspark", 6 * repeat),
+                ("draft_model", 10 * repeat),
+            ):
+                bench = deepcopy(result)
+                bench["output_throughput"] = rate
+                rows.append(
+                    {
+                        "repeat": repeat,
+                        "arm": arm,
+                        "concurrency": concurrency,
+                        "benchmark": bench,
+                    }
+                )
+    return rows
+
+
+def test_summary_pairs_repeats_in_execution_independent_order(serving_rows):
+    summary = summarize(serving_rows[::-1])
     dspark = next(row for row in summary if row["arm"] == "dspark")
+    assert dspark["repeat_ids"] == [1, 2]
     assert dspark["paired_throughput_ratio_vs_target"] == [0.75, 0.75]
-    assert dspark["exact_sequences_vs_target"] == [0, 0]
+    assert dspark["median_paired_throughput_ratio_vs_target"] == 0.75
     assert dspark["median_output_tokens_per_s"] == 9
+
+
+def test_summary_preserves_timings_without_claiming_parity(tmp_path, serving_rows):
+    write_summary(tmp_path, serving_rows)
+    summary = json.loads((tmp_path / "summary.json").read_text())
+    assert len(summary) == 6
+    assert all(row["sequences_per_repeat"] == 2 for row in summary)
+    assert all("greedy_parity_passed" not in row for row in summary)
+    assert all(len(row["output_tokens_per_s"]) == 2 for row in summary)
+
+
+def test_ordinary_draft_comparison_is_optional(serving_rows):
+    rows = [r for r in serving_rows if r["arm"] != "draft_model"]
+    summary = summarize(rows)
+    assert len(summary) == 4
+    assert {r["arm"] for r in summary} == {"target", "dspark"}
+
+
+@pytest.mark.parametrize(
+    "problem", ["empty", "duplicate", "missing", "no_target", "no_spec"]
+)
+def test_incomplete_comparisons_cannot_produce_summary(tmp_path, serving_rows, problem):
+    rows = serving_rows
+    if problem == "empty":
+        rows = []
+    elif problem == "duplicate":
+        rows.append(deepcopy(rows[0]))
+    elif problem == "missing":
+        rows.pop()
+    elif problem == "no_target":
+        rows = [r for r in rows if r["arm"] != "target"]
+    else:
+        rows = [r for r in rows if r["arm"] == "target"]
+    with pytest.raises(ValueError):
+        write_summary(tmp_path, rows)
+    assert not (tmp_path / "summary.json").exists()
+
+
+@pytest.mark.parametrize("key", ["input_lens", "output_lens"])
+def test_summary_rejects_comparison_of_different_workloads(serving_rows, key):
+    serving_rows[1]["benchmark"][key][0] += 1
+    with pytest.raises(ValueError, match="different workloads"):
+        summarize(serving_rows)
+
+
+@pytest.mark.parametrize("rate", [0, -1, float("nan"), float("inf")])
+def test_summary_rejects_invalid_throughput(serving_rows, rate):
+    serving_rows[0]["benchmark"]["output_throughput"] = rate
+    with pytest.raises(ValueError, match="finite and positive"):
+        summarize(serving_rows)
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="macOS process group lifecycle")
