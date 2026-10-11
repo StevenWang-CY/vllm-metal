@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Compare native MLX, target-only serving, and actual block-draft verification.
+"""Speculative workers for tools.check_parity.
 
 Unlike requesting sample logprobs, observing target rows inside the runner
 keeps greedy drafting enabled. This diagnostic is not a performance benchmark.
@@ -10,7 +10,6 @@ Use --audit-continuations for strict native replay on every emitted prefix.
 
 from __future__ import annotations
 
-import argparse
 import importlib.metadata
 import json
 import os
@@ -18,15 +17,12 @@ import subprocess
 import sys
 from pathlib import Path
 
-if __name__ == "__main__":
-    os.environ["MLX_ENABLE_TF32"] = "0"
-
 from tools.attention_bench_utils import source_file_hashes
-from tools.check_parity import compare_results, mlx_generate
+from tools.check_parity import mlx_generate
 from tools.parity_prompts import PROMPTS
+from tools.parity_utils import parity_report
 from vllm_metal.config import (
     DSPARK_DRAFT_QUANTIZATION_KEY,
-    DSPARK_DRAFT_QUANTIZATION_Q4,
 )
 
 
@@ -57,7 +53,7 @@ def run_engine(args):
         max_num_seqs=max(args.batch_size),
         max_num_batched_tokens=256,
         block_size=16,
-        gpu_memory_utilization=0.25,
+        gpu_memory_utilization=args.gpu_memory_utilization,
         num_gpu_blocks_override=1 + 64 * max(args.batch_size),
         enable_prefix_caching=False,
         async_scheduling=False,
@@ -71,6 +67,7 @@ def run_engine(args):
     runner = llm.llm_engine.model_executor.driver_worker.model_runner
     sample = runner._sample_paged_batch
     records, prompts, decisions = {}, {}, {}
+    request_ids = {}
     stats = {"drafted": 0, "accepted": 0, "scheduled_widths": {}}
     if runner._drafter is not None:
         propose = runner._drafter.propose
@@ -83,32 +80,20 @@ def run_engine(args):
 
         runner._drafter.propose = observe_width
 
-    def top(row):
-        scores = row.astype(mx.float32)
-        scores = scores - mx.logsumexp(scores)
-        ids = mx.argsort(-scores)[:5].tolist()
-        return [
-            {
-                "id": token,
-                "text": "",
-                "rank": rank,
-                "logprob": float(scores[token].item()),
-            }
-            for rank, token in enumerate(ids, start=1)
-        ]
-
     def record(req_id, row, token, kind, query_tokens):
+        decision = score_token(
+            np.array(row.astype(mx.float32)), token, top_k=args.top_k
+        )
+        records[req_id].append(decision["top_logprobs"])
         if args.audit_continuations:
-            decision = score_token(np.array(row.astype(mx.float32)), token)
             decision.update(kind=kind, query_tokens=query_tokens)
             decisions[req_id].append(decision)
-            records[req_id].append(decision["top_logprobs"])
-        else:
-            records[req_id].append(top(row))
 
     def observe(*positional, **keywords):
         state = runner._execute_model_state
         for new in state.scheduler_output.scheduled_new_reqs:
+            output_state = llm.llm_engine.output_processor.request_states[new.req_id]
+            request_ids[output_state.external_req_id] = new.req_id
             records[new.req_id] = []
             decisions[new.req_id] = []
             prompts[new.req_id] = new.prompt_token_ids
@@ -155,6 +140,7 @@ def run_engine(args):
                 records.clear()
                 prompts.clear()
                 decisions.clear()
+                request_ids.clear()
                 refs = reference[start : start + batch_size]
                 results = llm.generate(
                     [{"prompt_token_ids": r["input_ids"]} for r in refs],
@@ -164,11 +150,9 @@ def run_engine(args):
                     use_tqdm=False,
                 )
                 for ref, result in zip(refs, results, strict=True):
-                    req_id = next(
-                        key
-                        for key, prompt in prompts.items()
-                        if prompt == ref["input_ids"]
-                    )
+                    req_id = request_ids[result.request_id]
+                    if prompts[req_id] != ref["input_ids"]:
+                        raise ValueError("Serving changed the input token IDs")
                     output = result.outputs[0]
                     rows = records[req_id][: args.max_tokens]
                     if len(rows) != len(output.token_ids):
@@ -193,40 +177,12 @@ def run_engine(args):
                 and args.schedule_lookup[batch_size] > 0
                 and not stats["drafted"]
             ):
-                raise AssertionError("Parity run did not exercise block drafting")
+                raise AssertionError("Parity run did not exercise drafting")
     finally:
         llm.llm_engine.engine_core.shutdown()
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--target", default="mlx-community/Qwen3-4B-4bit")
-    parser.add_argument("--method", choices=["dflash", "dspark"], default="dflash")
-    parser.add_argument("--draft")
-    parser.add_argument("--num-draft-tokens", type=int, default=3)
-    parser.add_argument("--dspark-draft-topk", type=int)
-    parser.add_argument(
-        "--dspark-draft-quantization", choices=[DSPARK_DRAFT_QUANTIZATION_Q4]
-    )
-    parser.add_argument("--max-tokens", type=int, default=32)
-    parser.add_argument("--batch-size", type=int, nargs="+", default=[1, 2])
-    parser.add_argument(
-        "--draft-schedule",
-        type=json.loads,
-        help="JSON batch-size schedule, e.g. '[[1,1,3],[2,2,1],[3,4,0]]'",
-    )
-    parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument(
-        "--audit-continuations",
-        action="store_true",
-        help="Replay every emitted prefix natively; any greedy mismatch fails the strict audit",
-    )
-    parser.add_argument(
-        "--worker",
-        choices=["native", "target", "dflash", "dspark", "replay"],
-        help=argparse.SUPPRESS,
-    )
-    args = parser.parse_args()
+def validate_args(args, parser):
     if args.dspark_draft_quantization is not None and args.method != "dspark":
         parser.error("--dspark-draft-quantization requires --method dspark")
     if args.dspark_draft_topk is not None and (
@@ -239,6 +195,7 @@ def main():
         args.draft = {
             "dflash": "z-lab/Qwen3-4B-DFlash-b16",
             "dspark": "deepseek-ai/dspark_qwen3_4b_block7",
+            "draft_model": "Qwen/Qwen3-0.6B",
         }[args.method]
     if args.worker not in (None, "native", "target", args.method, "replay"):
         parser.error("Draft worker must match --method")
@@ -265,10 +222,17 @@ def main():
         )
     except (TypeError, ValueError) as exc:
         parser.error(str(exc))
+
+
+def run(args) -> bool:
+    """Run correctness workers serially, then preserve every comparison."""
+    os.environ["MLX_ENABLE_TF32"] = "0"
     if args.worker == "native":
-        reference = mlx_generate(args.target, PROMPTS, args.max_tokens, 5)
+        reference = mlx_generate(
+            args.target, args.prompt or PROMPTS, args.max_tokens, args.top_k
+        )
         (args.output_dir / "native.json").write_text(json.dumps(reference))
-        return
+        return True
     if args.worker == "replay":
         from tools.continuation_audit import audit_serving_run
 
@@ -276,21 +240,19 @@ def main():
         (args.output_dir / "continuation-audit.json").write_text(
             json.dumps(report, indent=2, allow_nan=False)
         )
-        return
+        return True
     if args.worker:
         run_engine(args)
-        return
+        return True
     args.output_dir.mkdir(parents=True, exist_ok=False)
-    if args.audit_continuations:
-        from huggingface_hub import snapshot_download
+    from huggingface_hub import snapshot_download
 
-        # Resolve once: every serving and replay worker must load the same
-        # checkpoint even when the CLI was given a mutable Hub model name.
-        for name in ("target", "draft"):
-            path = Path(getattr(args, name))
-            if not path.is_dir():
-                path = Path(snapshot_download(getattr(args, name)))
-            setattr(args, name, str(path.resolve()))
+    # Resolve once so every worker loads the same checkpoint revision.
+    for name in ("target", "draft"):
+        path = Path(getattr(args, name))
+        if not path.is_dir():
+            path = Path(snapshot_download(getattr(args, name)))
+        setattr(args, name, str(path.resolve()))
     root = Path(__file__).resolve().parents[1]
     sources = sorted(
         p
@@ -309,6 +271,7 @@ def main():
                 "dspark_draft_topk": args.dspark_draft_topk,
                 "dspark_draft_quantization": args.dspark_draft_quantization,
                 "max_tokens": args.max_tokens,
+                "top_k": args.top_k,
                 "batch_sizes": args.batch_size,
                 "draft_schedule": args.draft_schedule,
                 "audit_continuations": args.audit_continuations,
@@ -324,6 +287,8 @@ def main():
             indent=2,
         )
     )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(root) + os.pathsep + env.get("PYTHONPATH", "")
     workers = ["native", "target", args.method]
     if args.audit_continuations:
         workers.append("replay")
@@ -333,18 +298,22 @@ def main():
                 [
                     sys.executable,
                     "-m",
-                    "tools.dflash_serving_parity",
+                    "tools.check_parity",
                     *sys.argv[1:],
-                    "--target",
+                    "--model",
                     args.target,
                     "--draft",
                     args.draft,
+                    "--output-dir",
+                    str(args.output_dir),
                     "--worker",
                     worker,
                 ],
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 check=True,
+                cwd=root,
+                env=env,
                 # Replay includes a native control and both serving arms for
                 # every batch size, each with a full continuation per prompt.
                 timeout=600 * (1 + 2 * len(args.batch_size))
@@ -352,16 +321,31 @@ def main():
                 else 600,
             )
     reference = json.loads((args.output_dir / "native.json").read_text())
-    passed = True
-    for worker in ("target", args.method):
-        for batch_size in args.batch_size:
+    reports = {}
+    for batch_size in args.batch_size:
+        arms = {}
+        for worker in ("target", args.method):
             result = json.loads(
                 (args.output_dir / f"{worker}-b{batch_size}.json").read_text()
             )
+            arms[worker] = result["outputs"]
             print(f"{worker}, batch {batch_size}: {result['stats']}")
-            passed &= compare_results(
-                reference, result["outputs"], max_tokens=args.max_tokens, top_k=5
+            reports[f"native-vs-{worker}-b{batch_size}"] = parity_report(
+                reference,
+                result["outputs"],
+                max_tokens=args.max_tokens,
+                top_k=args.top_k,
+                labels=("native", worker),
             )
+        reports[f"target-vs-{args.method}-b{batch_size}"] = parity_report(
+            arms["target"],
+            arms[args.method],
+            max_tokens=args.max_tokens,
+            top_k=args.top_k,
+            labels=("target", args.method),
+        )
+    passed = all(report["passed"] for report in reports.values())
+    summary = {"top_k": args.top_k, "comparisons": reports}
     if args.audit_continuations:
         report = json.loads((args.output_dir / "continuation-audit.json").read_text())
         for name, audit in report["reports"].items():
@@ -374,10 +358,10 @@ def main():
                     f", {audit['serving_argmax_mismatches']} serving greedy mismatches"
                 )
             print(message)
+        summary["continuation_audit_passed"] = report["passed"]
         passed &= report["passed"]
-    if not passed:
-        raise SystemExit(1)
-
-
-if __name__ == "__main__":
-    main()
+    summary["passed"] = passed
+    (args.output_dir / "summary.json").write_text(
+        json.dumps(summary, indent=2, allow_nan=False) + "\n"
+    )
+    return passed

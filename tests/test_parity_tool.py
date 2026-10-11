@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from tools.check_parity import check_parity, compare_results, http_generate, http_result
+from tools.parity_utils import parity_report
 
 
 class TestParityTool:
@@ -50,6 +51,37 @@ class TestParityTool:
         ref = self._result([1], [[1, 6]])
         got = self._result([6], [[6, 1]])
         assert not compare_results([ref], [got], max_tokens=2, top_k=2)
+
+    def test_report_keeps_exact_tolerant_and_failed_counts_separate(self):
+        ref = self._result([1, 5], [[1], [5, 6]])
+        near = self._result([1, 6], [[1], [6, 5]])
+        wrong = self._result([1, 7], [[1], [7, 8]])
+        report = parity_report([ref] * 3, [ref, near, wrong], max_tokens=2, top_k=2)
+        assert not report["passed"]
+        assert report["counts"] == {"EXACT": 1, "TOP_K_MATCH": 1, "FAIL": 1}
+        assert [r["first_divergence"] for r in report["results"]] == [None, 1, 1]
+
+    def test_top_k_one_still_rejects_divergent_choices(self):
+        ref = self._result([1, 5], [[1], [5, 6]])
+        got = self._result([1, 6], [[1], [6, 5]])
+        assert not compare_results([ref], [got], max_tokens=2, top_k=1)
+
+    @pytest.mark.parametrize("outputs", [[], [{}]])
+    def test_missing_pairs_cannot_pass(self, outputs):
+        with pytest.raises(ValueError, match="nonempty"):
+            parity_report([], outputs, max_tokens=2, top_k=5)
+
+    def test_different_input_ids_cannot_pass(self):
+        ref = {**self._result([1], []), "input_ids": [10]}
+        got = {**ref, "input_ids": [20]}
+        with pytest.raises(ValueError, match="different token IDs"):
+            parity_report([ref], [got], max_tokens=1)
+
+    def test_missing_divergence_logprobs_cannot_pass(self):
+        ref = self._result([1, 5], [[1], [5, 6]])
+        got = self._result([1, 6], [])
+        with pytest.raises(ValueError, match="Missing logprobs"):
+            parity_report([ref], [got], max_tokens=2, top_k=2)
 
     def test_http_logprobs_exclude_sampled_token_outside_top_k(self):
         choice = {

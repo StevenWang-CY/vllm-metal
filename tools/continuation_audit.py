@@ -28,8 +28,10 @@ def token_ids(values, *, name: str) -> list[int]:
     return [int(value) for value in values]
 
 
-def score_token(scores: np.ndarray, token: int) -> dict:
+def score_token(scores: np.ndarray, token: int, *, top_k: int = 5) -> dict:
     """Describe a token under one finite vocabulary row, with stable ties."""
+    if top_k < 1:
+        raise ValueError("top-k must be positive")
     scores = np.asarray(scores)
     token = token_ids([token], name="emitted token")[0]
     if (
@@ -43,7 +45,7 @@ def score_token(scores: np.ndarray, token: int) -> dict:
         raise ValueError(f"Token {token} is outside vocabulary size {scores.size}")
     best = int(np.argmax(scores))
     selected = float(scores[token])
-    indices = np.argsort(-scores, kind="stable")[:5]
+    indices = np.argsort(-scores, kind="stable")[:top_k]
     # Decide using the input scores. Normalizing low-magnitude logits in FP32
     # can turn distinct values into a tie; logprobs are only for the report.
     shifted = scores.astype(np.float64) - float(scores[best])

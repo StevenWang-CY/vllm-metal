@@ -255,7 +255,8 @@ def test_replay_rejects_broken_generation_and_closes_stream(monkeypatch, problem
 def test_cli_requires_both_audits_and_preserves_the_report(
     monkeypatch, tmp_path, audit_passed, legacy_passed, hub_models
 ):
-    import tools.dflash_serving_parity as tool
+    import tools.speculative_parity as tool
+    from tools import check_parity as cli
 
     target, draft = tmp_path / "target", tmp_path / "draft"
     target.mkdir()
@@ -274,7 +275,7 @@ def test_cli_requires_both_audits_and_preserves_the_report(
             "parity",
             "--method",
             "dspark",
-            "--target",
+            "--model",
             "test/target" if hub_models else str(target),
             "--draft",
             "test/draft" if hub_models else str(draft),
@@ -305,25 +306,74 @@ def test_cli_requires_both_audits_and_preserves_the_report(
         assert kwargs["check"]
         assert kwargs["timeout"] == (3000 if worker == "replay" else 600)
         if worker == "native":
-            (output / "native.json").write_text("[]")
+            (output / "native.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "prompt": "test",
+                            "input_ids": [0],
+                            "tokens": [1] * 10,
+                            "text": "test",
+                            "top_logprobs": [
+                                [
+                                    {
+                                        "id": token,
+                                        "text": "",
+                                        "rank": rank,
+                                        "logprob": -rank,
+                                    }
+                                    for rank, token in enumerate([1, 2], 1)
+                                ]
+                            ]
+                            * 10,
+                        }
+                    ]
+                )
+            )
         elif worker == "replay":
             (output / "continuation-audit.json").write_text(json.dumps(report))
         else:
             for batch in (1, 2):
                 (output / f"{worker}-b{batch}.json").write_text(
-                    json.dumps({"stats": {}, "outputs": []})
+                    json.dumps(
+                        {
+                            "stats": {},
+                            "outputs": [
+                                {
+                                    "input_ids": [0],
+                                    "tokens": [1] * 10
+                                    if worker == "target"
+                                    else [2 if legacy_passed else 9] + [1] * 9,
+                                    "text": "test",
+                                    "top_logprobs": [
+                                        [
+                                            {
+                                                "id": token,
+                                                "text": "",
+                                                "rank": rank,
+                                                "logprob": -rank,
+                                            }
+                                            for rank, token in enumerate(
+                                                [2, 1] if legacy_passed else [9, 8], 1
+                                            )
+                                        ]
+                                    ]
+                                    * 10,
+                                }
+                            ],
+                        }
+                    )
                 )
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(tool.subprocess, "run", run)
-    # A legacy TOP_K_MATCH success must not override the strict audit result.
-    monkeypatch.setattr(tool, "compare_results", lambda *a, **kw: legacy_passed)
-    if audit_passed and legacy_passed:
-        tool.main()
-    else:
-        with pytest.raises(SystemExit) as caught:
-            tool.main()
-        assert caught.value.code == 1
+    # A TOP_K_MATCH success must not override the strict audit result.
+    with pytest.raises(SystemExit) as caught:
+        cli.main()
+    assert caught.value.code == (0 if audit_passed and legacy_passed else 1)
+    summary = json.loads((output / "summary.json").read_text())
+    assert summary["passed"] == (audit_passed and legacy_passed)
+    assert summary["continuation_audit_passed"] == audit_passed
     assert json.loads((output / "continuation-audit.json").read_text()) == report
     assert [command[-1] for command in commands] == [
         "native",
@@ -332,7 +382,7 @@ def test_cli_requires_both_audits_and_preserves_the_report(
         "replay",
     ]
     assert all(
-        command[-6:-2] == ["--target", str(target), "--draft", str(draft)]
+        command[-8:-4] == ["--model", str(target), "--draft", str(draft)]
         for command in commands
     )
     assert resolved == (["test/target", "test/draft"] if hub_models else [])
@@ -344,20 +394,20 @@ def test_cli_requires_both_audits_and_preserves_the_report(
 def test_cli_rejects_duplicate_batch_sizes_before_starting_workers(
     monkeypatch, tmp_path
 ):
-    import tools.dflash_serving_parity as tool
+    from tools import check_parity as cli
 
     monkeypatch.setattr(
         "sys.argv",
         ["parity", "--batch-size", "1", "1", "--output-dir", str(tmp_path / "results")],
     )
     with pytest.raises(SystemExit) as caught:
-        tool.main()
+        cli.main()
     assert caught.value.code == 2
     assert not (tmp_path / "results").exists()
 
 
 def test_cli_rejects_q4_for_other_drafting_methods(monkeypatch, tmp_path):
-    import tools.dflash_serving_parity as tool
+    from tools import check_parity as cli
 
     monkeypatch.setattr(
         "sys.argv",
@@ -372,7 +422,7 @@ def test_cli_rejects_q4_for_other_drafting_methods(monkeypatch, tmp_path):
         ],
     )
     with pytest.raises(SystemExit) as caught:
-        tool.main()
+        cli.main()
     assert caught.value.code == 2
     assert not (tmp_path / "results").exists()
 
@@ -381,7 +431,7 @@ def test_cli_rejects_q4_for_other_drafting_methods(monkeypatch, tmp_path):
 def test_q4_parity_option_only_applies_to_draft_worker(monkeypatch, tmp_path, worker):
     import vllm
 
-    import tools.dflash_serving_parity as tool
+    import tools.speculative_parity as tool
 
     (tmp_path / "native.json").write_text("[]")
     args = SimpleNamespace(
@@ -395,6 +445,7 @@ def test_q4_parity_option_only_applies_to_draft_worker(monkeypatch, tmp_path, wo
         dspark_draft_quantization="q4",
         batch_size=[1, 4],
         output_dir=tmp_path,
+        gpu_memory_utilization=0.25,
     )
 
     class ConfigCapturedError(Exception):
@@ -411,3 +462,94 @@ def test_q4_parity_option_only_applies_to_draft_worker(monkeypatch, tmp_path, wo
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "1")
     with pytest.raises(ConfigCapturedError):
         tool.run_engine(args)
+
+
+def test_duplicate_prompts_keep_their_own_internal_verification_rows(
+    monkeypatch, tmp_path
+):
+    import mlx.core as mx
+    import vllm
+
+    from tools.speculative_parity import run_engine
+
+    refs = [{"input_ids": [8]}] * 2
+    (tmp_path / "native.json").write_text(json.dumps(refs))
+    # Scheduler order differs from the public request order, and prompts repeat.
+    internal_ids = ["core-second", "core-first"]
+    state = SimpleNamespace(
+        scheduler_output=SimpleNamespace(
+            scheduled_new_reqs=[
+                SimpleNamespace(req_id=key, prompt_token_ids=[8])
+                for key in internal_ids
+            ]
+        ),
+        decode_reqs=[],
+        decode_segments=[],
+        prefill_reqs=[
+            SimpleNamespace(req_id=key, token_ids=[8]) for key in internal_ids
+        ],
+        batch=SimpleNamespace(
+            paged_prefill_entries=[SimpleNamespace(result_mode="final")] * 2
+        ),
+        logits_cu_seqlens=[0, 1, 2],
+        logits=mx.array([[[0.0, 0.0, 3.0], [0.0, 3.0, 0.0]]]),
+    )
+    runner = SimpleNamespace(
+        _drafter=None,
+        _execute_model_state=state,
+        _sample_paged_batch=lambda: None,
+        _request_states={
+            key: SimpleNamespace(token_ids=[8, token])
+            for key, token in zip(internal_ids, [2, 1], strict=True)
+        },
+    )
+    closed = []
+    engine = SimpleNamespace(
+        model_executor=SimpleNamespace(
+            driver_worker=SimpleNamespace(model_runner=runner)
+        ),
+        output_processor=SimpleNamespace(
+            request_states={
+                "core-first": SimpleNamespace(external_req_id="0"),
+                "core-second": SimpleNamespace(external_req_id="1"),
+            }
+        ),
+        engine_core=SimpleNamespace(shutdown=lambda: closed.append(True)),
+    )
+
+    def generate(prompts, params, use_tqdm):
+        runner._sample_paged_batch()
+        return [
+            SimpleNamespace(
+                request_id=str(i),
+                outputs=[SimpleNamespace(token_ids=[i + 1], text=str(i + 1))],
+            )
+            for i in range(2)
+        ]
+
+    monkeypatch.setattr(
+        vllm,
+        "LLM",
+        lambda **kwargs: SimpleNamespace(llm_engine=engine, generate=generate),
+    )
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "1")
+    run_engine(
+        SimpleNamespace(
+            worker="target",
+            method="dspark",
+            target="target",
+            draft="draft",
+            batch_size=[2],
+            max_tokens=1,
+            top_k=2,
+            output_dir=tmp_path,
+            gpu_memory_utilization=0.25,
+            dspark_draft_topk=None,
+            dspark_draft_quantization=None,
+            audit_continuations=False,
+        )
+    )
+    outputs = json.loads((tmp_path / "target-b2.json").read_text())["outputs"]
+    assert [row["tokens"] for row in outputs] == [[1], [2]]
+    assert [row["top_logprobs"][0][0]["id"] for row in outputs] == [1, 2]
+    assert closed == [True]

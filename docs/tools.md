@@ -19,6 +19,43 @@ The default is the 40 prompts in `tools/parity_prompts.py`, greedy decoding, and
 
 Exit status is 0 when all prompts pass, otherwise nonzero. No saved golden token IDs or regeneration step is needed.
 
+## Speculative decoding
+
+Use the same parity command for DFlash, DSpark, or an ordinary draft model:
+
+```bash
+python -m tools.check_parity \
+  --model /path/to/Qwen3-4B-4bit/snapshot \
+  --method dspark --draft /path/to/dspark_qwen3_4b_block7/snapshot \
+  --num-draft-tokens 7 --dspark-draft-topk 64 --dspark-draft-quantization q4 \
+  --top-k 5 --batch-size 1 4 --max-tokens 32 --output-dir dspark-parity
+```
+
+`--method dflash` and `--method draft_model` select the other draft types.
+Use a trained target/draft pair and its supported width. Speculative checks use
+all 40 shared prompts by default, with the same `--prompt` override as ordinary
+parity. Top-k defaults to 5 for speculative checks; use `--top-k` to change
+the rank bound. Reports compare target-only and speculative serving with native MLX,
+and speculative serving with the same-batch target-only run. `summary.json`
+keeps `EXACT`, `TOP_K_MATCH`, and `FAIL` counts separate for every comparison.
+
+Workers run serially in separate processes. The speculative worker observes the
+actual target verification rows instead of requesting sample logprobs, which
+would disable drafting. This observation changes execution timing, so these
+runs are only correctness checks. Checkpoint paths are resolved once for all
+workers, and a speculative run must exercise draft verification.
+
+Use `--audit-continuations` to additionally replay every emitted prefix through
+native MLX. Any strict greedy mismatch fails this audit, even if the first
+divergence passes top-k comparison. Raw outputs and reports are retained on a
+comparison failure. See [DSpark qualification](dspark.md#full-continuation-audit)
+for the audit's scope.
+
+This replaces `tools.dflash_serving_parity`: use `tools.check_parity --method
+dflash --model ...` instead, retaining the other draft options. The draft-forward
+and paged-cache diagnostics remain separate because they test different contracts.
+Measure speed separately with the [serving benchmark](dspark.md#measure-http-serving-and-memory).
+
 ## Scheduled and requested CI
 
 Parity runs daily at 07:17 UTC on `main`. Users with repository write access can also comment `/ci parity` on an open PR once the workflow is on the default branch.

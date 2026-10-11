@@ -107,8 +107,8 @@ Run the real-checkpoint lifecycle test with:
 pytest -m slow tests/test_block_draft_serving_e2e.py
 pytest -m slow tests/test_block_draft_schedule_e2e.py
 pytest -m slow tests/test_block_draft_prefix_caching_e2e.py -k dflash
-python -m tools.dflash_serving_parity --output-dir /path/to/new-parity-results
-python -m tools.dflash_serving_parity --batch-size 1 2 4 \
+python -m tools.check_parity --method dflash --model mlx-community/Qwen3-4B-4bit --max-tokens 32 --output-dir /path/to/new-parity-results
+python -m tools.check_parity --method dflash --model mlx-community/Qwen3-4B-4bit --max-tokens 32 --batch-size 1 2 4 \
     --draft-schedule '[[1,1,3],[2,2,1],[3,4,0]]' \
     --output-dir /path/to/new-scheduled-parity-results
 ```

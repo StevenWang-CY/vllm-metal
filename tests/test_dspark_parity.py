@@ -64,7 +64,7 @@ def test_reference_device_tensors_compare_and_report_mismatches(device):
 @pytest.mark.parametrize(
     "module",
     [
-        "tools.dflash_serving_parity",
+        "tools.speculative_parity",
         "tools.dspark_parity",
         "tools.dspark_paged_parity",
     ],
