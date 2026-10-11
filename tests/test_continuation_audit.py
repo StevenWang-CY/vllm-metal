@@ -398,7 +398,16 @@ def test_cli_rejects_duplicate_batch_sizes_before_starting_workers(
 
     monkeypatch.setattr(
         "sys.argv",
-        ["parity", "--batch-size", "1", "1", "--output-dir", str(tmp_path / "results")],
+        [
+            "parity",
+            "--model",
+            "test/target",
+            "--batch-size",
+            "1",
+            "1",
+            "--output-dir",
+            str(tmp_path / "results"),
+        ],
     )
     with pytest.raises(SystemExit) as caught:
         cli.main()
@@ -413,6 +422,8 @@ def test_cli_rejects_q4_for_other_drafting_methods(monkeypatch, tmp_path):
         "sys.argv",
         [
             "parity",
+            "--model",
+            "test/target",
             "--method",
             "dflash",
             "--dspark-draft-quantization",
