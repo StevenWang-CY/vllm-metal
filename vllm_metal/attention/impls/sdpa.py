@@ -989,6 +989,27 @@ def sdpa_forward(
             if ctx.gqa_length_plan is None:
                 ctx.gqa_length_plan = ops.gqa_decode_length_plan(ctx.context_lens)
             paged_kwargs["gqa_length_plan"] = ctx.gqa_length_plan
+        elif (
+            capabilities["gqa_verify_window"]
+            and not ctx.gqa_disabled
+            and ctx.verify_window_q > 1
+            and ctx.num_decode_requests == len(ctx.context_lens)
+            and ctx.num_decode_tokens == q_3d.shape[0]
+        ):
+            if ctx.gqa_length_plan is None:
+                # Count each row's causal prefix, not the final window length.
+                lengths = [
+                    row_length
+                    for length, start, end in zip(
+                        ctx.context_lens,
+                        ctx.cu_seqlens[:-1],
+                        ctx.cu_seqlens[1:],
+                        strict=True,
+                    )
+                    for row_length in range(length - (end - start) + 1, length + 1)
+                ]
+                ctx.gqa_length_plan = ops.gqa_decode_length_plan(lengths)
+            paged_kwargs["gqa_length_plan"] = ctx.gqa_length_plan
         ops.paged_attention_primitive(
             q_3d,
             kernel_k_cache,

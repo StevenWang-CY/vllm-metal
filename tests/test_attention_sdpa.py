@@ -683,6 +683,7 @@ class _PagedRoutingOpsSpy:
             "decode_routing_metadata": True,
             "gqa_batch_context_lens": True,
             "gqa_length_plan": True,
+            "gqa_verify_window": True,
         }
 
     def gqa_decode_length_plan(self, lengths):
@@ -954,6 +955,45 @@ class TestSDPAForward:
                 sdpa_forward(inner, x, next_ctx, cache, layer_idx=0)
                 assert spy.length_plans == [(2, 4), (5, 3)]
                 assert spy.calls[-1].gqa_length_plan is not plan
+
+    @pytest.mark.parametrize("disabled", [False, True])
+    @pytest.mark.parametrize("supported", [False, True])
+    def test_merged_verify_plans_each_causal_row_once(
+        self, monkeypatch, disabled, supported
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_DISABLE_GQA_DECODE", str(int(disabled)))
+        prepare_grouped(
+            [([[0]], 1, 3), ([[1]], 3, 1)], [], (8,), merge_verify_windows=True
+        )
+        ctx = get_context()
+        assert ctx is not None
+        spy = _PagedRoutingOpsSpy()
+        capabilities = spy.paged_attention_capabilities()
+        capabilities["gqa_verify_window"] = supported
+        monkeypatch.setattr(spy, "paged_attention_capabilities", lambda: capabilities)
+        inner = _make_inner()
+        inner.o_proj = lambda out: out
+        cache = MetalPagedKVCache(
+            num_layers=1,
+            num_kv_heads=_N_KV_HEADS,
+            head_dim=_HEAD_DIM,
+            num_blocks=2,
+            block_size=8,
+            dtype=mx.float16,
+        )
+        x = mx.ones((1, 4, _HIDDEN), mx.float16)
+        zeros = mx.zeros((1, 4, _N_HEADS * _HEAD_DIM), mx.float16)
+        with (
+            patch.object(sdpa_mod, "get_ops", return_value=spy),
+            patch.object(sdpa_mod, "truncate_padded_output", return_value=zeros),
+        ):
+            for _ in range(3):
+                sdpa_forward(inner, x, ctx, cache, layer_idx=0)
+        expected = [(2, 3, 4, 4)] if supported and not disabled else []
+        assert spy.length_plans == expected
+        assert spy.calls[-1].gqa_length_plan == (expected[0] if expected else None)
+        assert spy.calls[-1].num_decode_requests == 2
+        assert spy.calls[-1].num_decode_tokens == 4
 
     def test_mixed_batch_routes_slots_and_page_tables_by_layer_group(self) -> None:
         """Full and sliding layers consume their scheduler-group metadata."""

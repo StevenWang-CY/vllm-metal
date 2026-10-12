@@ -2074,7 +2074,7 @@ inline uint32_t gqa_broadcast_page_id(device const uint32_t *bt, int page,
 }
 
 // ---------------------------------------------------------------------------
-// GQA-shared flash-decode pass for pure-decode batches.
+// GQA-shared flash-decode pass for ordinary decode and causal verification.
 //
 // One threadgroup per (PARTITION_SIZE-token partition, kv head, sequence);
 // each simdgroup owns one query head of the GQA group. Co-locating these
@@ -2094,10 +2094,11 @@ inline uint32_t gqa_broadcast_page_id(device const uint32_t *bt, int page,
 // Partials are written in the exact contract paged_attention_v2_reduce
 // consumes: log2-space running (max, exp-sum) stats plus the
 // epsilon-normalised partial at tmp_out[token, head, partition, :], so the
-// existing reduce pass merges them unchanged.  Engaged only for pure-decode
-// batches without TurboQuant/FP8/sinks/softcap/sliding-window (dispatch gate
-// in paged_ops.cpp); everything else keeps the established paths.
-template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE>
+// existing reduce pass merges them unchanged. Verification resolves each
+// row's causal prefix from the merged request metadata. TurboQuant, FP8,
+// sinks, softcap and sliding windows keep their established paths.
+template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE,
+          bool VERIFY_WINDOW>
 [[kernel]] void paged_attention_gqa_decode(
     device float *exp_sums [[buffer(0)]], device float *max_logits [[buffer(1)]],
     device T *tmp_out [[buffer(2)]], device const T *q [[buffer(3)]],
@@ -2110,6 +2111,8 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE>
     const constant int &q_stride [[buffer(15)]],
     const constant int &kv_block_stride [[buffer(16)]],
     const constant int &kv_head_stride [[buffer(17)]],
+    device const int *cu_seqlens_q [[buffer(18)]],
+    const constant int &num_seqs [[buffer(19)]],
     uint3 tg_pos [[threadgroup_position_in_grid]],
     uint3 tg_per_grid [[threadgroups_per_grid]],
     uint3 tptg [[threads_per_threadgroup]],
@@ -2121,8 +2124,13 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE>
   constexpr int SLICE = HEAD_SIZE / 32;  // elements per lane
   const int partition_idx = tg_pos.x;
   const int kv_head_idx = tg_pos.y;
-  const int seq_idx = tg_pos.z;
-  const int context_len = static_cast<int>(context_lens[seq_idx]);
+  const int token_idx = tg_pos.z;
+  const int seq_idx = VERIFY_WINDOW
+      ? find_seq_idx(cu_seqlens_q, token_idx, num_seqs) : token_idx;
+  // Each verification row sees only its causal prefix, including itself.
+  // Reuse ordinary GQA's arithmetic without expanding the shared page tables.
+  const int context_len = static_cast<int>(context_lens[seq_idx]) -
+      (VERIFY_WINDOW ? cu_seqlens_q[seq_idx + 1] - token_idx - 1 : 0);
   const int t0 = partition_idx * PARTITION_SIZE;
   if (t0 >= context_len) {
     // The reduce reads only ceil(context_len / PARTITION_SIZE) partitions,
@@ -2141,7 +2149,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE>
 
   // Lane-strided query slice, loaded once.
   device const T *q_ptr =
-      q + seq_idx * q_stride + head_idx * HEAD_SIZE + lane * SLICE;
+      q + token_idx * q_stride + head_idx * HEAD_SIZE + lane * SLICE;
   float qv[SLICE];
 #pragma unroll
   for (int i = 0; i < SLICE; i++) {
@@ -2245,7 +2253,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE>
   }
 
   const int64_t pidx =
-      (static_cast<int64_t>(seq_idx) * num_heads + head_idx) *
+      (static_cast<int64_t>(token_idx) * num_heads + head_idx) *
           max_num_partitions +
       partition_idx;
   if (lane == 0) {
@@ -2462,11 +2470,11 @@ instantiate_paged_attention_v2(half, char, uchar, 32);
 // Compile only the dispatch domain: head128/256 with block16, plus the
 // head256 block32 view used by the 16q/2kv hybrid geometry, in FP16/BF16.
 #define instantiate_gqa_decode_inner(type, head_size, block_size,            \
-                                     partition_size)                         \
-  template [[host_name("paged_attention_gqa_decode_" #type "_hs" #head_size  \
+                                     partition_size, windowed, kind)         \
+  template [[host_name("paged_attention_gqa_" #kind "_" #type "_hs" #head_size \
                        "_bs" #block_size "_ps" #partition_size)]]            \
   [[kernel]] void paged_attention_gqa_decode<type, head_size, block_size,    \
-                                             partition_size>(                \
+                                             partition_size, windowed>(      \
       device float *exp_sums [[buffer(0)]],                                  \
       device float *max_logits [[buffer(1)]], device type *tmp_out           \
       [[buffer(2)]],                                                         \
@@ -2481,6 +2489,8 @@ instantiate_paged_attention_v2(half, char, uchar, 32);
       const constant int &q_stride [[buffer(15)]],                           \
       const constant int &kv_block_stride [[buffer(16)]],                    \
       const constant int &kv_head_stride [[buffer(17)]],                     \
+      device const int *cu_seqlens_q [[buffer(18)]],                         \
+      const constant int &num_seqs [[buffer(19)]],                           \
       uint3 tg_pos [[threadgroup_position_in_grid]],                         \
       uint3 tg_per_grid [[threadgroups_per_grid]],                           \
       uint3 tptg [[threads_per_threadgroup]],                                \
@@ -2488,9 +2498,15 @@ instantiate_paged_attention_v2(half, char, uchar, 32);
       uint lane [[thread_index_in_simdgroup]]);
 
 #define instantiate_gqa_decode(type, partition_size)                         \
-  instantiate_gqa_decode_inner(type, 128, 16, partition_size);               \
-  instantiate_gqa_decode_inner(type, 256, 16, partition_size);               \
-  instantiate_gqa_decode_inner(type, 256, 32, partition_size);
+  instantiate_gqa_decode_inner(type, 128, 16, partition_size, false, decode); \
+  instantiate_gqa_decode_inner(type, 256, 16, partition_size, false, decode); \
+  instantiate_gqa_decode_inner(type, 256, 32, partition_size, false, decode);
+
+// Verification initially covers the qualified Qwen3 32q/8kv, head128 layout.
+instantiate_gqa_decode_inner(bfloat16_t, 128, 16, 256, true, verify);
+instantiate_gqa_decode_inner(bfloat16_t, 128, 16, 512, true, verify);
+instantiate_gqa_decode_inner(half, 128, 16, 256, true, verify);
+instantiate_gqa_decode_inner(half, 128, 16, 512, true, verify);
 
 instantiate_gqa_decode(bfloat16_t, VLLM_METAL_PARTITION_SIZE);
 instantiate_gqa_decode(half, VLLM_METAL_PARTITION_SIZE);

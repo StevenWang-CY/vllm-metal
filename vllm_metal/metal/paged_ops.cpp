@@ -48,7 +48,7 @@ constexpr int kPartitionSize = VLLM_METAL_PARTITION_SIZE;
 
 // Process-wide diagnostic for tests; not a per-request trace or routing input.
 enum class PagedDispatch {
-  None, GqaDecode, PerToken, SplitKv, Window, WindowSplitKv, NaxPrefill,
+  None, GqaDecode, GqaVerify, PerToken, SplitKv, Window, WindowSplitKv, NaxPrefill,
   TiledPrefill, MixedPrefillDecode, Count
 };
 static std::atomic<PagedDispatch> g_last_dispatch{PagedDispatch::None};
@@ -218,8 +218,10 @@ constexpr int kM3GqaBlock32MinContext = 8192;
 constexpr size_t kM3GqaReducerMemoryBytes = 32 * 1024;
 
 static std::string gqa_decode_kernel_name(
-    const std::string& dtype, int head_size, int block_size, int partition_size) {
-  return "paged_attention_gqa_decode_" + dtype + "_hs" + std::to_string(head_size)
+    const std::string& dtype, int head_size, int block_size, int partition_size,
+    bool verify = false) {
+  return std::string(verify ? "paged_attention_gqa_verify_" : "paged_attention_gqa_decode_")
+      + dtype + "_hs" + std::to_string(head_size)
       + "_bs" + std::to_string(block_size) + "_ps" + std::to_string(partition_size);
 }
 
@@ -256,7 +258,8 @@ static bool gqa_scratch_fits(
 }
 
 // Compact CPU statistics shared by every attention layer of one forward.
-// No arrays, device reads or geometry-dependent policy are captured here.
+// One entry per query row, including each causal row of a merged verification
+// window. No arrays, device reads or geometry-dependent policy are captured.
 struct GqaDecodeLengthPlan {
   int num_requests = 0;
   int max_length = 0;
@@ -970,11 +973,15 @@ static void dispatch_paged_attention_v2_online(
         (num_decode_requests == -1 || num_decode_requests == 1)) ||
        (num_seqs > 1 && num_decode_requests == num_seqs &&
         num_decode_tokens == num_seqs));
+  const bool gqa_verify = window_batch && num_decode_requests == num_seqs
+      && num_decode_tokens == total_q_tokens && decode_only_rows == 0
+      && num_heads == 32 && num_kv_heads == 8 && head_size == 128
+      && block_size == 16 && gqa_length_plan.num_requests == total_q_tokens;
   // Enforce geometry at the actual dispatch boundary, including the private
   // forced-partition entry. That entry bypasses only occupancy selection.
   const bool gqa_supported =
       !gqa_disabled
-      && pure_decode && window_seqlen_q <= 1 && gqa_decode_rows
+      && ((pure_decode && window_seqlen_q <= 1 && gqa_decode_rows) || gqa_verify)
       && (query.dtype() == float16 || query.dtype() == bfloat16)
       && query.dtype() == key_cache.dtype()
       && query.dtype() == value_cache.dtype()
@@ -986,7 +993,7 @@ static void dispatch_paged_attention_v2_online(
       : gqa_test_partition > 0 ? gqa_test_partition
       : gqa_decode_plan_for_lengths(
             num_heads, num_kv_heads, head_size,
-            num_seqs == 1
+            num_seqs == 1 && !gqa_verify
                 ? gqa_decode_length_plan(std::array<int, 1>{max_seq_len})
                 : gqa_length_plan,
             detected_gpu_core_count(), block_size, d.get_architecture(), max_seq_len);
@@ -1010,9 +1017,10 @@ static void dispatch_paged_attention_v2_online(
   if (gqa_decode) {
     const int gqa_num_partitions = static_cast<int>(gqa_partitions);
     const int gqa_group = num_heads / num_kv_heads;
-    record_paged_dispatch(PagedDispatch::GqaDecode, gqa_partition_size, num_seqs);
+    record_paged_dispatch(gqa_verify ? PagedDispatch::GqaVerify : PagedDispatch::GqaDecode,
+                          gqa_partition_size, num_seqs);
     const auto gname = gqa_decode_kernel_name(
-        dt, head_size, block_size, gqa_partition_size);
+        dt, head_size, block_size, gqa_partition_size, gqa_verify);
     // Instantiated in pagedattention.metal and shipped in the v2 metallib.
     // A missing specialization is a build/packaging bug: fail loudly
     // rather than silently drop eligible long decode back to the slower
@@ -1042,10 +1050,13 @@ static void dispatch_paged_attention_v2_online(
     int32_t g_max_blocks = static_cast<int32_t>(block_tables.shape(1));
     enc.set_bytes(g_max_blocks, 13);
     bind_paged_attn_strides(enc, query, key_cache, block_size);
-    // One threadgroup per (partition, kv head, sequence); each simdgroup
-    // owns one query head of the GQA group.
+    enc.set_input_array(cu_seqlens_q, 18);
+    int32_t g_num_seqs = static_cast<int32_t>(num_seqs);
+    enc.set_bytes(g_num_seqs, 19);
+    // Each group owns one query row. Verification resolves its shared page
+    // table and causal prefix in the producer; ordinary decode keeps its layout.
     enc.dispatch_threadgroups(
-        MTL::Size::Make(gqa_num_partitions, num_kv_heads, num_seqs),
+        MTL::Size::Make(gqa_num_partitions, num_kv_heads, total_q_tokens),
         MTL::Size::Make(32 * gqa_group, 1, 1));
 
     dispatch_paged_attention_v2_reduce(
@@ -1325,12 +1336,13 @@ static array paged_attention_primitive_fn(
   if ((gqa_length_plan || !gqa_context_lens.empty()) &&
       (query.ndim() != 3 || seq_lens.ndim() != 1 || cu_seqlens_q.ndim() != 1 ||
        lengths.num_requests == 0 || lengths.num_requests != query.shape(0) ||
-       lengths.num_requests != seq_lens.shape(0) ||
-       lengths.num_requests + 1 != cu_seqlens_q.shape(0) ||
+       seq_lens.shape(0) + 1 != cu_seqlens_q.shape(0) ||
+       seq_lens.shape(0) > query.shape(0) ||
+       (window_seqlen_q <= 1 && lengths.num_requests != seq_lens.shape(0)) ||
        lengths.max_length > max_seq_len)) {
     throw std::invalid_argument(
         "gqa_context_lens or gqa_length_plan requires one positive length per "
-        "decode row, bounded by max_seq_len");
+        "query row, bounded by max_seq_len");
   }
   if (sinks != nullptr) {
     // Upstream MLX refuses the same combination
@@ -2380,6 +2392,12 @@ NB_MODULE(_paged_ops, m) {
                 const auto name = gqa_decode_kernel_name(
                     dtype, layout.head_size, layout.block_size, part);
                 if (d.get_kernel(name, lib, name, {}) == nullptr) return false;
+                if (layout.head_size == 128 && layout.block_size == 16) {
+                  const auto verify_name = gqa_decode_kernel_name(
+                      dtype, layout.head_size, layout.block_size, part, true);
+                  if (d.get_kernel(verify_name, lib, verify_name, {}) == nullptr)
+                    return false;
+                }
               }
             }
           }
@@ -2397,6 +2415,7 @@ NB_MODULE(_paged_ops, m) {
     caps["decode_routing_metadata"] = true;
     caps["gqa_batch_context_lens"] = true;
     caps["gqa_length_plan"] = true;
+    caps["gqa_verify_window"] = true;
     return caps;
   }, "Capabilities of the public paged attention interface. Private test "
      "kernels do not imply an enabled production route.");
@@ -2740,7 +2759,7 @@ NB_MODULE(_paged_ops, m) {
       "last_paged_dispatch",
       []() {
         static constexpr const char* names[] = {
-            "", "gqa_decode", "per_token_ps0", "per_token_ps512", "window_ps0",
+            "", "gqa_decode", "gqa_verify", "per_token_ps0", "per_token_ps512", "window_ps0",
             "window_ps512", "nax_prefill", "tiled_prefill", "mixed_prefill_decode"};
         static_assert(std::size(names) == static_cast<size_t>(PagedDispatch::Count),
                       "PagedDispatch and its diagnostic names must stay in sync");
@@ -2748,7 +2767,7 @@ NB_MODULE(_paged_ops, m) {
             g_last_dispatch.load(std::memory_order_relaxed))];
       },
       "Dispatch family chosen by the most recent recorded paged_attention_primitive "
-      "eval (\"gqa_decode\", \"per_token_ps0\", \"per_token_ps512\", "
+      "eval (\"gqa_decode\", \"gqa_verify\", \"per_token_ps0\", \"per_token_ps512\", "
       "\"window_ps0\", \"window_ps512\", \"nax_prefill\", "
       "\"tiled_prefill\", \"mixed_prefill_decode\"). Diagnostic surface for routing tests; empty "
       "when diagnostics are disabled, cleared or before the first recorded eval.");
