@@ -101,6 +101,12 @@ not establish a different supported width. Acceptance depends on the trained
 draft, target precision, prompts, and thinking mode. Measure the intended pair
 with the same inputs and serving settings before making speedup claims.
 
+Production qualification remains incomplete. Fresh speculative and target-only
+greedy outputs can differ, including across batch shapes and prefix-cache states.
+BF16 comparisons with the independent Speculators reference also have failures;
+passing proposal or top-K checks alone does not establish numerical agreement.
+Keep this path experimental while these checks remain unresolved.
+
 ### Limit Markov candidates
 
 Optionally add `"dspark_draft_topk": 64` to the speculative configuration.
