@@ -31,6 +31,7 @@ def make_cache(
     quantized=False,
     context_windows=(),
     causal_blocks=False,
+    max_model_len=64,
 ):
     cfg = DSparkConfig(
         backbone=replace(
@@ -38,7 +39,7 @@ def make_cache(
             hidden_size=64,
             intermediate_size=64 if quantized else 48,
             head_dim=64,
-            max_position_embeddings=64,
+            max_position_embeddings=max_model_len,
             block_size=7,
             target_layer_ids=(0, 2, 3),
         ),
@@ -66,10 +67,11 @@ def make_cache(
         dtype=torch.float16 if dtype == mx.float16 else torch.bfloat16,
     )
     names = ("target", "dspark_layers.0.self_attn", "dspark_layers.1.self_attn")
-    size = 12 * spec.page_size_bytes
+    num_blocks = max(12, 1 + 2 * ((max_model_len + block_size - 1) // block_size))
+    size = num_blocks * spec.page_size_bytes
     storage = KVCacheStorage(
         KVCacheConfig(
-            num_blocks=12,
+            num_blocks=num_blocks,
             kv_cache_groups=[
                 KVCacheGroupSpec(layer_names=list(names), kv_cache_spec=spec)
             ],
@@ -87,7 +89,9 @@ def make_cache(
     storage.tensors["target"].fill_(7)
     for name in names[1:]:
         storage.tensors[name].fill_(float("nan"))
-    return model, DSparkPagedCache(model, storage, names[1:], max_model_len=64)
+    return model, DSparkPagedCache(
+        model, storage, names[1:], max_model_len=max_model_len
+    )
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
@@ -394,6 +398,81 @@ def test_compiled_block_replays_without_retracing_as_context_grows(
             rtol=0.006,
         )
     assert len(traces) == 1
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("width", [1, 7])
+@pytest.mark.parametrize("windows", [(2048, 2048), (8, 2048), (None, 2048)])
+@pytest.mark.parametrize("causal", [False, True])
+def test_window_buckets_preserve_ragged_attention_during_growth_and_reuse(
+    monkeypatch, dtype, width, windows, causal
+):
+    from vllm_metal.v1 import block_draft_paged
+
+    model, cache = make_cache(
+        dtype,
+        context_windows=windows,
+        causal_blocks=causal,
+        max_model_len=2304,
+    )
+    tables = [list(range(1 + row, cache.cache.num_blocks, 2)) for row in range(2)]
+    tables[1].reverse()
+    gathered_rows = []
+    gather = block_draft_paged.gather_kv
+
+    def record_gather(values, slots, *args):
+        gathered_rows.append(slots.size)
+        return gather(values, slots, *args)
+
+    monkeypatch.setattr(block_draft_paged, "gather_kv", record_gather)
+    draft = cache.compile_draft(num_draft_tokens=width)
+    # Cross shape/reduction boundaries, then rewind into reused, poisoned pages.
+    for step, span in enumerate(
+        (24, 256, 257, 512, 513, 1023, 1024, 1025, 2047, 2048, 2049, 2112, 24)
+    ):
+        lengths = (span - width, 17)
+        for name, tensor in cache.storage.tensors.items():
+            if name != "target":
+                tensor.fill_(float("nan"))
+        features = [
+            [mx.random.normal((1, length, 64)).astype(dtype) for _ in range(3)]
+            for length in lengths
+        ]
+        cache.write_context(
+            [mx.concatenate([row[i][0] for row in features]) for i in range(3)],
+            [(table, 0, n) for table, n in zip(tables, lengths, strict=True)],
+        )
+        anchors = mx.array([11, 12])
+        actual = draft(anchors, list(zip(tables, lengths, strict=True)))
+        mx.eval(actual, *cache.storage.buffers)
+        for row, feature in enumerate(features):
+            hidden = _torch_forward(
+                model.backbone,
+                model.block_embeddings(anchors[row : row + 1], width),
+                feature,
+                context_windows=windows,
+                causal_blocks=causal,
+            )
+            expected = model.greedy_proposal(
+                mx.array(hidden).astype(dtype), anchors[row : row + 1]
+            )
+            mx.eval(expected)
+            np.testing.assert_array_equal(
+                np.array(actual[0][row : row + 1]), np.array(expected[0])
+            )
+            tolerance = 0.04 if dtype == mx.bfloat16 else 0.006
+            for observed, wanted in zip(actual[1:], expected[1:], strict=True):
+                np.testing.assert_allclose(
+                    np.array(observed[row : row + 1].astype(mx.float32)),
+                    np.array(wanted.astype(mx.float32)),
+                    atol=tolerance,
+                    rtol=tolerance,
+                )
+        if step == 0:
+            # Short requests must not gather the entire trained 2K window.
+            assert gathered_rows and max(gathered_rows) <= 2 * 256
+        gathered_rows.clear()
+        assert torch.all(cache.storage.tensors["target"] == 7)
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])

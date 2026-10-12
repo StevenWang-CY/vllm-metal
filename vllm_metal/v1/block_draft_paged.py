@@ -159,6 +159,7 @@ class BlockDraftPagedCache:
         ``finish`` receives unnormalized block states and the anchor IDs, so
         each checkpoint keeps its own prediction alignment and normalization.
         Fixed-size block tables and device offsets allow replay as context grows.
+        Sliding layers gather only a bucket covering the longest live window.
         Scatter outputs remain explicit dependencies of the shared storage.
         """
         model = self.model
@@ -166,8 +167,9 @@ class BlockDraftPagedCache:
         if type(width) is not int or not 1 <= width <= cfg.block_size:
             raise ValueError("Block draft width must fit the trained block_size")
         table_width = (self.max_model_len + self.block_size - 1) // self.block_size
+        max_window = max((w or 0 for w in model.context_windows), default=0)
 
-        def forward(anchors, keys, values, tables, offsets, slots, ranges):
+        def forward(anchors, keys, values, tables, offsets, slots, ranges, positions):
             h = embed(anchors)
             model.validate_embeddings(h, 0)
             if h.shape[:2] != (anchors.shape[0], width) or h.dtype != self.cache.dtype:
@@ -221,7 +223,9 @@ class BlockDraftPagedCache:
                         mm_prefix_ranges=ranges if width > 1 else None,
                     )
                 else:
-                    out = self._window_attention(q, k, v, tables, offsets, i, window)
+                    out = self._window_attention(
+                        q, k, v, tables, offsets, i, window, positions
+                    )
                 h = h + attn.o_proj(out.reshape(batch, width, -1))
                 h = h + layer.mlp(layer.post_attention_layernorm(h))
                 updated_keys.append(k)
@@ -251,6 +255,18 @@ class BlockDraftPagedCache:
                 raise ValueError(
                     "Block draft currently requires a native cache block size"
                 )
+            span = 0
+            if max_window:
+                needed = min(max(offsets), max_window) + width
+                boundary = max(1024, 1 << (needed - 1).bit_length())
+                # Power-of-two buckets bound compiled shapes. Avoid padding
+                # across MLX vector SDPA's reduction boundaries at >=1024.
+                span = min(
+                    max(256, 1 << (needed - 1).bit_length()),
+                    boundary - (needed != boundary),
+                    max_window + width,
+                    self.max_model_len,
+                )
             result, keys, values = compiled(
                 anchors,
                 tuple(self.cache.key_caches),
@@ -259,6 +275,7 @@ class BlockDraftPagedCache:
                 mx.array(offsets, dtype=mx.int32),
                 mx.array(slots, dtype=mx.int64),
                 mx.array(ranges, dtype=mx.int32),
+                mx.arange(span, dtype=mx.int32),
             )
             for i, (k, v) in enumerate(zip(keys, values, strict=True)):
                 self.cache.replace_layer_cache(i, k, v)
@@ -266,15 +283,15 @@ class BlockDraftPagedCache:
 
         return draft
 
-    def _window_attention(self, q, k, v, tables, offsets, layer_idx, window):
+    def _window_attention(self, q, k, v, tables, offsets, layer_idx, window, indices):
         """Speculators' prefix window is anchored at the block's first row.
 
         The paged kernel's moving window has different semantics. Gather only
         this bounded span and apply the checkpoint's within-block mask instead.
         """
         batch, width, _, head_dim = q.shape
-        span = min(window + width, self.max_model_len)
-        positions = mx.maximum(offsets - window, 0)[:, None] + mx.arange(span)
+        span = min(window + width, indices.size)
+        positions = mx.maximum(offsets - window, 0)[:, None] + indices[:span]
         valid = positions < (offsets + width)[:, None]
         safe_positions = mx.where(valid, positions, 0)
         blocks = mx.take_along_axis(tables, safe_positions // self.block_size, axis=1)

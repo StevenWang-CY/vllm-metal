@@ -87,8 +87,10 @@ policy: each draft query sees up to 2,048 prefix positions before the anchor and
 the preceding positions in its own block, including itself. The prefix window
 stays anchored at the block start. Full-attention layers remain bidirectional;
 `sliding_window_non_causal=true` also permits future positions within sliding
-layers' blocks. Bounded KV gathers reuse scheduler-owned storage without changing
-page ownership, prefix reuse, or eviction.
+layers' blocks. KV gathers cover the longest live window in the batch, rounded
+to bounded reusable shapes, so short requests avoid reading the full trained
+window. They reuse scheduler-owned storage without changing page ownership,
+prefix reuse, or eviction.
 
 This path requires a full vocabulary, vanilla Markov head, interior target
 hidden-state taps, and a single floating-point safetensors file containing all
@@ -321,7 +323,9 @@ since matching dimensions alone do not establish training/tokenizer compatibilit
   `DFlashTargetCapture(target, draft.config.backbone)` for the shared HF
   `hidden_states[layer_id + 1]` convention, including final normalization when
   a final-layer tap is configured. Embedding-output taps are not supported.
-- Every block query attends the full committed prefix and the complete block.
+- In the DeepSeek checkpoint, every block query attends the full committed prefix
+  and the complete block. Speculators checkpoints use their configured prefix
+  windows and within-block masks, as described above.
   `DSparkModel.block_hidden` returns normalized states for all K positions.
 - `greedy_proposal` adds the vanilla low-rank Markov correction sequentially:
   the first position uses the anchor; later positions use the actual preceding
@@ -397,11 +401,13 @@ cache block size and precision. Incompatible bindings are rejected before writes
   `(block_ids, committed_length)` rows. It returns IDs, corrected logits, and
   optional raw confidence. It reserves **K slots**, including the anchor, and
   predicts from every slot. DFlash retains its separate K+1-slot contract.
-- Each block query sees its entire committed prefix and the full draft block.
-  K=1 uses ordinary paged decode because its prefix plus anchor is already the
-  complete block. Larger blocks use explicit bidirectional ranges.
+- Full-attention layers expose the entire committed prefix and draft block.
+  K=1 uses ordinary paged decode; larger blocks use explicit bidirectional ranges.
+  Sliding layers gather the live prefix window and apply their configured block
+  mask through SDPA.
 - Fixed-size block tables and device offsets let a compiled block replay as
-  context grows. Cache writes retain dependencies through shared storage.
+  context grows. Sliding-window gather shapes use bounded buckets. Cache writes
+  retain dependencies through shared storage.
   The caller owns committed lengths, page ownership, and invalidation after
   preemption or request reuse; the cache does not track request identities.
 
