@@ -42,7 +42,9 @@ def _block_draft_llm(**overrides):
     )
 
 
-def _serve(mode, baseline_path, verify_window, draft_quantization=None):
+def _serve(
+    mode, baseline_path, verify_window, draft_quantization=None, draft_checkpoint=None
+):
     _spawn_env(verify_window)
     from vllm import SamplingParams
     from vllm.sampling_params import StructuredOutputsParams
@@ -56,6 +58,8 @@ def _serve(mode, baseline_path, verify_window, draft_quantization=None):
             "num_speculative_tokens": DRAFT_WIDTHS[mode],
         }
     )
+    if spec is not None and draft_checkpoint is not None:
+        spec.update(model=draft_checkpoint[0], revision=draft_checkpoint[1])
     llm = _block_draft_llm(
         speculative_config=spec,
         additional_config={"dspark_draft_quantization": draft_quantization}
@@ -332,14 +336,39 @@ def _serve(mode, baseline_path, verify_window, draft_quantization=None):
 
 @pytest.mark.slow
 @pytest.mark.parametrize(
-    "method,draft_quantization", [("dflash", None), ("dspark", None), ("dspark", "q4")]
+    "method,draft_quantization,draft_checkpoint",
+    [
+        ("dflash", None, None),
+        ("dspark", None, None),
+        ("dspark", "q4", None),
+        pytest.param(
+            "dspark",
+            None,
+            (
+                "RedHatAI/Qwen3-4B-speculator.dspark",
+                "bdffaa5f011da5a1a58ad841a1f6ced3e87f2f23",
+            ),
+            id="speculators",
+        ),
+    ],
 )
 @pytest.mark.parametrize("verify_window", [False, True])
 def test_block_draft_serving_parity_and_lifecycle(
-    tmp_path, run_in_spawn_process, verify_window, method, draft_quantization
+    tmp_path,
+    run_in_spawn_process,
+    verify_window,
+    method,
+    draft_quantization,
+    draft_checkpoint,
 ):
     baseline = tmp_path / "target.json"
     run_in_spawn_process(_serve, "target", baseline, verify_window, label="target")
     run_in_spawn_process(
-        _serve, method, baseline, verify_window, draft_quantization, label=method
+        _serve,
+        method,
+        baseline,
+        verify_window,
+        draft_quantization,
+        draft_checkpoint,
+        label=method,
     )

@@ -63,6 +63,42 @@ and any offloading connector from `--kv-transfer-config` when using DSpark.
 The Metal compatibility bridge exempts only `MetalWorker` from the GPU V1
 runner's DSpark prohibition; all other upstream runner checks remain active.
 
+### Speculators checkpoints
+
+Self-contained Qwen3 DSpark checkpoints in the Speculators format are also
+supported. For example, pair `Qwen/Qwen3-4B` with
+[`RedHatAI/Qwen3-4B-speculator.dspark`](https://huggingface.co/RedHatAI/Qwen3-4B-speculator.dspark/tree/bdffaa5f011da5a1a58ad841a1f6ced3e87f2f23):
+
+```bash
+vllm serve Qwen/Qwen3-4B \
+    --revision 1cfa9a7208912126459214e8b04321603b3df60c \
+    --max-model-len 4096 \
+    --no-async-scheduling \
+    --speculative-config '{
+      "method": "dspark",
+      "model": "RedHatAI/Qwen3-4B-speculator.dspark",
+      "revision": "bdffaa5f011da5a1a58ad841a1f6ced3e87f2f23",
+      "num_speculative_tokens": 7
+    }'
+```
+
+The loader preserves this checkpoint's hidden-state tuple indices and attention
+policy: each draft query sees up to 2,048 prefix positions before the anchor and
+the preceding positions in its own block, including itself. The prefix window
+stays anchored at the block start. Full-attention layers remain bidirectional;
+`sliding_window_non_causal=true` also permits future positions within sliding
+layers' blocks. Bounded KV gathers reuse scheduler-owned storage without changing
+page ownership, prefix reuse, or eviction.
+
+This path requires a full vocabulary, vanilla Markov head, interior target
+hidden-state taps, and a single floating-point safetensors file containing all
+draft weights, including embeddings and the output head. Checkpoints that omit
+verifier-owned weights or use other architectures remain unsupported. Use the
+checkpoint's configured block size (seven here); a model-card table alone does
+not establish a different supported width. Acceptance depends on the trained
+draft, target precision, prompts, and thinking mode. Measure the intended pair
+with the same inputs and serving settings before making speedup claims.
+
 ### Limit Markov candidates
 
 Optionally add `"dspark_draft_topk": 64` to the speculative configuration.

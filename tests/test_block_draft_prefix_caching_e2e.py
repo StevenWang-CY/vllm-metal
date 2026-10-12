@@ -23,6 +23,12 @@ CHECKPOINTS = {
         "deepseek-ai/dspark_qwen3_4b_block7",
         "3457dff1417cb84927f6098a5fcb7cee85c934b7",
     ),
+    "dspark-speculators": (
+        "mlx-community/Qwen3-4B-4bit",
+        "4dcb3d101c2a062e5c1d4bb173588c54ea6c4d25",
+        "RedHatAI/Qwen3-4B-speculator.dspark",
+        "bdffaa5f011da5a1a58ad841a1f6ced3e87f2f23",
+    ),
 }
 
 

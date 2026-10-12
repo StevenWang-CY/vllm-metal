@@ -136,8 +136,8 @@ def make_cache(model, max_length, block_size):
 
 def qualify(args):
     raw = json.loads((args.draft / "config.json").read_text())
-    config = DSparkConfig.from_dict(raw)
     target = json.loads((args.target / "config.json").read_text())
+    config = DSparkConfig.from_dict(raw, target_config=target)
     config.backbone.validate_target(target)
     samples = capture_samples(args.target, config.backbone, args.context_lengths)
     draft = load_dspark(args.draft, target_config=target)
