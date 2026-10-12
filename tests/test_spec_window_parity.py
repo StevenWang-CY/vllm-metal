@@ -9,6 +9,10 @@ A K+1-token speculative-verification window can be dispatched two ways through
 - windowed: one K+1-token segment (``window_seqlen_q=K+1``), where a threadgroup
   owns the window's rows and shares each KV read across them.
 
+These calls omit GQA planning and scheduler metadata to exercise the original
+window kernel. The causal GQA route uses a different reduction order and is
+covered in test_gqa_batched_decode.py.
+
 The window gate keys the split-KV partition decision on the split-equivalent
 grid (``num_heads * total_q_tokens``), the same grid the expanded path uses, so
 the two dispatch the same kernel family and are BITWISE identical on any GPU

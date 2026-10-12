@@ -9,6 +9,7 @@ from tests.gqa_test_utils import (
     _assert_close,
     _assert_fallback,
     _dispatch_family,
+    _grouped_paged_reference,
     _primitive,
     _run_primitive,
 )
@@ -652,7 +653,7 @@ def test_precomputed_length_plan_is_immutable_and_validated():
         plan.max_length = 1
     query = mx.zeros((1, 32, 128), mx.float16)
     keys = mx.zeros((1, 16, 8, 128), mx.float16)
-    with pytest.raises(ValueError, match="one positive length per decode row"):
+    with pytest.raises(ValueError, match="one positive length per query row"):
         ops.paged_attention_primitive(
             query,
             keys,
@@ -669,3 +670,130 @@ def test_precomputed_length_plan_is_immutable_and_validated():
             mx.array(0),
             gqa_length_plan=plan,
         )
+
+
+def _verification_case(prefixes, widths, dtype):
+    heads, kv_heads, dim, block = 32, 8, 128, 16
+    lengths = [prefix + width for prefix, width in zip(prefixes, widths, strict=True)]
+    pages = (max(lengths) + block - 1) // block
+    batch = len(widths)
+    mx.random.seed(1107)
+    query = mx.random.normal((sum(widths), heads, dim)).astype(dtype)
+    keys = mx.random.normal((batch * pages, block, kv_heads, dim)).astype(dtype)
+    values = mx.random.normal(keys.shape).astype(dtype)
+    table = np.random.default_rng(808).permutation(batch * pages).reshape(batch, pages)
+    # Ragged rows must not read the page-table padding of a longer request.
+    for row, length in enumerate(lengths):
+        table[row, (length + block - 1) // block :] = -1
+    tables = mx.array(table, dtype=mx.int32)
+    cu = mx.array(np.cumsum([0, *widths]), dtype=mx.int32)
+    seq_lens = mx.array(lengths, dtype=mx.int32)
+    row_lengths = [
+        length
+        for prefix, width in zip(prefixes, widths, strict=True)
+        for length in range(prefix + 1, prefix + width + 1)
+    ]
+    plan = get_ops().gqa_decode_length_plan(row_lengths)
+    mx.eval(query, keys, values, tables, cu, seq_lens)
+
+    def run(q, *, disabled=False, planned=True, metadata=True, sliding=-1):
+        out = mx.array(0)
+        get_ops().paged_attention_primitive(
+            q,
+            keys,
+            values,
+            kv_heads,
+            dim**-0.5,
+            0.0,
+            tables,
+            seq_lens,
+            cu,
+            block,
+            max(lengths),
+            sliding,
+            out,
+            window_seqlen_q=max(widths),
+            gqa_disabled=disabled,
+            num_decode_requests=batch if metadata else -1,
+            num_decode_tokens=sum(widths) if metadata else 0,
+            **({"gqa_length_plan": plan} if planned else {}),
+        )
+        return out
+
+    def expanded(q, partition):
+        out = mx.array(0)
+        get_ops()._gqa_paged_attention_for_test(
+            q,
+            keys,
+            values,
+            dim**-0.5,
+            mx.array(np.repeat(table, widths, axis=0), dtype=mx.int32),
+            mx.array(row_lengths, dtype=mx.int32),
+            block,
+            max(lengths),
+            partition,
+            out,
+        )
+        return out
+
+    def reference(q, sliding=None):
+        return _grouped_paged_reference(
+            query=q,
+            key_cache=keys,
+            value_cache=values,
+            query_lens=widths,
+            kv_lens=lengths,
+            block_tables=table,
+            scale=dim**-0.5,
+            sliding_window=sliding,
+        )
+
+    return query, run, expanded, reference
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize(
+    "prefixes,widths,partition",
+    [
+        ([760] * 4, [8] * 4, 256),
+        ([8192], [8], 512),
+        ([1, 255, 2800], [3, 1, 8], 256),
+        ([511, 4094], [2, 12], 512),
+    ],
+)
+def test_verification_matches_expanded_gqa(dtype, prefixes, widths, partition):
+    query, run, expanded, reference = _verification_case(prefixes, widths, dtype)
+    compiled = mx.compile(run)
+    for q in (query, -query):
+        actual = compiled(q)
+        mx.eval(actual)
+        ops = get_ops()
+        assert ops.last_paged_dispatch() == "gqa_verify"
+        assert ops.last_gqa_partition_size() == partition
+        assert ops.last_gqa_num_requests() == len(widths)
+        expected = expanded(q, partition)
+        mx.eval(expected)
+        np.testing.assert_array_equal(
+            np.array(actual.astype(mx.float32)), np.array(expected.astype(mx.float32))
+        )
+        _assert_close(actual, reference(q), dtype)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [{"disabled": True}, {"planned": False}, {"metadata": False}, {"sliding": 512}],
+)
+def test_verification_preserves_fallbacks(options):
+    query, run, _, reference = _verification_case([760] * 4, [8] * 4, mx.bfloat16)
+    out = run(query, **options)
+    mx.eval(out)
+    assert get_ops().last_paged_dispatch().startswith("window_")
+    _assert_close(out, reference(query, options.get("sliding")), mx.bfloat16)
+
+
+def test_fp32_verification_keeps_existing_kernel():
+    query, run, _, reference = _verification_case([760] * 4, [8] * 4, mx.float32)
+    out = run(query)
+    mx.eval(out)
+    assert get_ops().last_paged_dispatch().startswith("window_")
+    _assert_close(out, reference(query), mx.float32)

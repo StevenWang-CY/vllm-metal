@@ -4,7 +4,8 @@ The default paged attention path selects between 256- and 512-token GQA
 partitions for ordinary single- and multi-request decode in the geometries below.
 Each partition has FP16/BF16 specializations for head dimensions 128/256
 with kernel block16, plus head256 with kernel block32. These form 12 active
-shader specializations.
+ordinary-decode shader specializations. Four additional FP16/BF16
+specializations support causal verification with head128 and block16.
 
 This is a Metal-backend split-KV occupancy heuristic over precompiled
 partitions. It uses a fixed work budget, counts only complete partitions,
@@ -123,16 +124,19 @@ epsilon-normalized `tmp_out` contract as split-KV. The shared
 `paged_attention_v2_reduce` therefore merges GQA partials unchanged:
 the GQA producer does not require a separate reduction algorithm.
 
-Every eligible call additionally requires:
+Ordinary decode additionally requires:
 
 - A pure-decode batch with exactly one query row per request. One request
   retains the existing `num_decode_requests=1` or omitted-count convention.
   Multiple requests require matching `num_decode_requests` and
   `num_decode_tokens`, plus their CPU `gqa_context_lens` metadata.
 - A verification window of at most 1.
+
+Both ordinary decode and the causal verification route below require:
+
 - Matching FP16/BF16 query, key-cache and value-cache types.
 - At most **512 MiB total GQA scratch per attention call**, including all
-  rectangular padding: `B * Q * ceil(max_seq_len / P) * (2 * head_dim + 8)`
+  rectangular padding: `query_rows * Q * ceil(max_seq_len / P) * (2 * head_dim + 8)`
   bytes for the FP16/BF16 partial output and two FP32 statistics. Larger calls
   fall back before allocation. This ceiling covers the measured serving
   windows; it is not a reservation or a bound on total process memory.
@@ -149,6 +153,29 @@ verification rows and unknown core counts, use the
 established attention family. Model context limits, cache capacity and
 primitive resource limits still apply. The 16/4/256 geometry remains
 excluded from default routing.
+
+### Causal verification windows
+
+Merged speculative verification can use GQA for `(32,8,128)` with block16.
+This requires `VLLM_METAL_SPEC_VERIFY_WINDOW=1`, matching scheduler decode
+request/token counts, and the native `gqa_verify_window` capability. Mixed
+prefill/decode and expanded verification keep their existing routes.
+
+Each query row attends to its own causal prefix. For a request ending at
+KV length `L` with `W` query rows, the CPU plan uses lengths
+`L-W+1, ..., L`. It applies the same complete-partition budget and resource
+limits as ordinary GQA. The first attention layer builds this plan once;
+later layers reuse it without GPU readback or expanded page tables.
+The plan’s existing `num_requests` property counts query rows for this route;
+dispatch diagnostics continue to report actual scheduler requests.
+The producer resolves the owning request from cumulative query lengths,
+then runs ordinary GQA's arithmetic on that row's prefix. The existing
+reducer already handles these causal lengths.
+
+The GQA disable switch also disables this route. Missing metadata, unsupported
+geometry or features, and insufficient work retain the existing window
+kernel. GQA and the window kernel use different reduction orders; numerical
+reference agreement does not establish identical model continuations.
 
 ## Disable switch
 
@@ -173,8 +200,8 @@ without it keep their existing batch routing.
 
 Kernel dtype, page layout, query-row shape, feature and resource checks determine
 whether an operation can run. Default admission is a separate measured policy:
-ordinary decode, the listed geometries, the two-tier work budget and the
-scoped M3 partition preference.
+ordinary decode or the scoped causal verification route, the listed
+geometries, the two-tier work budget and the scoped M3 partition preference.
 The C++ boundary enforces both, including for direct primitive callers.
 
 The native planner consumes post-append KV lengths, query/KV head geometry
@@ -233,6 +260,12 @@ single-request and other-device decisions, the reducer allocation limit and
 executed numerical results while lazy batches change membership and partition.
 The Python tests also keep mixed prefill and expanded verification metadata
 out of batch planning.
+`tests/test_gqa_batched_decode.py` also checks merged causal windows against
+independent CPU FP32 attention and bitwise against ordinary GQA evaluated
+on the same expanded causal rows. It covers ragged widths, invalid padding
+pages, both dtypes and partitions, compiled replay, and excluded routes.
+Eligible calls report `gqa_verify`; the recorded request count remains the
+actual scheduler request count, not the number of verification rows.
 
 Default-policy positive route tests need a GPU core count and a sufficient
 partition grid. Hosts whose IORegistry does not report cores inject a
@@ -248,7 +281,7 @@ These tests execute both partitions, both dtypes, every shipped shader
 specialization, tails and upstream shared-page writes/copies even when CI
 cannot report GPU cores. Numerical parity does not establish performance
 eligibility. Feature/dtype/page-size fallback tests remain independent.
-The library-availability check loads all 12 active GQA specializations and
+The library-availability check loads all 16 active GQA specializations and
 their matching reducers even when the reported core count is unavailable.
 Validate the positive path on a capable GPU before reporting GQA coverage.
 
@@ -316,10 +349,9 @@ enablement or performance claims of this two-tier routing policy:
    KV window. This is relevant to Gemma/Mistral-style attention, but their
    geometries and other features such as sinks or soft-capping must also
    satisfy the supported kernel contract.
-5. **Speculative verification:** evaluate sharing KV across both grouped heads
-   and multiple query rows. The existing verification kernel already shares
-   KV across rows; compare against it while preserving causal masks and
-   controlling register pressure. A larger gain is possible, not established.
+5. **Sharing across verification rows:** the causal GQA route shares KV across
+   grouped heads within each row. Evaluate sharing across multiple query rows
+   too, while preserving causal masks and controlling register pressure.
 6. **Cooperative K/V loading:** evaluate shared staging against direct
    loads on each device, accounting for cache reuse, synchronization and
    occupancy. Context length alone does not establish a benefit.

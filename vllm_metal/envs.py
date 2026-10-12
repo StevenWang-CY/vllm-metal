@@ -185,7 +185,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_METAL_DISABLE_NAX": _bool("VLLM_METAL_DISABLE_NAX", False),
     # Emergency override for the GQA-shared flash-decode dispatch gate
     # (issue #713): force long-context decode back to the established
-    # per-token / split-KV kernels. Mainly a benchmarking/A-B escape
+    # per-token / split-KV kernels, and causal verification to its window
+    # kernel. Mainly a benchmarking/A-B escape
     # hatch so controlled comparisons can run under the server topology.
     "VLLM_METAL_DISABLE_GQA_DECODE": _bool("VLLM_METAL_DISABLE_GQA_DECODE", False),
     # TQ materialized prefill: auto enables only when NAX is available;
@@ -197,14 +198,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_METAL_TQ_PREFILL_MAX_MIB": _auto_or_nonnegative_int(
         "VLLM_METAL_TQ_PREFILL_MAX_MIB", unit="MiB"
     ),
-    # Spec-decode verification window mode (issue #465). Off by default —
-    # verify windows keep the expanded per-token layout (main behavior)
-    # unless this opt-in is set. Set to "1" to merge K+1 verify windows
-    # into one segment and share each KV block load across the window
-    # rows. Profitability is chip- and shape-dependent: measured wins at
-    # conc >= 4 with 8k+ context (M2 Ultra / M3 Ultra / M4 Pro, up to
-    # +40% e2e at conc 16-32), measured losses single-stream on M4 Pro
-    # and at conc 32 on M2 Max. Outputs are bitwise identical either way.
+    # Spec-decode verification windows (issue #465), off by default.
+    # Merge K+1 verification rows into one segment per request. Eligible
+    # causal GQA windows use a different reduction order, so this opt-in
+    # does not guarantee bitwise identity with expanded verification.
+    # Profitability remains chip- and shape-dependent; see configuration.md.
     "VLLM_METAL_SPEC_VERIFY_WINDOW": _bool("VLLM_METAL_SPEC_VERIFY_WINDOW", False),
     # Max tokens of cold draft KV ingested per forward (issue #482,
     # direction 3). The first propose of a fresh prefix ingests the whole
