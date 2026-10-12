@@ -60,7 +60,15 @@ def _target_config(config=None):
     }
 
 
-def _torch_forward(model, embeddings, features, *, causal=False):
+def _torch_forward(
+    model,
+    embeddings,
+    features,
+    *,
+    causal=False,
+    context_windows=None,
+    causal_blocks=False,
+):
     """Use explicit QK/softmax/V, half-rotation RoPE, and unfused MLP on CPU."""
     weights = {
         name: torch.from_numpy(np.array(value.astype(mx.float32)))
@@ -134,6 +142,13 @@ def _torch_forward(model, embeddings, features, *, causal=False):
                 torch.arange(length + width)[None]
                 <= (length + torch.arange(width))[:, None]
             )
+            scores = scores.masked_fill(~allowed, -torch.inf)
+        window = None if context_windows is None else context_windows[i]
+        if window is not None:
+            allowed = torch.zeros((width, length + width), dtype=torch.bool)
+            for query in range(width):
+                end = length + (query + 1 if causal_blocks else width)
+                allowed[query, max(0, length - window) : end] = True
             scores = scores.masked_fill(~allowed, -torch.inf)
         attention = (
             (scores.softmax(dim=-1) @ v).transpose(1, 2).reshape(batch, width, -1)

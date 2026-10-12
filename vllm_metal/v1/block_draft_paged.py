@@ -11,6 +11,7 @@ import mlx.core as mx
 from vllm_metal.attention.block_tables import build_block_tables
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.caches.storage import KVCacheStorage
+from vllm_metal.attention.impls.bidi_prefill import gather_kv
 from vllm_metal.metal import get_ops
 from vllm_metal.v1.dflash import DFlashModel
 from vllm_metal.v1.proposer import validate_scheduler_blocks
@@ -197,28 +198,30 @@ class BlockDraftPagedCache:
                     values[i],
                     slots,
                 )
-                out = mx.array(0)
-                # The existing explicit block-range interface is also used by
-                # image attention. Its bounds are inclusive. Every block row
-                # sees the committed prefix and every row in its own block.
-                get_ops().paged_attention_primitive(
-                    q.reshape(-1, cfg.num_attention_heads, cfg.head_dim),
-                    k,
-                    v,
-                    cfg.num_key_value_heads,
-                    attn.scale,
-                    0.0,
-                    tables,
-                    lengths,
-                    boundaries,
-                    self.block_size,
-                    self.max_model_len,
-                    -1,
-                    out,
-                    # A one-position DSpark block has no future block rows;
-                    # normal decode sees exactly the same prefix + anchor.
-                    mm_prefix_ranges=ranges if width > 1 else None,
-                )
+                window = model.context_windows[i]
+                if window is None:
+                    out = mx.array(0)
+                    # Inclusive bounds: every row sees the committed prefix
+                    # and every row in its own block.
+                    get_ops().paged_attention_primitive(
+                        q.reshape(-1, cfg.num_attention_heads, cfg.head_dim),
+                        k,
+                        v,
+                        cfg.num_key_value_heads,
+                        attn.scale,
+                        0.0,
+                        tables,
+                        lengths,
+                        boundaries,
+                        self.block_size,
+                        self.max_model_len,
+                        -1,
+                        out,
+                        # A one-position block has no future block rows.
+                        mm_prefix_ranges=ranges if width > 1 else None,
+                    )
+                else:
+                    out = self._window_attention(q, k, v, tables, offsets, i, window)
                 h = h + attn.o_proj(out.reshape(batch, width, -1))
                 h = h + layer.mlp(layer.post_attention_layernorm(h))
                 updated_keys.append(k)
@@ -262,3 +265,41 @@ class BlockDraftPagedCache:
             return result
 
         return draft
+
+    def _window_attention(self, q, k, v, tables, offsets, layer_idx, window):
+        """Speculators' prefix window is anchored at the block's first row.
+
+        The paged kernel's moving window has different semantics. Gather only
+        this bounded span and apply the checkpoint's within-block mask instead.
+        """
+        batch, width, _, head_dim = q.shape
+        span = min(window + width, self.max_model_len)
+        positions = mx.maximum(offsets - window, 0)[:, None] + mx.arange(span)
+        valid = positions < (offsets + width)[:, None]
+        safe_positions = mx.where(valid, positions, 0)
+        blocks = mx.take_along_axis(tables, safe_positions // self.block_size, axis=1)
+        slots = (blocks * self.block_size + safe_positions % self.block_size).reshape(
+            -1
+        )
+        stride = self.cache.block_stride_for_layer(layer_idx)
+
+        def gather(cache):
+            rows = gather_kv(cache, slots, head_dim, stride).reshape(
+                batch, span, self.model.config.num_key_value_heads, head_dim
+            )
+            # Padding may read an uninitialized page. A mask alone cannot keep
+            # NaNs out of the softmax/value product.
+            return mx.where(valid[:, :, None, None], rows, 0).transpose(0, 2, 1, 3)
+
+        mask = valid[:, None, None, :]
+        if self.model.causal_blocks:
+            queries = offsets[:, None] + mx.arange(width)
+            mask = mask & (positions[:, None, None, :] <= queries[:, None, :, None])
+        out = mx.fast.scaled_dot_product_attention(
+            q.transpose(0, 2, 1, 3),
+            gather(k),
+            gather(v),
+            scale=head_dim**-0.5,
+            mask=mask,
+        )
+        return out.transpose(0, 2, 1, 3)

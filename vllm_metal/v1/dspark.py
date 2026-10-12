@@ -24,7 +24,7 @@
 Adapted from deepseek-ai/DeepSpec (deepspec/modeling/dspark/qwen3/modeling.py,
 markov_head.py, and common.py) at 005e03b81cec38b7da6399833d609ee89a2587f2.
 The upstream MIT copyright and permission notice are retained above.
-The full-context Qwen3 backbone is shared with DFlash. DSpark owns its embedding
+The Qwen3 backbone is shared with DFlash. DSpark owns its embedding
 and output head and predicts from slot zero, with sequential Markov corrections.
 """
 
@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from numbers import Integral
 from pathlib import Path
 from typing import Any
@@ -48,6 +48,16 @@ from vllm_metal.config import (
 from vllm_metal.v1.dflash import DFlashConfig, DFlashModel
 from vllm_metal.v1.draft_checkpoint import COMMON_DRAFT_OPTIONS, load_draft_weights
 
+_DSPARK_OPTIONS = {
+    **COMMON_DRAFT_OPTIONS,
+    "partial_rotary_factor": 1.0,
+    "tie_word_embeddings": False,
+    "dflash_query_causal": False,
+    "sample_from_anchor": True,
+    "log_snr_conditioning": False,
+    "enable_qwen35_gated_q_proj": False,
+}
+
 
 @dataclass(frozen=True)
 class DSparkConfig:
@@ -55,6 +65,8 @@ class DSparkConfig:
     markov_rank: int
     enable_confidence_head: bool
     confidence_head_with_markov: bool
+    context_windows: tuple[int | None, ...] = ()
+    causal_blocks: bool = False
 
     def __post_init__(self) -> None:
         if type(self.markov_rank) is not int or self.markov_rank <= 0:
@@ -65,9 +77,26 @@ class DSparkConfig:
         taps = self.backbone.target_layer_ids
         if any(a >= b for a, b in zip(taps, taps[1:], strict=False)):
             raise ValueError("DSpark target_layer_ids must be strictly increasing")
+        if type(self.causal_blocks) is not bool:
+            raise ValueError("DSpark causal_blocks must be a boolean")
+        if self.context_windows and (
+            len(self.context_windows) != self.backbone.num_hidden_layers
+            or any(
+                window is not None and (type(window) is not int or window < 1)
+                for window in self.context_windows
+            )
+        ):
+            raise ValueError("DSpark context windows must match the draft layers")
 
     @classmethod
-    def from_dict(cls, raw: Mapping[str, Any]) -> DSparkConfig:
+    def from_dict(
+        cls,
+        raw: Mapping[str, Any],
+        *,
+        target_config: Mapping[str, Any] | None = None,
+    ) -> DSparkConfig:
+        if raw.get("speculators_model_type") == "dspark":
+            return cls._from_speculators(raw, target_config)
         if (
             raw.get("architectures") != ["Qwen3DSparkModel"]
             or raw.get("model_type") != "qwen3"
@@ -75,16 +104,7 @@ class DSparkConfig:
             raise ValueError("Expected a standalone Qwen3DSparkModel checkpoint")
         if raw.get("markov_head_type") != "vanilla":
             raise ValueError("DSpark requires an explicit vanilla markov_head_type")
-        supported = {
-            **COMMON_DRAFT_OPTIONS,
-            "partial_rotary_factor": 1.0,
-            "tie_word_embeddings": False,
-            "dflash_query_causal": False,
-            "sample_from_anchor": True,
-            "log_snr_conditioning": False,
-            "enable_qwen35_gated_q_proj": False,
-        }
-        for name, expected in supported.items():
+        for name, expected in _DSPARK_OPTIONS.items():
             if raw.get(name, expected) != expected:
                 raise ValueError(f"Unsupported DSpark {name}: {raw[name]!r}")
         rope = raw.get("rope_parameters")
@@ -131,6 +151,88 @@ class DSparkConfig:
             raise ValueError("DSpark requires confidence_head_with_markov")
         return config
 
+    @classmethod
+    def _from_speculators(
+        cls, raw: Mapping[str, Any], target: Mapping[str, Any] | None
+    ) -> DSparkConfig:
+        if target is None:
+            raise ValueError("Speculators DSpark requires the target configuration")
+        backbone = raw.get("transformer_layer_config")
+        metadata = raw.get("speculators_config")
+        if (
+            raw.get("architectures") not in (["DSparkDraftModel"], ["DSparkSpeculator"])
+            or not isinstance(backbone, Mapping)
+            or backbone.get("model_type") != "qwen3"
+            or not isinstance(metadata, Mapping)
+            or metadata.get("algorithm") != "dspark"
+        ):
+            raise ValueError("Expected a Qwen3 Speculators DSpark checkpoint")
+        if raw.get("sample_from_anchor") is not True:
+            raise ValueError("Speculators DSpark requires sample_from_anchor=True")
+        if raw.get("draft_vocab_size") != backbone.get("vocab_size"):
+            raise ValueError("Speculators DSpark requires the full target vocabulary")
+        if raw.get("target_hidden_size") not in (None, backbone.get("hidden_size")):
+            raise ValueError("Speculators DSpark requires matching target hidden size")
+        for source in (raw, backbone):
+            for name, expected in _DSPARK_OPTIONS.items():
+                if name not in {"use_sliding_window", "sliding_window"} and (
+                    source.get(name, expected) != expected
+                ):
+                    raise ValueError(f"Unsupported DSpark {name}: {source[name]!r}")
+        layers = backbone.get("layer_types")
+        if (
+            not isinstance(layers, list)
+            or len(layers) != backbone.get("num_hidden_layers")
+            or any(
+                kind not in ("full_attention", "sliding_attention") for kind in layers
+            )
+        ):
+            raise ValueError(
+                "Speculators DSpark requires explicit attention layer types"
+            )
+        sliding = "sliding_attention" in layers
+        window = backbone.get("sliding_window")
+        if sliding and (type(window) is not int or window < 1):
+            raise ValueError("Speculators DSpark requires a positive sliding window")
+        if backbone.get("use_sliding_window", sliding) is not sliding:
+            raise ValueError("Conflicting Speculators DSpark sliding-window settings")
+        non_causal = raw.get("sliding_window_non_causal", False)
+        if type(non_causal) is not bool:
+            raise ValueError("DSpark sliding_window_non_causal must be a boolean")
+        taps = raw.get("aux_hidden_state_layer_ids")
+        count = target.get("num_hidden_layers")
+        if (
+            type(count) is not int
+            or not isinstance(taps, list)
+            or not taps
+            or any(type(i) is not int or not 1 <= i < count for i in taps)
+        ):
+            raise ValueError(
+                "Speculators DSpark requires interior target hidden-state taps"
+            )
+        # Speculators uses hidden-state tuple indices directly, unlike DeepSpec's
+        # decoder indices. Preserve its attention policy separately from geometry.
+        normalized = {
+            **raw,
+            **backbone,
+            "architectures": ["Qwen3DSparkModel"],
+            "speculators_model_type": None,
+            "num_target_layers": count,
+            "target_layer_ids": [i - 1 for i in taps],
+            "use_sliding_window": False,
+            "sliding_window": None,
+            "layer_types": ["full_attention"] * len(layers),
+        }
+        config = cls.from_dict(normalized)
+        config.backbone.validate_target(target)
+        return replace(
+            config,
+            context_windows=tuple(
+                window if kind == "sliding_attention" else None for kind in layers
+            ),
+            causal_blocks=not non_causal,
+        )
+
     def validate_q4_dimensions(self) -> None:
         """Check quantized linear input widths before allocating or loading weights."""
         cfg = self.backbone
@@ -170,7 +272,11 @@ class DSparkModel(nn.Module):
         super().__init__()
         self.config = config
         cfg = config.backbone
-        self.backbone = DFlashModel(cfg)
+        self.backbone = DFlashModel(
+            cfg,
+            context_windows=config.context_windows or None,
+            causal_blocks=config.causal_blocks,
+        )
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
         self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
         self.markov_head = _MarkovHead(cfg.vocab_size, config.markov_rank)
@@ -393,7 +499,9 @@ def load_dspark(
             f"{DSPARK_DRAFT_QUANTIZATION_Q4!r}, got {draft_quantization!r}"
         )
     path = Path(path)
-    config = DSparkConfig.from_dict(json.loads((path / "config.json").read_text()))
+    config = DSparkConfig.from_dict(
+        json.loads((path / "config.json").read_text()), target_config=target_config
+    )
     config.backbone.validate_target(target_config)
     if draft_quantization == DSPARK_DRAFT_QUANTIZATION_Q4:
         config.validate_q4_dimensions()

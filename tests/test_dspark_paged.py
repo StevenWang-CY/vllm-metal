@@ -29,6 +29,8 @@ def make_cache(
     confidence=True,
     with_markov=True,
     quantized=False,
+    context_windows=(),
+    causal_blocks=False,
 ):
     cfg = DSparkConfig(
         backbone=replace(
@@ -43,6 +45,8 @@ def make_cache(
         markov_rank=4,
         enable_confidence_head=confidence,
         confidence_head_with_markov=with_markov,
+        context_windows=context_windows,
+        causal_blocks=causal_blocks,
     )
     model = DSparkModel(cfg)
     # Keep exact-ID assertions well-conditioned across low-precision kernels.
@@ -160,6 +164,8 @@ def _check_ragged_proposals(
     draft_topk=None,
     quantized=False,
     corrected_logits=True,
+    context_windows=(),
+    causal_blocks=False,
 ):
     model, cache = make_cache(
         dtype,
@@ -167,6 +173,8 @@ def _check_ragged_proposals(
         confidence=confidence,
         with_markov=with_markov,
         quantized=quantized,
+        context_windows=context_windows,
+        causal_blocks=causal_blocks,
     )
     if draft_topk is not None and not quantized:
         # Separate candidate scores to avoid an unstable top-k boundary in
@@ -231,6 +239,8 @@ def _check_ragged_proposals(
                 reference_model.backbone,
                 reference_model.block_embeddings(anchor, width),
                 feature,
+                context_windows=context_windows or None,
+                causal_blocks=causal_blocks,
             )
             expected = model.greedy_proposal(
                 mx.array(independent_hidden).astype(dtype),
@@ -254,6 +264,24 @@ def _check_ragged_proposals(
         assert torch.all(cache.storage.tensors["target"] == 7)
         for name in ("dspark_layers.0.self_attn", "dspark_layers.1.self_attn"):
             assert torch.all(torch.isnan(cache.storage.tensors[name][[0, 6, 10, 11]]))
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("width", [1, 7])
+@pytest.mark.parametrize("windows", [(8, 8), (None, 16), (64, 64)])
+@pytest.mark.parametrize("causal_blocks", [False, True])
+def test_speculators_windows_preserve_ragged_context_and_page_reuse(
+    dtype, width, windows, causal_blocks
+):
+    _check_ragged_proposals(
+        dtype,
+        16,
+        width,
+        True,
+        True,
+        context_windows=windows,
+        causal_blocks=causal_blocks,
+    )
 
 
 @pytest.mark.parametrize("draft_topk", [None, 8])
@@ -331,8 +359,11 @@ def test_feature_precision_rejected_before_any_cache_write():
         assert torch.all(torch.isnan(cache.storage.tensors[name]))
 
 
-def test_compiled_block_replays_without_retracing_as_context_grows(monkeypatch):
-    model, cache = make_cache()
+@pytest.mark.parametrize("windows", [(), (8, 8)])
+def test_compiled_block_replays_without_retracing_as_context_grows(
+    monkeypatch, windows
+):
+    model, cache = make_cache(context_windows=windows, causal_blocks=bool(windows))
     original = mx.compile
     traces = []
 
@@ -368,10 +399,20 @@ def test_compiled_block_replays_without_retracing_as_context_grows(monkeypatch):
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 @pytest.mark.parametrize("block_size", [8, 16, 32])
 @pytest.mark.parametrize("width", [1, 7])
+@pytest.mark.parametrize("windows", [(), (8, 8)])
 def test_q4_backbone_preserves_committed_features_and_page_reuse(
-    dtype, block_size, width
+    dtype, block_size, width, windows
 ):
-    _check_ragged_proposals(dtype, block_size, width, True, True, quantized=True)
+    _check_ragged_proposals(
+        dtype,
+        block_size,
+        width,
+        True,
+        True,
+        quantized=True,
+        context_windows=windows,
+        causal_blocks=bool(windows),
+    )
 
 
 @pytest.mark.parametrize("drafter", ["dflash", "dspark"])

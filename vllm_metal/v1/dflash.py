@@ -274,8 +274,8 @@ class _Attention(nn.Module):
             start = context_length.reshape(1)
             keys = mx.slice_update(keys, bk, start, axes=(2,))
             values = mx.slice_update(values, bv, start, axes=(2,))
-        # Every block query sees the entire committed context AND draft block.
-        # This is bidirectional block attention, not the target's causal mask.
+        # The caller supplies any checkpoint-specific prefix/block restrictions;
+        # the default is bidirectional attention over the prefix and draft block.
         output = mx.fast.scaled_dot_product_attention(
             q,
             keys,
@@ -311,11 +311,19 @@ class _DecoderLayer(nn.Module):
 
 
 class DFlashModel(nn.Module):
-    """Full-context block forward, with no persistent KV or borrowed parameters."""
+    """Qwen3 block forward, with no persistent KV or borrowed parameters."""
 
-    def __init__(self, config: DFlashConfig) -> None:
+    def __init__(
+        self,
+        config: DFlashConfig,
+        *,
+        context_windows: tuple[int | None, ...] | None = None,
+        causal_blocks: bool = False,
+    ) -> None:
         super().__init__()
         self.config = config
+        self.context_windows = context_windows or (None,) * config.num_hidden_layers
+        self.causal_blocks = causal_blocks
         self.fc = nn.Linear(
             len(config.target_layer_ids) * config.hidden_size,
             config.hidden_size,
@@ -406,8 +414,23 @@ class DFlashModel(nn.Module):
                 context_length + embeddings.shape[1]
             )
         h = embeddings
-        for layer, context in zip(self.layers, contexts, strict=True):
-            h = layer(h, context, self.rope, context_length, mask)
+        for layer, context, window in zip(
+            self.layers, contexts, self.context_windows, strict=True
+        ):
+            layer_mask = mask
+            if window is not None:
+                # Speculators anchors its prefix window at the block start.
+                # Its sliding layers may also use causal attention inside a block.
+                start = length if context_length is None else context_length
+                keys = mx.arange(length + embeddings.shape[1])
+                prefix = (keys >= start - window) & (keys < start)
+                block = (keys >= start) & (keys < start + embeddings.shape[1])
+                if self.causal_blocks:
+                    block = block & (
+                        keys <= start + mx.arange(embeddings.shape[1])[:, None]
+                    )
+                layer_mask = prefix | block
+            h = layer(h, context, self.rope, context_length, layer_mask)
         # Slice before normalization, as in the reference. Normalization produces
         # contiguous rows for the borrowed head; a strided BF16 slice can select
         # a different quantized projection kernel for batched one-token drafts.
