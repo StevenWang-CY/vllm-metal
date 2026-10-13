@@ -1,0 +1,48 @@
+name: PR 1103 native qualification
+
+on:
+  push:
+    branches: [validation/pr1103-native-39983f2]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 25
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
+      VLLM_METAL_BUILD_FROM_SOURCE: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Build pinned native artifacts
+        run: |
+          set -euo pipefail
+          source scripts/lib.sh
+          setup_dev_env
+          ./install.sh
+          source .venv-vllm-metal/bin/activate
+          python -c 'from vllm_metal import envs; assert not envs.VLLM_METAL_BUILD_FROM_SOURCE; from vllm_metal.metal import get_ops; assert get_ops().paged_attention_capabilities()["gqa_verify_window"]'
+          python -m pytest -q tests/test_gqa_batched_decode.py -k verification
+          git rev-parse HEAD > native-build-commit.txt
+          git diff 39983f210b420b730c76153063f8fb197e10df74 -- vllm_metal tests > native-source-diff.txt
+          test ! -s native-source-diff.txt
+          shasum -a 256 vllm_metal/metal/*.metallib > native-library-checksums.txt
+          xcodebuild -version > native-toolchain.txt
+          python -m pip freeze > native-environment.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pr1103-native-39983f2
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            vllm_metal/metal/*.metallib
+            vllm_metal/metal/*.metallib.sha256
+            native-build-commit.txt
+            native-library-checksums.txt
+            native-toolchain.txt
+            native-environment.txt
