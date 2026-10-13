@@ -1066,7 +1066,7 @@ static void dispatch_paged_attention_v2_online(
 
   int shared_heads = window_batch && num_heads == 32 && num_kv_heads == 8
       && head_size == 128 && block_size == 16 && !use_turboquant
-      && sinks == nullptr && sliding_window < 0 && softcapping == 0.0f
+      && sinks == nullptr && sliding_window < 0 && softcap == 0.0f
       && (query.dtype() == float16 || query.dtype() == bfloat16)
       ? window_test_heads : 1;
   bool use_partitioning  = partition;
