@@ -759,6 +759,8 @@ def _verification_case(prefixes, widths, dtype):
         ([8192], [8], 512),
         ([1, 255, 2800], [3, 1, 8], 256),
         ([511, 4094], [2, 12], 512),
+        ([8192, 8192], [2, 1], 512),  # An idle final row must not read metadata.
+        ([8192, 8192], [3, 2], 512),  # A pair straddles two page tables.
     ],
 )
 def test_verification_matches_expanded_gqa(dtype, prefixes, widths, partition):

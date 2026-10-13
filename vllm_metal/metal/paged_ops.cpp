@@ -1053,11 +1053,13 @@ static void dispatch_paged_attention_v2_online(
     enc.set_input_array(cu_seqlens_q, 18);
     int32_t g_num_seqs = static_cast<int32_t>(num_seqs);
     enc.set_bytes(g_num_seqs, 19);
-    // Each group owns one query row. Verification resolves its shared page
-    // table and causal prefix in the producer; ordinary decode keeps its layout.
+    // Match ROWS in paged_attention_gqa_decode. Each simdgroup still owns
+    // one head of one row, including pairs that cross request boundaries.
+    const int gqa_rows = gqa_verify ? 2 : 1;
     enc.dispatch_threadgroups(
-        MTL::Size::Make(gqa_num_partitions, num_kv_heads, total_q_tokens),
-        MTL::Size::Make(32 * gqa_group, 1, 1));
+        MTL::Size::Make(gqa_num_partitions, num_kv_heads,
+                       (total_q_tokens + gqa_rows - 1) / gqa_rows),
+        MTL::Size::Make(32 * gqa_group * gqa_rows, 1, 1));
 
     dispatch_paged_attention_v2_reduce(
         d, enc, out, g_exp_sums, g_max_logits, g_tmp_out, seq_lens,

@@ -2076,9 +2076,10 @@ inline uint32_t gqa_broadcast_page_id(device const uint32_t *bt, int page,
 // ---------------------------------------------------------------------------
 // GQA-shared flash-decode pass for ordinary decode and causal verification.
 //
-// One threadgroup per (PARTITION_SIZE-token partition, kv head, sequence);
-// each simdgroup owns one query head of the GQA group. Co-locating these
-// heads can improve KV cache locality; each simdgroup issues its own K/V loads.
+// One threadgroup per (PARTITION_SIZE-token partition, kv head, query rows);
+// each simdgroup owns one query head of one row. Verification co-locates two
+// adjacent rows to improve KV locality; ordinary decode keeps one row.
+// Each simdgroup issues its own K/V loads.
 //
 // The producer walks pages, not tokens: PARTITION_SIZE is a multiple of
 // BLOCK_SIZE so the partition start is page-aligned. Lane 0 preloads the
@@ -2122,9 +2123,18 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE,
   static_assert(PARTITION_SIZE % BLOCK_SIZE == 0,
                 "partition start is page-aligned");
   constexpr int SLICE = HEAD_SIZE / 32;  // elements per lane
+  // Keep in sync with the GQA threadgroup dimensions in paged_ops.cpp.
+  constexpr int ROWS = VERIFY_WINDOW ? 2 : 1;
+  const int group = tptg.x / (32 * ROWS);  // query heads per kv head
   const int partition_idx = tg_pos.x;
   const int kv_head_idx = tg_pos.y;
-  const int token_idx = tg_pos.z;
+  const int token_idx = VERIFY_WINDOW
+      ? tg_pos.z * ROWS + static_cast<int>(sg) / group : tg_pos.z;
+  if (VERIFY_WINDOW && token_idx >= cu_seqlens_q[num_seqs]) {
+    // An odd final row leaves whole simdgroups idle. There are no
+    // threadgroup barriers; other rows remain independent.
+    return;
+  }
   const int seq_idx = VERIFY_WINDOW
       ? find_seq_idx(cu_seqlens_q, token_idx, num_seqs) : token_idx;
   // Each verification row sees only its causal prefix, including itself.
@@ -2140,8 +2150,8 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE,
   }
   const int t_end = min(t0 + PARTITION_SIZE, context_len);
 
-  const int group = tptg.x / 32;  // query heads per kv head (GQA group)
-  const int head_idx = kv_head_idx * group + static_cast<int>(sg);
+  const int head_idx = kv_head_idx * group +
+      (VERIFY_WINDOW ? static_cast<int>(sg) % group : static_cast<int>(sg));
   const int num_heads = num_kv_heads * group;
   const int max_num_partitions = tg_per_grid.x;
   const int64_t kv_token_stride =

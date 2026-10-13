@@ -172,6 +172,12 @@ The producer resolves the owning request from cumulative query lengths,
 then runs ordinary GQA's arithmetic on that row's prefix. The existing
 reducer already handles these causal lengths.
 
+Two adjacent query rows occupy each verification threadgroup. Each SIMD
+group still owns one query head of one row and loads its own K/V. Co-locating
+rows preserves each row's arithmetic. Rows may belong
+to different requests, and an odd final row leaves the extra SIMD groups
+idle. Ordinary decode keeps one row per threadgroup.
+
 The GQA disable switch also disables this route. Missing metadata, unsupported
 geometry or features, and insufficient work retain the existing window
 kernel. GQA and the window kernel use different reduction orders; numerical
@@ -349,9 +355,9 @@ enablement or performance claims of this two-tier routing policy:
    KV window. This is relevant to Gemma/Mistral-style attention, but their
    geometries and other features such as sinks or soft-capping must also
    satisfy the supported kernel contract.
-5. **Sharing across verification rows:** the causal GQA route shares KV across
-   grouped heads within each row. Evaluate sharing across multiple query rows
-   too, while preserving causal masks and controlling register pressure.
+5. **Wider verification tiles:** the causal GQA route co-locates two query
+   rows and their grouped heads. Evaluate wider tiles while preserving causal
+   masks and controlling register pressure; shared staging is a separate choice.
 6. **Cooperative K/V loading:** evaluate shared staging against direct
    loads on each device, accounting for cache reuse, synchronization and
    occupancy. Context length alone does not establish a benefit.
