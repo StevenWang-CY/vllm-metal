@@ -47,6 +47,8 @@ static std::string v2_paged_attention_source_;
 constexpr int kPartitionSize = VLLM_METAL_PARTITION_SIZE;
 
 // Process-wide diagnostic for tests; not a per-request trace or routing input.
+static bool window_serial_test = false;
+
 enum class PagedDispatch {
   None, GqaDecode, PerToken, SplitKv, Window, WindowSplitKv, NaxPrefill,
   TiledPrefill, MixedPrefillDecode, Count
@@ -1056,11 +1058,22 @@ static void dispatch_paged_attention_v2_online(
     return;
   }
 
+  const bool serial_window = window_serial_test && window_batch
+      && num_heads == 32 && num_kv_heads == 8 && head_size == 128
+      && block_size == 16 && !use_turboquant && sinks == nullptr
+      && softcap == 0.f && sliding_window < 0
+      && (query.dtype() == float16 || query.dtype() == bfloat16)
+      && key_cache.dtype() == query.dtype() && value_cache.dtype() == query.dtype();
   std::string kname =
       "paged_attention_" + dt + "_cache_" + k_cache_dt + "_" + v_cache_dt +
       "_hs" + std::to_string(head_size) +
       "_bs" + std::to_string(block_size) +
       "_nt256_nsl32_ps" + std::to_string(partition ? kPartitionSize : 0);
+
+  if (serial_window) {
+    kname.replace(0, std::string("paged_attention_").size(), "paged_attention_serial_");
+    kname.replace(kname.find("_nt256"), 6, "_nt128");
+  }
 
   bool use_partitioning  = partition;
   bool use_alibi         = false;
@@ -1146,8 +1159,8 @@ static void dispatch_paged_attention_v2_online(
     bind_turboquant();
     bind_sinks();
     enc.dispatch_threadgroups(
-        MTL::Size::Make(num_heads, grid_y, 1),
-        MTL::Size::Make(NUM_THREADS, 1, 1));
+        MTL::Size::Make(serial_window ? num_heads / 4 : num_heads, grid_y, 1),
+        MTL::Size::Make(serial_window ? 128 : NUM_THREADS, 1, 1));
     return;
   }
 
@@ -1177,8 +1190,8 @@ static void dispatch_paged_attention_v2_online(
   // declared argument under function constant 40, so it must be bound here.
   bind_sinks();
   enc.dispatch_threadgroups(
-      MTL::Size::Make(num_heads, grid_y, max_num_partitions),
-      MTL::Size::Make(NUM_THREADS, 1, 1));
+      MTL::Size::Make(serial_window ? num_heads / 4 : num_heads, grid_y, max_num_partitions),
+      MTL::Size::Make(serial_window ? 128 : NUM_THREADS, 1, 1));
 
   // Pass 2: reduce per-partition partials -> out (log-sum-exp combine).
   dispatch_paged_attention_v2_reduce(
@@ -2277,6 +2290,11 @@ static std::vector<array> gdn_linear_attention_primitive_fn(
 // ---------------------------------------------------------------------------
 
 NB_MODULE(_paged_ops, m) {
+  m.def("_set_window_serial_test", [](bool enabled) {
+    bool prior = window_serial_test;
+    window_serial_test = enabled;
+    return prior;
+  });
   register_mlx_patch(m);
   m.attr("PARTITION_SIZE") = nb::int_(kPartitionSize);
   m.def("detected_gpu_core_count", &detected_gpu_core_count,

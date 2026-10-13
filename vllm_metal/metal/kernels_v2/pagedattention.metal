@@ -2263,6 +2263,287 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE>
 // Tiled paged attention kernel (paged_attention_tiled) is in
 // pagedattention_tiled.metal.
 
+template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
+          int NUM_THREADS, int NUM_SIMD_LANES, int PARTITION_SIZE = 0>
+[[kernel]] void paged_attention_serial(
+    device float *exp_sums
+    [[buffer(0), function_constant(use_partitioning)]], // [num_seqs, num_heads,
+                                                        // max_num_partitions]
+    device float *max_logits
+    [[buffer(1), function_constant(use_partitioning)]], // [num_seqs, num_heads,
+                                                        // max_num_partitions]
+    device T *out
+    [[buffer(2)]], // [num_seqs, num_heads, max_num_partitions, head_size]
+    device const T *q [[buffer(3)]], // [num_seqs, num_heads, head_size]
+    device const K_CACHE_T *k_cache
+    [[buffer(4)]], // [num_blocks, block_size, num_kv_heads, head_size]
+    device const V_CACHE_T *v_cache
+    [[buffer(5)]], // [num_blocks, block_size, num_kv_heads, head_size]
+    const device float *__restrict__ k_scale
+    [[buffer(6), function_constant(use_fp8_scales)]], // [1]
+    const device float *__restrict__ v_scale
+    [[buffer(7), function_constant(use_fp8_scales)]], // [1]
+    const constant int &num_kv_heads [[buffer(8)]],   // [num_heads]
+    const constant float &scale [[buffer(9)]],
+    const constant float &softcapping [[buffer(10)]],
+    device const uint32_t *block_tables
+    [[buffer(11)]], // [num_seqs, max_num_blocks_per_seq]
+    device const uint32_t *context_lens [[buffer(12)]], // [num_seqs]
+    const constant int &max_num_blocks_per_seq [[buffer(13)]],
+    device const float *alibi_slopes
+    [[buffer(14), function_constant(use_alibi)]], // [num_heads]
+    const constant int &q_stride [[buffer(15)]],
+    const constant int &kv_block_stride [[buffer(16)]],
+    const constant int &kv_head_stride [[buffer(17)]],
+    const device float *sinks
+    [[buffer(18), function_constant(use_sinks)]], // [num_heads]
+    device const int32_t *cu_seqlens_q [[buffer(19)]],  // [num_seqs + 1]
+    const constant int &num_seqs [[buffer(20)]],
+    const constant int &sliding_window [[buffer(21)]],  // -1 = disabled
+    const device half *key_scale_cache
+    [[buffer(22), function_constant(use_turboquant)]], // [num_blocks, block_size, num_kv_heads, head_size/32]
+    const device half *value_scale_cache
+    [[buffer(23), function_constant(use_turboquant)]], // [num_blocks, block_size, num_kv_heads, head_size/32]
+    const constant int &v_block_stride
+    [[buffer(24), function_constant(use_turboquant)]],
+    const constant int &v_head_stride
+    [[buffer(25), function_constant(use_turboquant)]],
+    const device half *key_zero_cache
+    [[buffer(26), function_constant(use_turboquant)]], // [num_blocks, block_size, num_kv_heads, head_size/32]
+    const device float *v_centroids
+    [[buffer(27), function_constant(use_turboquant)]], // [2^v_bits] Lloyd-Max centroids for V
+    constant int64_t &scale_block_stride
+    [[buffer(28), function_constant(use_turboquant)]],
+    constant int64_t &scale_head_stride
+    [[buffer(29), function_constant(use_turboquant)]],
+    threadgroup char *shared_mem [[threadgroup(0)]],
+    uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
+    uint3 threadgroups_per_grid [[threadgroups_per_grid]],
+    uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
+    uint simd_tid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  static_assert(HEAD_SIZE == 128 && BLOCK_SIZE == 16 && NUM_SIMD_LANES == 32);
+  constexpr int ROWS = 2;
+  constexpr int VIRTUAL_WARPS = 8;
+  constexpr int GROUP = 4;
+  constexpr int VECS = 16;
+  using Q_vec = typename Vec<T, 4>::Type;
+  using A_vec = typename FloatVec<Q_vec>::Type;
+  const int lane = simd_lid;
+  const int seq = int(threadgroup_position_in_grid.y) / window_q;
+  const int row_start = int(threadgroup_position_in_grid.y) % window_q * ROWS;
+  const int q_start = cu_seqlens_q[seq];
+  const int q_len = cu_seqlens_q[seq + 1] - q_start;
+  const int rows = MIN(ROWS, q_len - row_start);
+  if (rows <= 0) return;
+  const int head = int(threadgroup_position_in_grid.x) * GROUP + simd_tid;
+  const int heads = int(threadgroups_per_grid.x) * GROUP;
+  const int kv_head = head / (heads / num_kv_heads);
+  const int first_row = q_start + row_start;
+  const int first_length = int(context_lens[seq]) - q_len + row_start + 1;
+  const int max_length = first_length + rows - 1;
+  const int partition = threadgroup_position_in_grid.z;
+  const int partitions = threadgroups_per_grid.z;
+  constexpr bool PARTITIONED = PARTITION_SIZE > 0;
+  if (max_length <= 0 || (PARTITIONED && partition * PARTITION_SIZE >= max_length)) return;
+  const int first_block = PARTITIONED ? partition * (PARTITION_SIZE / BLOCK_SIZE) : 0;
+  const int end_block = PARTITIONED
+      ? MIN(first_block + PARTITION_SIZE / BLOCK_SIZE, DIVIDE_ROUND_UP(max_length, BLOCK_SIZE))
+      : DIVIDE_ROUND_UP(max_length, BLOCK_SIZE);
+  const int kv_token_stride = num_kv_heads * kv_head_stride;
+  const device uint32_t *table = block_tables + seq * max_num_blocks_per_seq;
+  threadgroup float *scores = reinterpret_cast<threadgroup float *>(shared_mem) + simd_tid * ROWS * BLOCK_SIZE;
+  threadgroup Q_vec *queries = reinterpret_cast<threadgroup Q_vec *>(
+      shared_mem + GROUP * ROWS * BLOCK_SIZE * sizeof(float)) + simd_tid * ROWS * 32;
+  const int offset = lane % 2;
+  const int vector = lane / 2;
+#pragma unroll
+  for (int r = 0; r < ROWS; r++) {
+    if (r >= rows) break;
+    const device T *qp = q + (first_row + r) * q_stride + head * HEAD_SIZE;
+    queries[r * 32 + offset * VECS + vector] =
+        *reinterpret_cast<const device Q_vec *>(qp + (offset + vector * 2) * 4);
+  }
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+  float total_m[ROWS], total_l[ROWS], total_o[ROWS][4];
+  for (int virtual_warp = 0; virtual_warp < VIRTUAL_WARPS; virtual_warp++) {
+    float m[ROWS], l[ROWS], acc[ROWS][4];
+#pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+      m[r] = -FLT_MAX;
+      l[r] = 0.f;
+#pragma unroll
+      for (int j = 0; j < 4; j++) acc[r][j] = 0.f;
+    }
+    for (int block = first_block + virtual_warp; block < end_block; block += VIRTUAL_WARPS) {
+      const int64_t physical = table[block];
+      const int token = block * BLOCK_SIZE + vector;
+      A_vec qk_acc[ROWS];
+#pragma unroll
+      for (int j = 0; j < VECS; j++) {
+        const device T *kp = k_cache + physical * kv_block_stride
+            + vector * kv_token_stride + kv_head * kv_head_stride;
+        const Q_vec key = *reinterpret_cast<const device Q_vec *>(kp + (offset + j * 2) * 4);
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+          if (r >= rows) break;
+          const Q_vec query = queries[r * 32 + offset * VECS + j];
+          if (j == 0) qk_acc[r] = mul<A_vec, Q_vec, Q_vec>(query, key);
+          else qk_acc[r] = fma(query, key, qk_acc[r]);
+        }
+      }
+#pragma unroll
+      for (int r = 0; r < ROWS; r++) {
+        if (r >= rows) break;
+        float score = sum(qk_acc[r]);
+        score += simd_shuffle_xor(score, 1);
+        score *= scale;
+        score += 0.f;
+        if (offset == 0) scores[r * BLOCK_SIZE + vector] =
+            token >= first_length + r ? -FLT_MAX : score * M_LOG2E_F;
+      }
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+#pragma unroll
+      for (int r = 0; r < ROWS; r++) {
+        if (r >= rows) break;
+        const int valid = MIN(BLOCK_SIZE, first_length + r - block * BLOCK_SIZE);
+        if (valid <= 0) continue;
+        float block_max = -FLT_MAX;
+        for (int t = lane; t < valid; t += 32) block_max = max(block_max, scores[r * BLOCK_SIZE + t]);
+#pragma unroll
+        for (int mask = 16; mask >= 1; mask /= 2) block_max = max(block_max, simd_shuffle_xor(block_max, mask));
+        const float next_m = max(m[r], block_max);
+        if (next_m == -FLT_MAX) continue;
+        float correction = exp2(m[r] - next_m);
+        if (m[r] == -FLT_MAX) correction = 0.f;
+#pragma unroll
+        for (int j = 0; j < 4; j++) acc[r][j] *= correction;
+        l[r] *= correction;
+        m[r] = next_m;
+      }
+      const int valid = MIN(BLOCK_SIZE, max_length - block * BLOCK_SIZE);
+      for (int t = 0; t < valid; t++) {
+        float weights[ROWS];
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+          weights[r] = 0.f;
+          if (r >= rows || t >= MIN(BLOCK_SIZE, first_length + r - block * BLOCK_SIZE)) continue;
+          weights[r] = m[r] == -FLT_MAX ? 0.f : exp2(scores[r * BLOCK_SIZE + t] - m[r]);
+          l[r] += weights[r];
+        }
+        const device T *vp = v_cache + physical * kv_block_stride
+            + t * kv_token_stride + kv_head * kv_head_stride;
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+          const float value = float(vp[lane + j * 32]);
+#pragma unroll
+          for (int r = 0; r < ROWS; r++) {
+            if (r >= rows) break;
+            if (weights[r] == 0.f) continue;
+            acc[r][j] += weights[r] * value;
+          }
+        }
+      }
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+#pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+      if (r >= rows) break;
+      if (virtual_warp == 0) {
+        total_m[r] = m[r];
+        total_l[r] = l[r];
+#pragma unroll
+        for (int j = 0; j < 4; j++) total_o[r][j] = acc[r][j];
+        continue;
+      }
+      if (m[r] == -FLT_MAX && l[r] == 0.f) continue;
+      const float next_m = max(total_m[r], m[r]);
+      const float my_corr = total_m[r] == -FLT_MAX ? 0.f : exp2(total_m[r] - next_m);
+      const float other_corr = m[r] == -FLT_MAX ? 0.f : exp2(m[r] - next_m);
+#pragma unroll
+      for (int j = 0; j < 4; j++) total_o[r][j] = total_o[r][j] * my_corr + acc[r][j] * other_corr;
+      total_m[r] = next_m;
+      total_l[r] = total_l[r] * my_corr + l[r] * other_corr;
+    }
+  }
+#pragma unroll
+  for (int r = 0; r < ROWS; r++) {
+    if (r >= rows) break;
+    const int64_t index = ((int64_t(first_row + r) * heads + head) * partitions + partition);
+    if (PARTITIONED && use_partitioning && lane == 0) {
+      max_logits[index] = total_m[r];
+      exp_sums[index] = total_l[r];
+    }
+    const float inv_l = 1.f / (total_l[r] + kPagedAttentionSoftmaxEpsilon);
+#pragma unroll
+    for (int j = 0; j < 4; j++) out[index * HEAD_SIZE + lane + j * 32] = T(total_o[r][j] * inv_l);
+  }
+}
+
+#define instantiate_serial_window_inner(type, k_cache_type, v_cache_type,    \
+                                          head_size, block_size, num_threads,  \
+                                          num_simd_lanes, partition_size)      \
+  template [[host_name("paged_attention_serial_" #type "_cache_" #k_cache_type        \
+                       "_" #v_cache_type                                       \
+                       "_hs" #head_size "_bs" #block_size "_nt" #num_threads   \
+                       "_nsl" #num_simd_lanes                                  \
+                       "_ps" #partition_size)]] [[kernel]] void                \
+  paged_attention_serial<type, k_cache_type, v_cache_type, head_size, block_size,     \
+                  num_threads, num_simd_lanes, partition_size>(                \
+      device float *exp_sums                                                   \
+      [[buffer(0), function_constant(use_partitioning)]],                      \
+      device float *max_logits                                                 \
+      [[buffer(1), function_constant(use_partitioning)]],                      \
+      device type *out [[buffer(2)]], device const type *q [[buffer(3)]],      \
+      device const k_cache_type *k_cache [[buffer(4)]],                        \
+      device const v_cache_type *v_cache [[buffer(5)]],                        \
+      device const float *k_scale                                              \
+      [[buffer(6), function_constant(use_fp8_scales)]],                        \
+      device const float *v_scale                                              \
+      [[buffer(7), function_constant(use_fp8_scales)]],                        \
+      const constant int &num_kv_heads [[buffer(8)]],                          \
+      const constant float &scale [[buffer(9)]],                               \
+      const constant float &softcapping [[buffer(10)]],                        \
+      device const uint32_t *block_tables [[buffer(11)]],                      \
+      device const uint32_t *context_lens [[buffer(12)]],                      \
+      const constant int &max_num_blocks_per_seq [[buffer(13)]],               \
+      device const float *alibi_slopes                                         \
+      [[buffer(14), function_constant(use_alibi)]],                            \
+      const constant int &q_stride [[buffer(15)]],                             \
+      const constant int &kv_block_stride [[buffer(16)]],                      \
+      const constant int &kv_head_stride [[buffer(17)]],                       \
+      const device float *sinks [[buffer(18), function_constant(use_sinks)]],  \
+      device const int32_t *cu_seqlens_q [[buffer(19)]],                       \
+      const constant int &num_seqs [[buffer(20)]],                             \
+      const constant int &sliding_window [[buffer(21)]],                       \
+      const device half *key_scale_cache                                       \
+      [[buffer(22), function_constant(use_turboquant)]],                       \
+      const device half *value_scale_cache                                     \
+      [[buffer(23), function_constant(use_turboquant)]],                       \
+      const constant int &v_block_stride                                       \
+      [[buffer(24), function_constant(use_turboquant)]],                       \
+      const constant int &v_head_stride                                        \
+      [[buffer(25), function_constant(use_turboquant)]],                       \
+      const device half *key_zero_cache                                        \
+      [[buffer(26), function_constant(use_turboquant)]],                       \
+      const device float *v_centroids                                          \
+      [[buffer(27), function_constant(use_turboquant)]],                       \
+      constant int64_t &scale_block_stride                                    \
+      [[buffer(28), function_constant(use_turboquant)]],                       \
+      constant int64_t &scale_head_stride                                     \
+      [[buffer(29), function_constant(use_turboquant)]],                       \
+      threadgroup char *shared_mem [[threadgroup(0)]],                         \
+      uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],     \
+      uint3 threadgroups_per_grid [[threadgroups_per_grid]],                   \
+      uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]], \
+      uint simd_tid [[simdgroup_index_in_threadgroup]],                        \
+      uint simd_lid [[thread_index_in_simdgroup]]);
+
+instantiate_serial_window_inner(half, half, half, 128, 16, 128, 32, 0);
+instantiate_serial_window_inner(half, half, half, 128, 16, 128, 32, 512);
+instantiate_serial_window_inner(bfloat16_t, bfloat16_t, bfloat16_t, 128, 16, 128, 32, 0);
+instantiate_serial_window_inner(bfloat16_t, bfloat16_t, bfloat16_t, 128, 16, 128, 32, 512);
+
 #define instantiate_paged_attention_inner(type, k_cache_type, v_cache_type,    \
                                           head_size, block_size, num_threads,  \
                                           num_simd_lanes, partition_size)      \
