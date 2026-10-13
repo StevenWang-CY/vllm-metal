@@ -47,6 +47,8 @@ static std::string v2_paged_attention_source_;
 constexpr int kPartitionSize = VLLM_METAL_PARTITION_SIZE;
 
 // Process-wide diagnostic for tests; not a per-request trace or routing input.
+static int window_test_heads = 1;
+
 enum class PagedDispatch {
   None, GqaDecode, PerToken, SplitKv, Window, WindowSplitKv, NaxPrefill,
   TiledPrefill, MixedPrefillDecode, Count
@@ -1062,6 +1064,11 @@ static void dispatch_paged_attention_v2_online(
       "_bs" + std::to_string(block_size) +
       "_nt256_nsl32_ps" + std::to_string(partition ? kPartitionSize : 0);
 
+  int shared_heads = window_batch && num_heads == 32 && num_kv_heads == 8
+      && head_size == 128 && block_size == 16 && !use_turboquant
+      && sinks == nullptr && sliding_window < 0 && softcapping == 0.0f
+      && (query.dtype() == float16 || query.dtype() == bfloat16)
+      ? window_test_heads : 1;
   bool use_partitioning  = partition;
   bool use_alibi         = false;
   bool use_fp8           = false;
@@ -1077,6 +1084,7 @@ static void dispatch_paged_attention_v2_online(
       + "_tq" + (use_tq_fc ? "1" : "0")
       + "_kb" + std::to_string(k_bits_i)
       + "_vb" + std::to_string(v_bits_i)
+      + "_wh" + std::to_string(shared_heads)
       + "_wq" + std::to_string(window_q_fc)
       + "_sk" + (use_sinks ? "1" : "0");
 
@@ -1089,7 +1097,8 @@ static void dispatch_paged_attention_v2_online(
        {&use_tq_fc,        MTL::DataType::DataTypeBool, NS::UInteger(50)},
        {&k_bits_i,         MTL::DataType::DataTypeInt,  NS::UInteger(60)},
        {&v_bits_i,         MTL::DataType::DataTypeInt,  NS::UInteger(70)},
-       {&window_q_fc,      MTL::DataType::DataTypeInt,  NS::UInteger(110)}});
+       {&window_q_fc,      MTL::DataType::DataTypeInt,  NS::UInteger(110)},
+       {&shared_heads, MTL::DataType::DataTypeInt, NS::UInteger(130)}});
 
   constexpr int NUM_THREADS    = 256;
   constexpr int NUM_SIMD_LANES = 32;
@@ -1097,17 +1106,21 @@ static void dispatch_paged_attention_v2_online(
   // Window mode widens the per-warp score slices to one BLOCK_SIZE slice
   // per row and stages the sub-window's query rows after them; the layout
   // must mirror the kernel's shared_mem carve exactly.
-  const int rows_per_tg = window_batch ? kWindowRows : 1;
+  const int rows_per_tg = window_batch ? kWindowRows * shared_heads : 1;
   int warp_scores_bytes = NUM_WARPS * rows_per_tg * block_size
                           * static_cast<int>(sizeof(float));
   int q_window_bytes = window_batch
-      ? kWindowRows * head_size * static_cast<int>(query.itemsize())
+      ? kWindowRows * shared_heads * head_size * static_cast<int>(query.itemsize())
       : 0;
   int merge_bytes = (2 * NUM_WARPS + NUM_WARPS * head_size)
                     * static_cast<int>(sizeof(float));
   size_t shmem = static_cast<size_t>(
       std::max(warp_scores_bytes + q_window_bytes, merge_bytes));
   shmem = (shmem + 15) & ~size_t(15);
+  if (kernel->maxTotalThreadsPerThreadgroup() < NUM_THREADS
+      || shmem + kernel->staticThreadgroupMemoryLength() > d.mtl_device()->maxThreadgroupMemoryLength()) {
+    throw std::runtime_error("Prototype head sharing exceeds pipeline limits");
+  }
 
   // TurboQuant scale/zero/centroid buffers (slots 22-27); shared by both paths.
   auto bind_turboquant = [&]() {
@@ -1146,7 +1159,7 @@ static void dispatch_paged_attention_v2_online(
     bind_turboquant();
     bind_sinks();
     enc.dispatch_threadgroups(
-        MTL::Size::Make(num_heads, grid_y, 1),
+        MTL::Size::Make(num_heads / shared_heads, grid_y, 1),
         MTL::Size::Make(NUM_THREADS, 1, 1));
     return;
   }
@@ -1177,7 +1190,7 @@ static void dispatch_paged_attention_v2_online(
   // declared argument under function constant 40, so it must be bound here.
   bind_sinks();
   enc.dispatch_threadgroups(
-      MTL::Size::Make(num_heads, grid_y, max_num_partitions),
+      MTL::Size::Make(num_heads / shared_heads, grid_y, max_num_partitions),
       MTL::Size::Make(NUM_THREADS, 1, 1));
 
   // Pass 2: reduce per-partition partials -> out (log-sum-exp combine).
@@ -2277,6 +2290,13 @@ static std::vector<array> gdn_linear_attention_primitive_fn(
 // ---------------------------------------------------------------------------
 
 NB_MODULE(_paged_ops, m) {
+  m.def("_set_window_test_heads", [](int heads) {
+    if (heads != 1 && heads != 2)
+      throw std::invalid_argument("Expected 1 or 2 shared heads");
+    const int prior = window_test_heads;
+    window_test_heads = heads;
+    return prior;
+  });
   register_mlx_patch(m);
   m.attr("PARTITION_SIZE") = nb::int_(kPartitionSize);
   m.def("detected_gpu_core_count", &detected_gpu_core_count,

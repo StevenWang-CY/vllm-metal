@@ -656,6 +656,7 @@ constant bool use_mm_prefix [[function_constant(120)]];
 // PA_WINDOW_ROWS consecutive query rows of that segment, so each KV block
 // is read once and shared across those rows (spec-decode verification).
 constant int window_q [[function_constant(110)]];
+constant int window_shared_heads [[function_constant(130)]];
 
 // Query rows per threadgroup in window mode.  Fixed at 2: the per-row
 // (m, l, O) register state scales with this, and measured on M2 Ultra the
@@ -756,16 +757,16 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
   // A sub-window past the segment's rows (short segment in a mixed batch)
   // owns none and exits.
   const int num_rows =
-      WINDOW_MODE ? MIN(q_len - row_start, PA_WINDOW_ROWS) : 1;
+      WINDOW_MODE ? MIN(q_len - row_start, PA_WINDOW_ROWS) * window_shared_heads : 1;
   if (WINDOW_MODE && num_rows <= 0) {
     return;
   }
-  const int rows_per_tg = WINDOW_MODE ? PA_WINDOW_ROWS : 1;
+  const int rows_per_tg = WINDOW_MODE ? PA_WINDOW_ROWS * window_shared_heads : 1;
   const int partition_idx = threadgroup_position_in_grid.z;
   const int max_num_partitions = threadgroups_per_grid.z;
   const int thread_idx = thread_position_in_threadgroup.x;
-  const int head_idx = threadgroup_position_in_grid.x;
-  const int num_heads = threadgroups_per_grid.x;
+  const int head_idx = threadgroup_position_in_grid.x * window_shared_heads;
+  const int num_heads = threadgroups_per_grid.x * window_shared_heads;
   constexpr bool USE_PARTITIONING = PARTITION_SIZE > 0;
   const uint32_t context_len = context_lens[seq_idx];  // total KV length for this seq
 
@@ -775,7 +776,7 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
   const int effective_context_len = (int)context_len - q_len + q_pos_in_seq + 1;
   // Widest causal range any row of this threadgroup attends to.
   const int max_row_context_len =
-      effective_context_len + (WINDOW_MODE ? num_rows - 1 : 0);
+      effective_context_len + (WINDOW_MODE ? num_rows / window_shared_heads - 1 : 0);
   if (max_row_context_len <= 0) {
     // No KV tokens to attend to. Caller guarantees out is zero-initialized.
     return;
@@ -821,16 +822,16 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
     // in-window scores are all far below 0).
     const int rows = WINDOW_MODE ? num_rows : 1;
     for (int r = 0; r < rows; r++) {
-      const int out_row = q_token_idx + r;
+      const int out_row = q_token_idx + r / window_shared_heads;
       if (USE_PARTITIONING && thread_idx == 0 && use_partitioning) {
         max_logits[out_row * num_heads * max_num_partitions +
-                   head_idx * max_num_partitions + partition_idx] = -FLT_MAX;
+                   (head_idx + r % window_shared_heads) * max_num_partitions + partition_idx] = -FLT_MAX;
         exp_sums[out_row * num_heads * max_num_partitions +
-                 head_idx * max_num_partitions + partition_idx] = 0.f;
+                 (head_idx + r % window_shared_heads) * max_num_partitions + partition_idx] = 0.f;
       }
       device T *out_ptr =
           out + out_row * num_heads * max_num_partitions * HEAD_SIZE +
-          head_idx * max_num_partitions * HEAD_SIZE + partition_idx * HEAD_SIZE;
+          (head_idx + r % window_shared_heads) * max_num_partitions * HEAD_SIZE + partition_idx * HEAD_SIZE;
       for (int d = thread_idx; d < HEAD_SIZE; d += NUM_THREADS) {
         out_ptr[d] = T(0);
       }
@@ -1311,7 +1312,8 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
   for (int r = 0; r < rows_per_tg; r++) {
     if (r >= num_rows) break;
     const device T *q_ptr =
-        q + (q_token_idx + r) * q_stride + head_idx * HEAD_SIZE;
+        q + (q_token_idx + r / window_shared_heads) * q_stride +
+        (head_idx + r % window_shared_heads) * HEAD_SIZE;
     threadgroup Q_vec *q_row_base =
         q_rows_window + r * Q_VECS_PER_ROW;
 #pragma unroll
@@ -1340,12 +1342,12 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
   // m = running max of QK scores (for numerical stability)
   // l = running sum of exp(score - m) (softmax denominator)
   // O = running unnormalized output accumulator
-  float warp_m[PA_WINDOW_ROWS];  // running max
-  float warp_l[PA_WINDOW_ROWS];  // running exp sum
+  float warp_m[PA_WINDOW_ROWS * 2];  // running max
+  float warp_l[PA_WINDOW_ROWS * 2];  // running exp sum
 
   constexpr int V_ELEMS_PER_THREAD =
       DIVIDE_ROUND_UP(HEAD_SIZE, NUM_SIMD_LANES);
-  float v_accs[PA_WINDOW_ROWS][V_ELEMS_PER_THREAD];
+  float v_accs[PA_WINDOW_ROWS * 2][V_ELEMS_PER_THREAD];
 #pragma unroll
   for (int r = 0; r < rows_per_tg; r++) {
     warp_m[r] = -FLT_MAX;
@@ -1399,7 +1401,7 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
       // Qk_dot, so scores stay bitwise identical; the register relief keeps
       // window threadgroups (and plain decode) off the occupancy cliff.
       using A_vec = typename FloatVec<K_vec>::Type;
-      A_vec qk_accs[PA_WINDOW_ROWS];
+      A_vec qk_accs[PA_WINDOW_ROWS * 2];
 
 #pragma unroll
       for (int j = 0; j < NUM_VECS_PER_THREAD; j++) {
@@ -1474,7 +1476,7 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
         }
 
         // Causal frontier of row r (== effective_context_len in per-token mode).
-        const int row_context_len = effective_context_len + r;
+        const int row_context_len = effective_context_len + r / window_shared_heads;
 
         qk += (alibi_slope != 0)
                   ? alibi_slope * (token_idx - row_context_len + 1)
@@ -1519,7 +1521,7 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
       // the skip, an all-masked block would clamp the row's running max
       // from -FLT_MAX to 0).
       const int block_valid_tokens =
-          MIN(BLOCK_SIZE, effective_context_len + r - block_start_token);
+          MIN(BLOCK_SIZE, effective_context_len + r / window_shared_heads - block_start_token);
       if (block_valid_tokens <= 0) continue;
 
       // Find max score in this block (all lanes participate for speed).
@@ -1570,7 +1572,7 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
     const int block_max_valid =
         MIN(BLOCK_SIZE, max_row_context_len - block_start_token);
     for (int tok = 0; tok < block_max_valid; tok++) {
-      float w[PA_WINDOW_ROWS];
+      float w[PA_WINDOW_ROWS * 2];
 #pragma unroll
       for (int r = 0; r < rows_per_tg; r++) {
         if (r >= num_rows) {
@@ -1578,7 +1580,7 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
           continue;
         }
         const int row_valid_tokens =
-            MIN(BLOCK_SIZE, effective_context_len + r - block_start_token);
+            MIN(BLOCK_SIZE, effective_context_len + r / window_shared_heads - block_start_token);
         if (tok >= row_valid_tokens) {
           w[r] = 0.f;
           continue;
@@ -1734,7 +1736,7 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
       // See the equivalent block in the per-token kernel for the rationale;
       // partitioned mode defers to paged_attention_v2_reduce.
       if (!USE_PARTITIONING && use_sinks) {
-        const float sink_val = sinks[head_idx] * M_LOG2E_F;
+        const float sink_val = sinks[head_idx + r % window_shared_heads] * M_LOG2E_F;
         const float new_m = max(warp_m[r], sink_val);
         const float old_corr =
             (warp_m[r] == -FLT_MAX) ? 0.f : exp2(warp_m[r] - new_m);
@@ -1747,7 +1749,7 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
       }
 
       // Global query row this iteration writes.
-      const int out_row = q_token_idx + r;
+      const int out_row = q_token_idx + r / window_shared_heads;
 
       // For partitioned mode, persist the merged partition statistics for
       // the reduce kernel. These must match the normalized tmp_out written
@@ -1755,7 +1757,7 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
       if (USE_PARTITIONING && thread_idx == 0 && use_partitioning) {
         device float *max_logits_ptr =
             max_logits + out_row * num_heads * max_num_partitions +
-            head_idx * max_num_partitions + partition_idx;
+            (head_idx + r % window_shared_heads) * max_num_partitions + partition_idx;
         // The block range starts at the window of the threadgroup's first
         // row, so a later row can read a partition that lies wholly left of
         // its own window.  Such a row sees no unmasked key and keeps the
@@ -1764,7 +1766,7 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
         *max_logits_ptr = warp_m[r];
         device float *exp_sums_ptr = exp_sums +
                                      out_row * num_heads * max_num_partitions +
-                                     head_idx * max_num_partitions + partition_idx;
+                                     (head_idx + r % window_shared_heads) * max_num_partitions + partition_idx;
         *exp_sums_ptr = warp_l[r];
       }
 
@@ -1812,7 +1814,7 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
 
       device T *out_ptr =
           out + out_row * num_heads * max_num_partitions * HEAD_SIZE +
-          head_idx * max_num_partitions * HEAD_SIZE + partition_idx * HEAD_SIZE;
+          (head_idx + r % window_shared_heads) * max_num_partitions * HEAD_SIZE + partition_idx * HEAD_SIZE;
 #pragma unroll
       for (int j = 0; j < V_ELEMS_PER_THREAD; j++) {
         const int d = lane + j * NUM_SIMD_LANES;
