@@ -67,6 +67,20 @@ def test_speculators_preserves_tuple_indices_and_attention_policy():
         DSparkConfig.from_dict(raw)
 
 
+@pytest.mark.parametrize("architecture", ["DSparkDraftModel", "DSparkSpeculator"])
+def test_speculators_full_attention_configuration(architecture):
+    raw = speculators_config()
+    raw["architectures"] = [architecture]
+    raw["transformer_layer_config"].update(
+        layer_types=["full_attention", "full_attention"],
+        use_sliding_window=False,
+        sliding_window=None,
+    )
+    cfg = DSparkConfig.from_dict(raw, target_config=_target_config())
+    assert cfg.backbone == replace(config().backbone, target_layer_ids=(0, 1, 2))
+    assert cfg.context_windows == (None, None)
+
+
 @pytest.mark.parametrize(
     "section,key,value",
     [
@@ -82,6 +96,9 @@ def test_speculators_preserves_tuple_indices_and_attention_policy():
         (None, "sliding_window_non_causal", "false"),
         (None, "input_embedding_scale", 2),
         (None, "tie_word_embeddings", True),
+        (None, "markov_head_type", "unknown"),
+        (None, "markov_rank", 0),
+        (None, "enable_confidence_head", "false"),
         ("transformer_layer_config", "hidden_size", 16),
         ("transformer_layer_config", "model_type", "qwen3_5"),
         ("transformer_layer_config", "layer_types", ["sliding_attention"]),
@@ -96,6 +113,7 @@ def test_speculators_preserves_tuple_indices_and_attention_policy():
         ("transformer_layer_config", "attention_bias", True),
         ("transformer_layer_config", "tie_word_embeddings", True),
         ("transformer_layer_config", "rope_scaling", {"rope_type": "yarn"}),
+        ("transformer_layer_config", "rope_parameters", {"rope_type": "yarn"}),
     ],
 )
 def test_incompatible_speculators_semantics_rejected(section, key, value):

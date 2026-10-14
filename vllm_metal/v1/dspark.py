@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, fields
 from numbers import Integral
 from pathlib import Path
 from typing import Any
@@ -102,11 +102,25 @@ class DSparkConfig:
             or raw.get("model_type") != "qwen3"
         ):
             raise ValueError("Expected a standalone Qwen3DSparkModel checkpoint")
-        if raw.get("markov_head_type") != "vanilla":
-            raise ValueError("DSpark requires an explicit vanilla markov_head_type")
         for name, expected in _DSPARK_OPTIONS.items():
             if raw.get(name, expected) != expected:
                 raise ValueError(f"Unsupported DSpark {name}: {raw[name]!r}")
+        config = cls._from_fields(raw)
+        full_attention = ["full_attention"] * config.backbone.num_hidden_layers
+        if raw.get("layer_types", full_attention) != full_attention:
+            raise ValueError("Only full-attention DSpark layers are supported")
+        return config
+
+    @classmethod
+    def _from_fields(
+        cls,
+        raw: Mapping[str, Any],
+        *,
+        context_windows: tuple[int | None, ...] = (),
+        causal_blocks: bool = False,
+    ) -> DSparkConfig:
+        if raw.get("markov_head_type") != "vanilla":
+            raise ValueError("DSpark requires an explicit vanilla markov_head_type")
         rope = raw.get("rope_parameters")
         if rope is None:
             rope = {}
@@ -135,18 +149,13 @@ class DSparkConfig:
                 confidence_head_with_markov=raw.get(
                     "confidence_head_with_markov", False
                 ),
+                context_windows=context_windows,
+                causal_blocks=causal_blocks,
             )
         except (KeyError, TypeError) as exc:
             raise ValueError(
                 f"Incomplete DSpark checkpoint configuration: {exc}"
             ) from exc
-        if (
-            raw.get(
-                "layer_types", ["full_attention"] * config.backbone.num_hidden_layers
-            )
-            != ["full_attention"] * config.backbone.num_hidden_layers
-        ):
-            raise ValueError("Only full-attention DSpark layers are supported")
         if config.enable_confidence_head and "confidence_head_with_markov" not in raw:
             raise ValueError("DSpark requires confidence_head_with_markov")
         return config
@@ -212,26 +221,20 @@ class DSparkConfig:
             )
         # Speculators uses hidden-state tuple indices directly, unlike DeepSpec's
         # decoder indices. Preserve its attention policy separately from geometry.
-        normalized = {
-            **raw,
-            **backbone,
-            "architectures": ["Qwen3DSparkModel"],
-            "speculators_model_type": None,
-            "num_target_layers": count,
-            "target_layer_ids": [i - 1 for i in taps],
-            "use_sliding_window": False,
-            "sliding_window": None,
-            "layer_types": ["full_attention"] * len(layers),
-        }
-        config = cls.from_dict(normalized)
-        config.backbone.validate_target(target)
-        return replace(
-            config,
+        config = cls._from_fields(
+            {
+                **raw,
+                **backbone,
+                "num_target_layers": count,
+                "target_layer_ids": [i - 1 for i in taps],
+            },
             context_windows=tuple(
                 window if kind == "sliding_attention" else None for kind in layers
             ),
             causal_blocks=not non_causal,
         )
+        config.backbone.validate_target(target)
+        return config
 
     def validate_q4_dimensions(self) -> None:
         """Check quantized linear input widths before allocating or loading weights."""
