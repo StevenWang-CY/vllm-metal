@@ -180,22 +180,3 @@ def test_window_boundary_and_future_block_are_excluded():
     changed = mx.concatenate([embeddings[:, :4], embeddings[:, 4:] + 100], axis=1)
     actual = model.backbone(changed, features)
     np.testing.assert_array_equal(array(actual[:, :4]), array(expected[:, :4]))
-
-
-@pytest.mark.parametrize("causal_blocks", [False, True])
-def test_padded_context_preserves_the_block_anchored_window(causal_blocks):
-    model = DSparkModel(
-        replace(config(), context_windows=(8, 8), causal_blocks=causal_blocks)
-    ).backbone
-    features = [mx.random.normal((1, 17, 32)) for _ in range(3)]
-    embeddings = mx.random.normal((1, 7, 32))
-    expected = model(embeddings, features)
-    contexts = model._project_context(features)
-    padded = tuple(
-        tuple(mx.pad(t, [(0, 0), (0, 0), (0, 15), (0, 0)]) for t in layer)
-        for layer in contexts
-    )
-    actual = model._block_forward(
-        embeddings, padded, logits_start=0, context_length=mx.array(17, dtype=mx.int32)
-    )
-    np.testing.assert_allclose(array(actual), array(expected), atol=2e-5, rtol=2e-5)

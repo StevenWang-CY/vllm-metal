@@ -257,23 +257,14 @@ class _Attention(nn.Module):
         x: mx.array,
         context: tuple[mx.array, mx.array],
         rope: nn.RoPE,
-        context_length: mx.array | None,
         mask: mx.array | None,
     ) -> mx.array:
         batch, width, _ = x.shape
         ck, cv = context
         length = ck.shape[2]
-        offset = length if context_length is None else context_length
-        q, bk, bv = self.project_block(x, rope, offset)
+        q, bk, bv = self.project_block(x, rope, length)
         keys = mx.concatenate([ck, bk], axis=2)
         values = mx.concatenate([cv, bv], axis=2)
-        if context_length is not None:
-            # Keep valid keys in their unpadded order: [context, block, padding].
-            # A gap before the block changes SDPA's reduction order and can
-            # amplify BF16 rounding through the trained draft's later layers.
-            start = context_length.reshape(1)
-            keys = mx.slice_update(keys, bk, start, axes=(2,))
-            values = mx.slice_update(values, bv, start, axes=(2,))
         # The caller supplies any checkpoint-specific prefix/block restrictions;
         # the default is bidirectional attention over the prefix and draft block.
         output = mx.fast.scaled_dot_product_attention(
@@ -301,12 +292,9 @@ class _DecoderLayer(nn.Module):
         x: mx.array,
         context: tuple[mx.array, mx.array],
         rope: nn.RoPE,
-        context_length: mx.array | None,
         mask: mx.array | None,
     ) -> mx.array:
-        h = x + self.self_attn(
-            self.input_layernorm(x), context, rope, context_length, mask
-        )
+        h = x + self.self_attn(self.input_layernorm(x), context, rope, mask)
         return h + self.mlp(self.post_attention_layernorm(h))
 
 
@@ -355,7 +343,7 @@ class DFlashModel(nn.Module):
 
     def _validate_features(
         self, features: Sequence[mx.array], batch: int, width: int
-    ) -> int:
+    ) -> None:
         if len(features) != len(self.config.target_layer_ids):
             raise ValueError(
                 "DFlash requires one feature tensor per configured target layer"
@@ -373,7 +361,6 @@ class DFlashModel(nn.Module):
             )
         if shape[1] + width > self.config.max_position_embeddings:
             raise ValueError("DFlash context and block exceed max_position_embeddings")
-        return shape[1]
 
     def validate_embeddings(self, embeddings: mx.array, logits_start: int) -> None:
         """Check block-state metadata and the selected suffix without evaluating it."""
@@ -404,33 +391,25 @@ class DFlashModel(nn.Module):
         contexts: Sequence[tuple[mx.array, mx.array]],
         *,
         logits_start: int,
-        context_length: mx.array | None = None,
     ) -> mx.array:
         length = contexts[0][0].shape[2]
-        mask = None
-        if context_length is not None:
-            # All prefix and block keys precede the masked padding suffix.
-            mask = mx.arange(length + embeddings.shape[1]) < (
-                context_length + embeddings.shape[1]
-            )
         h = embeddings
         for layer, context, window in zip(
             self.layers, contexts, self.context_windows, strict=True
         ):
-            layer_mask = mask
+            layer_mask = None
             if window is not None:
                 # Speculators anchors its prefix window at the block start.
                 # Its sliding layers may also use causal attention inside a block.
-                start = length if context_length is None else context_length
                 keys = mx.arange(length + embeddings.shape[1])
-                prefix = (keys >= start - window) & (keys < start)
-                block = (keys >= start) & (keys < start + embeddings.shape[1])
+                prefix = (keys >= length - window) & (keys < length)
+                block = (keys >= length) & (keys < length + embeddings.shape[1])
                 if self.causal_blocks:
                     block = block & (
-                        keys <= start + mx.arange(embeddings.shape[1])[:, None]
+                        keys <= length + mx.arange(embeddings.shape[1])[:, None]
                     )
                 layer_mask = prefix | block
-            h = layer(h, context, self.rope, context_length, layer_mask)
+            h = layer(h, context, self.rope, layer_mask)
         # Slice before normalization, as in the reference. Normalization produces
         # contiguous rows for the borrowed head; a strided BF16 slice can select
         # a different quantized projection kernel for batched one-token drafts.
@@ -494,70 +473,6 @@ class DFlashModel(nn.Module):
         if logits.shape != (batch, num_draft_tokens, self.config.vocab_size):
             raise ValueError("DFlash target projection has an incompatible vocabulary")
         return logits
-
-    def compile_draft(
-        self,
-        *,
-        num_draft_tokens: int,
-        embed: Callable[[mx.array], mx.array],
-        project: Callable[[mx.array], mx.array],
-        context_bucket_size: int = 256,
-    ) -> Callable[[mx.array, Sequence[mx.array]], mx.array]:
-        """Build once, then reuse for growing full-prefix features.
-
-        The returned callable projects the real prefix and pads its K/V outside
-        the compiled block forward. Batch size, dtype and context bucket
-        determine its input shapes; the true prefix
-        length is a device scalar used for masking and draft RoPE positions.
-        All rows still require the same prefix length. Keep model weights and
-        borrowed projections fixed for the lifetime of this callable.
-        """
-        if type(context_bucket_size) is not int or context_bucket_size < 1:
-            raise ValueError("DFlash context_bucket_size must be a positive integer")
-        self._validate_num_draft_tokens(num_draft_tokens)
-        width = num_draft_tokens + 1
-
-        def forward(anchors, contexts, context_length):
-            embeddings = self._draft_embeddings(anchors, num_draft_tokens, embed)
-            hidden = self._block_forward(
-                embeddings, contexts, logits_start=1, context_length=context_length
-            )
-            return self._project_logits(
-                hidden, project, anchors.shape[0], num_draft_tokens
-            )
-
-        compiled = mx.compile(forward)
-
-        def draft(anchors: mx.array, features: Sequence[mx.array]) -> mx.array:
-            self.validate_anchor_metadata(anchors)
-            length = self._validate_features(features, anchors.shape[0], width)
-            bucket = min(
-                ((length + context_bucket_size - 1) // context_bucket_size)
-                * context_bucket_size,
-                self.config.max_position_embeddings - width,
-            )
-            # MLX 0.32.1 changes vector SDPA kernels/partition counts at
-            # power-of-two KV lengths starting at 1024. Do not let padding
-            # cross those boundaries (including their exact-length case):
-            # changing the reduction can amplify BF16 rounding in the draft.
-            span = length + width
-            boundary = max(1024, 1 << (span - 1).bit_length())
-            bucket = min(bucket, boundary - (span != boundary) - width)
-            # Project the real prefix before padding. Padding feature rows
-            # can select a different GEMM reduction and change BF16 values.
-            # These shape-dependent projections stay outside the compiled
-            # block graph; only their padded K/V enter that reusable graph.
-            contexts = self._project_context(features)
-            padded = tuple(
-                tuple(
-                    mx.pad(value, ((0, 0), (0, 0), (0, bucket - length), (0, 0)))
-                    for value in context
-                )
-                for context in contexts
-            )
-            return compiled(anchors, padded, mx.array(length, dtype=mx.int32))
-
-        return draft
 
     @staticmethod
     def validate_anchor_metadata(anchors: mx.array) -> None:
