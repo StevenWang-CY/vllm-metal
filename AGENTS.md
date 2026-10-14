@@ -45,8 +45,8 @@ For performance improvements, report before/after end-to-end serving speedup on 
 
 ### Speculative decoding
 
-- Compare fresh greedy runs with speculative decoding enabled and disabled, using the same inputs and settings. The output token IDs must be identical.
-- Test the algorithm's correctness properties. For example, for draft-model speculation, use the same checkpoint for draft and target under greedy decoding; acceptance should be near 100%. Report the measured rate and investigate substantial rejections.
+- Compare fresh greedy runs with speculative decoding enabled and disabled, using the same inputs and settings. Accept `EXACT` or mutual `TOP_K_MATCH` at the first divergence (`--top-k 5`); require zero `FAIL`.
+- Test the algorithm's correctness properties, including exact verifier results for fixed target logits. For draft-model speculation, use the same checkpoint for draft and target under greedy decoding; acceptance should be near 100%. Report the measured rate and investigate substantial rejections.
 - Evaluate acceptance rate and speedup on natural datasets such as [RedHatAI/speculator_benchmarks](https://huggingface.co/datasets/RedHatAI/speculator_benchmarks), prepared with [the dataset builder](tools/build_spec_bench_dataset.py). Artificial workloads such as `sonnet` can produce unrealistically low acceptance rates.
 - Demonstrate end-to-end speedup at batch size `B=1`. Speedup at `B>1` is harder but still expected; benchmark both with [the benchmark tools](tools/README.md). Report the tested batch sizes, representative workloads, and any regressions.
 
