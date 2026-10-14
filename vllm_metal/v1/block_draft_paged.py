@@ -289,6 +289,8 @@ class BlockDraftPagedCache:
         The paged kernel's moving window has different semantics. Gather only
         this bounded span and apply the checkpoint's within-block mask instead.
         """
+        # TODO: Support block-anchored sliding masks in paged attention to avoid
+        # gathering KV into dense tensors before SDPA.
         batch, width, _, head_dim = q.shape
         span = min(window + width, indices.size)
         positions = mx.maximum(offsets - window, 0)[:, None] + indices[:span]

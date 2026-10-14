@@ -48,13 +48,12 @@ workers, and a speculative run must exercise draft verification.
 Use `--audit-continuations` to additionally replay every emitted prefix through
 native MLX. Any strict greedy mismatch fails this audit, even if the first
 divergence passes top-k comparison. Raw outputs and reports are retained on a
-comparison failure. See [DSpark qualification](dspark.md#full-continuation-audit)
-for the audit's scope.
+comparison failure.
 
 This replaces `tools.dflash_serving_parity`: use `tools.check_parity --method
 dflash --model ...` instead, retaining the other draft options. The draft-forward
 and paged-cache diagnostics remain separate because they test different contracts.
-Measure speed separately with the [serving benchmark](dspark.md#measure-http-serving-and-memory).
+Measure speed separately with the [DSpark serving benchmark](https://github.com/vllm-project/vllm-metal/blob/main/tools/benchmark/dspark_serving_benchmark.py).
 
 ## Scheduled and requested CI
 
