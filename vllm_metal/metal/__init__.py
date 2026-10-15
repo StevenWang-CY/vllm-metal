@@ -237,12 +237,7 @@ def _load_native_module() -> ModuleType:
     if _native_module is not None:
         return _native_module
 
-    # The prebuilt .so links `-lmlx` with no rpath, so it records a dependency on
-    # `@rpath/libmlx.dylib` (libmlx's install name) that it cannot resolve on its
-    # own; dyld instead satisfies it against an already-resident libmlx, matched
-    # by install name (`-undefined dynamic_lookup` resolves any stragglers the
-    # same way; see build.py). Both need libmlx loaded first, so import mlx.core
-    # now to make it resident before the .so is dlopen'd below.
+    # Register MLX's nanobind types and load libmlx before the native extension.
     import mlx.core  # noqa: F401
 
     # 1. Locate the native extension: load the prebuilt artifact by default;
@@ -265,7 +260,7 @@ def _load_native_module() -> ModuleType:
                 f"Prebuilt native extension not found at {so_path}. Install a "
                 f"vllm-metal release wheel (which ships it prebuilt), or set "
                 f"VLLM_METAL_BUILD_FROM_SOURCE=1 to compile it from source "
-                f"(requires Xcode command-line tools)."
+                f"(requires CMake and the Xcode Metal toolchain)."
             )
         # Locally-built artifacts (the .so and the .metallib shaders) drift if a
         # developer edits paged_ops.cpp or a .metal file without rebuilding. Fail
@@ -311,6 +306,8 @@ def get_ops() -> ModuleType:
     is set, the ``.so`` is rebuilt and the shader sources are read, pre-processed
     (includes inlined) and JIT-compiled in-process via
     ``mlx::core::metal::Device::get_library(name, builder)`` instead.
+    The native build also produces ``.metallib`` files, but source mode still
+    initializes the shaders through JIT.
 
     Returns:
         The ``_paged_ops`` module with ``paged_attention_primitive()`` and

@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the JIT-build cache invalidation in vllm_metal.metal.build."""
+"""Tests for native build cache invalidation in vllm_metal.metal.build."""
 
 from __future__ import annotations
 
-import dataclasses
 import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -22,11 +23,10 @@ class _Paths:
     device: Path
     bld: Path
     consts: Path
-    nb_src: Path
     out: Path
     hsh: Path
     ver: Path
-    spec: build._BuildSpec
+    versions: dict[str, str]
 
 
 @pytest.fixture
@@ -37,7 +37,6 @@ def patched(tmp_path, monkeypatch) -> _Paths:
     device = tmp_path / "metal_device.h"
     bld = tmp_path / "build.py"
     consts = tmp_path / "constants.py"
-    nb_src = tmp_path / "nb_combined.cpp"
     out = tmp_path / "_paged_ops.so"
     hsh = tmp_path / "_paged_ops.so.sha256"
     ver = tmp_path / "_paged_ops.mlx-version"
@@ -48,7 +47,6 @@ def patched(tmp_path, monkeypatch) -> _Paths:
     device.write_bytes(b"// hardware detection v1")
     bld.write_bytes(b"# build v1")
     consts.write_bytes(b"PARTITION_SIZE = 256")
-    nb_src.write_bytes(b"// nanobind combined v1")
     ver.write_text("0.0.0\n")
 
     monkeypatch.setattr(build, "_SRC", src)
@@ -61,18 +59,10 @@ def patched(tmp_path, monkeypatch) -> _Paths:
     monkeypatch.setattr(build, "_HASH", hsh)
     monkeypatch.setattr(build, "_MLX_VERSION", ver)
 
-    spec = build._BuildSpec(
-        cmd=["clang++", "-O2", "-Lfake/mlx/lib", "-o", str(out)],
-        nb_src=nb_src,
-        mlx_lib=Path("/fake/mlx/lib"),
-        mlx_include=Path("/fake/mlx/include"),
-        py_include="/fake/py/include",
-        mlx_version="0.31.0",
-        nb_version="2.10.0",
-    )
-    monkeypatch.setattr(build, "_build_spec", lambda: spec)
+    versions = {"mlx": "0.31.0", "nanobind": "2.10.0"}
+    monkeypatch.setattr(build, "_package_version", versions.__getitem__)
 
-    return _Paths(src, patch, kernels, device, bld, consts, nb_src, out, hsh, ver, spec)
+    return _Paths(src, patch, kernels, device, bld, consts, out, hsh, ver, versions)
 
 
 def test_needs_rebuild_when_so_missing(patched):
@@ -92,13 +82,13 @@ def test_needs_rebuild_when_hash_differs(patched):
 
 def test_no_rebuild_when_hash_matches(patched):
     patched.out.write_bytes(b"compiled")
-    patched.hsh.write_text(build._input_hash(patched.spec))
+    patched.hsh.write_text(build._input_hash())
     assert build.needs_rebuild() is False
 
 
 def test_needs_rebuild_when_mlx_version_record_missing(patched):
     patched.out.write_bytes(b"compiled")
-    patched.hsh.write_text(build._input_hash(patched.spec))
+    patched.hsh.write_text(build._input_hash())
     patched.ver.unlink()
     assert build.needs_rebuild() is True
 
@@ -110,61 +100,48 @@ def test_old_content_with_newer_so_mtime_still_rebuilds(patched):
     patched.out.write_bytes(b"compiled-from-prev-branch")
     patched.hsh.write_text("hash-from-prev-branch")
     older = patched.out.stat().st_mtime - 86400
-    for p in (patched.src, patched.bld, patched.consts, patched.nb_src):
+    for p in (patched.src, patched.bld, patched.consts):
         os.utime(p, (older, older))
     assert build.needs_rebuild() is True
 
 
 @pytest.mark.parametrize("source_name", ["src", "patch", "kernels", "device"])
 def test_hash_changes_with_source_bytes(patched, source_name):
-    h1 = build._input_hash(patched.spec)
+    h1 = build._input_hash()
     getattr(patched, source_name).write_bytes(b"// source v2")
-    assert build._input_hash(patched.spec) != h1
+    assert build._input_hash() != h1
 
 
 def test_hash_changes_with_constants_bytes(patched):
-    h1 = build._input_hash(patched.spec)
+    h1 = build._input_hash()
     patched.consts.write_bytes(b"PARTITION_SIZE = 512")
-    assert build._input_hash(patched.spec) != h1
+    assert build._input_hash() != h1
 
 
-def test_hash_changes_with_nb_src_bytes(patched):
-    h1 = build._input_hash(patched.spec)
-    patched.nb_src.write_bytes(b"// nanobind combined v2")
-    assert build._input_hash(patched.spec) != h1
+def test_hash_ignores_source_directory(patched, tmp_path, monkeypatch):
+    h1 = build._input_hash()
+    moved = tmp_path / "moved" / patched.src.name
+    moved.parent.mkdir()
+    moved.write_bytes(patched.src.read_bytes())
+    monkeypatch.setattr(build, "_SRC", moved)
+    assert build._input_hash() == h1
 
 
-def test_hash_ignores_cmd_paths(patched):
-    # The .so links `-undefined dynamic_lookup` and bakes in no absolute path, so
-    # moving the venv (different -L/-I/-o paths in spec.cmd) yields an equivalent
-    # binary and must NOT flag the artifact stale. Semantically meaningful inputs
-    # (compile flags, PARTITION_SIZE) live in build.py/constants.py, whose bytes
-    # ARE hashed below — so this excludes only machine-specific paths.
-    h1 = build._input_hash(patched.spec)
-    s2 = dataclasses.replace(patched.spec, cmd=patched.spec.cmd + ["-L/other/mlx/lib"])
-    assert build._input_hash(s2) == h1
-
-
-def test_hash_changes_with_mlx_version(patched):
-    h1 = build._input_hash(patched.spec)
-    s2 = dataclasses.replace(patched.spec, mlx_version="99.0.0")
-    assert build._input_hash(s2) != h1
-
-
-def test_hash_changes_with_nb_version(patched):
-    h1 = build._input_hash(patched.spec)
-    s2 = dataclasses.replace(patched.spec, nb_version="99.0.0")
-    assert build._input_hash(s2) != h1
+@pytest.mark.parametrize("package", ["mlx", "nanobind"])
+def test_hash_changes_with_dependency_version(patched, package):
+    h1 = build._input_hash()
+    patched.versions[package] = "99.0.0"
+    assert build._input_hash() != h1
 
 
 def test_needs_rebuild_swallows_resolution_errors(patched, monkeypatch):
     patched.out.write_bytes(b"compiled")
     patched.hsh.write_text("anything")
 
-    def boom():
+    def boom(name):
         raise ImportError("mlx not installed")
 
-    monkeypatch.setattr(build, "_build_spec", boom)
+    monkeypatch.setattr(build, "_package_version", boom)
     assert build.needs_rebuild() is True
 
 
@@ -267,8 +244,7 @@ def stale_env(tmp_path, monkeypatch):
     (mlx, nanobind, shader-source builders) are never imported."""
     monkeypatch.setattr(build, "_OUT", tmp_path / "_paged_ops.so")
     monkeypatch.setattr(build, "_THIS_DIR", tmp_path)
-    monkeypatch.setattr(build, "_build_spec", lambda: None)
-    monkeypatch.setattr(build, "_input_hash", lambda _spec: "SO_DIGEST")
+    monkeypatch.setattr(build, "_input_hash", lambda: "SO_DIGEST")
     monkeypatch.setattr(build, "_metallib_source", lambda name: f"SRC::{name}")
     return tmp_path
 
@@ -290,7 +266,9 @@ def test_stale_artifacts_empty_when_all_fresh(stale_env):
 
 def test_prepare_metallib_is_independent_of_mlx(stale_env, monkeypatch):
     _seed_fresh()
-    monkeypatch.setattr(build, "_build_spec", _raise(AssertionError("touched MLX")))
+    monkeypatch.setattr(
+        build, "_package_version", _raise(AssertionError("touched MLX"))
+    )
     name = build.METALLIB_NAMES[0]
     lib = build.metallib_path(name)
     assert build.prepare_metallib(name) == lib
@@ -375,22 +353,113 @@ def test_mlx_version_mismatch_none_when_unrecorded(tmp_path, monkeypatch):
     assert build.mlx_version_mismatch() is None
 
 
-def test_build_records_the_mlx_version_it_compiled_against(
-    patched, tmp_path, monkeypatch
+@pytest.fixture
+def compiler(patched, monkeypatch, tmp_path):
+    sources = {
+        name: f"shader {name}"
+        for name in (*build.METALLIB_NAMES, build.NAX_METALLIB_NAME)
+    }
+    calls = []
+
+    def compile_artifacts(sources, build_dir):
+        calls.append(build_dir)
+        patched.out.write_bytes(b"compiled")
+        for name in sources:
+            build.metallib_path(name).write_bytes(b"metallib")
+
+    monkeypatch.setattr(build, "_THIS_DIR", tmp_path)
+    monkeypatch.setattr(build, "_sdk_supports_nax", lambda: False)
+    monkeypatch.setattr(build, "_metallib_source", sources.__getitem__)
+    monkeypatch.setattr(build, "_build_extension", compile_artifacts)
+    return sources, calls
+
+
+@pytest.mark.parametrize("nax_supported", [False, True])
+def test_build_entries_share_artifact_paths_and_cache(
+    patched, compiler, monkeypatch, nax_supported
 ):
-    (tmp_path / "libmlx.dylib").write_bytes(b"")
-    spec = dataclasses.replace(
-        patched.spec, py_include=str(tmp_path), mlx_include=tmp_path, mlx_lib=tmp_path
+    _, calls = compiler
+    monkeypatch.setattr(build, "_sdk_supports_nax", lambda: nax_supported)
+    names = (
+        *build.METALLIB_NAMES,
+        *([build.NAX_METALLIB_NAME] if nax_supported else []),
     )
-    record = tmp_path / "_paged_ops.mlx-version"
-    monkeypatch.setattr(build, "_build_spec", lambda: spec)
-    monkeypatch.setattr(build, "_MLX_VERSION", record)
-    monkeypatch.setattr(build, "_run_or_raise", lambda cmd, what: None)
 
+    assert build.build_metallibs() == [build.metallib_path(name) for name in names]
+    assert all(build.metallib_path(name).exists() for name in names)
+    assert patched.ver.read_text() == "0.31.0\n"
+    assert patched.hsh.read_text() == build._input_hash()
+    assert build.stale_artifacts() == []
+    assert build.needs_rebuild() is False
+    assert build.build() == patched.out
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("missing_stamp", [False, True])
+def test_build_restores_a_missing_shader_artifact(patched, compiler, missing_stamp):
+    _, calls = compiler
     build.build()
+    library = build.metallib_path(build.METALLIB_NAMES[0])
+    (build._stamp_path(library) if missing_stamp else library).unlink()
+    assert build.build() == patched.out
+    assert len(calls) == 2
+    assert library.exists()
+    assert build._stamp_path(library).exists()
 
-    assert record.read_text() == "0.31.0\n"
-    assert patched.hsh.read_text() == build._input_hash(spec)
+
+def test_build_recompiles_edited_shader_sources(patched, compiler):
+    sources, calls = compiler
+    build.build()
+    sources[build.METALLIB_NAMES[0]] = "changed shader"
+    build.build()
+    assert len(calls) == 2
+    assert build.stale_artifacts() == []
+
+
+def test_build_adds_nax_when_sdk_support_becomes_available(
+    patched, compiler, monkeypatch
+):
+    build.build()
+    library = build.metallib_path(build.NAX_METALLIB_NAME)
+    assert not library.exists()
+    monkeypatch.setattr(build, "_sdk_supports_nax", lambda: True)
+    build.build()
+    assert library.exists()
+    assert build._stamp_path(library).exists()
+
+
+def test_failed_build_does_not_mark_changed_sources_current(
+    patched, compiler, monkeypatch
+):
+    sources, _ = compiler
+    build.build()
+    name = build.METALLIB_NAMES[0]
+    sources[name] = "changed shader"
+    monkeypatch.setattr(build, "_build_extension", _raise(RuntimeError("build failed")))
+
+    with pytest.raises(RuntimeError, match="build failed"):
+        build.build()
+    assert build.stale_artifacts() == [build.metallib_path(name)]
+
+
+def test_source_mode_jits_shaders_instead_of_loading_metallibs(monkeypatch):
+    import vllm_metal.metal as metal
+
+    ops = SimpleNamespace(nax_supported=lambda: False)
+    for kind in ("v2", "gdn", "mla"):
+        setattr(ops, f"init_{kind}_library", Mock())
+    monkeypatch.setenv("VLLM_METAL_BUILD_FROM_SOURCE", "1")
+    monkeypatch.setattr(metal, "_ops_module", None)
+    monkeypatch.setattr(metal, "_load_native_module", lambda: ops)
+    monkeypatch.setattr(metal, "_build_v2_paged_attention_source", lambda: "v2 source")
+    monkeypatch.setattr(metal, "_build_gdn_source", lambda: "gdn source")
+    monkeypatch.setattr(
+        metal, "_build_mla_paged_attention_source", lambda: "mla source"
+    )
+
+    assert metal.get_ops() is ops
+    for kind in ("v2", "gdn", "mla"):
+        getattr(ops, f"init_{kind}_library").assert_called_once_with(f"{kind} source")
 
 
 def test_get_ops_rejects_an_extension_built_against_another_mlx(tmp_path, monkeypatch):
