@@ -1,8 +1,8 @@
-name: CI
+name: DSpark combined source qualification
 
 on:
   push:
-    branches: [ main ]
+    branches: [ validation/dspark-integration-mlx0324-20261017 ]
   pull_request:
     branches: [ main ]
 
@@ -30,6 +30,7 @@ jobs:
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
       MACOSX_DEPLOYMENT_TARGET: "15.0"
+      PYTORCH_ENABLE_MPS_FALLBACK: "0"
     permissions:
       contents: read
     strategy:

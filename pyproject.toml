@@ -31,7 +31,7 @@ dependencies = [
     # libmlx.dylib carries no SONAME version (compatibility version 0.0.0), so
     # a wheel built against one MLX is only ABI-safe against that exact MLX.
     # Rebuild and re-release the wheel on every MLX bump.
-    "mlx==0.32.2; platform_system == 'Darwin' and platform_machine == 'arm64'",
+    "mlx==0.32.4; platform_system == 'Darwin' and platform_machine == 'arm64'",
     # Git SHA (2026-08-25), not a version: this revision requires MLX >=0.32.1
     # and includes cache APIs not available in the latest release (0.31.3).
     "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@9e6acca691e64d6d8bb808c328fcdea459099cca ; platform_system == 'Darwin' and platform_machine == 'arm64'",
