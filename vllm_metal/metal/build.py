@@ -155,9 +155,9 @@ def _metallib_source(name: str) -> str:
 
 
 def _metallib_digest(name: str, source: str) -> str:
-    """Content hash of a metallib: its assembled ``.metal`` source + the compile
-    flags. Editing any concatenated shader changes ``source`` and so the digest."""
+    """Hash the assembled Metal source, compile flags, and MLX build version."""
     h = hashlib.sha256()
+    h.update(f"mlx={_package_version('mlx')}\0".encode())
     h.update("\0".join(_metallib_flags(name)).encode())
     h.update(b"\0")
     h.update(source.encode())
@@ -255,8 +255,8 @@ def _read_strict(path: Path) -> str | None:
 
 def _metallib_is_current(name: str, source: str) -> bool:
     """Build-side skip gate: the library exists, its ``.sha256`` stamp matches
-    the assembled source + flags, and it was compiled by the current Metal
-    toolchain. Stricter than the runtime :func:`is_stale` on purpose: an
+    the source, flags, and MLX version, and it was compiled by the current
+    Metal toolchain. Stricter than the runtime :func:`is_stale` on purpose: an
     unreadable stamp or toolchain record means rebuild."""
     path = metallib_path(name)
     if not path.is_file():
