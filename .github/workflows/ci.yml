@@ -1,8 +1,8 @@
-name: CI
+name: MLX build configuration qualification
 
 on:
   push:
-    branches: [ main ]
+    branches: [ validation/pr1125-build-config-20261017 ]
   pull_request:
     branches: [ main ]
 
@@ -30,6 +30,7 @@ jobs:
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
       MACOSX_DEPLOYMENT_TARGET: "15.0"
+      PYTORCH_ENABLE_MPS_FALLBACK: "0"
     permissions:
       contents: read
     strategy:
@@ -114,6 +115,84 @@ jobs:
     - name: Test
       run: |
         scripts/test.sh
+
+    - name: Confirm the cache regression on the previous implementation
+      shell: bash
+      run: |
+        set -euo pipefail
+        source .venv-vllm-metal/bin/activate
+        cp vllm_metal/metal/build.py "$RUNNER_TEMP/build-config-after.py"
+        trap 'cp "$RUNNER_TEMP/build-config-after.py" vllm_metal/metal/build.py' EXIT
+        git show da9fb0018d6ef5922706cda3a9bfc12f950288b6:vllm_metal/metal/build.py > vllm_metal/metal/build.py
+        set +e
+        python -m pytest -q tests/test_metal_build_cache.py \
+          -k test_build_setting_change_rebuilds_binding_and_shaders \
+          --junitxml="$RUNNER_TEMP/build-config-before.xml"
+        result=$?
+        set -e
+        test "$result" -eq 1
+        python - <<'PY'
+        import os
+        import xml.etree.ElementTree as ET
+        root = ET.parse(os.path.join(os.environ["RUNNER_TEMP"], "build-config-before.xml"))
+        cases = list(root.iter("testcase"))
+        assert len(cases) == 3
+        for case in cases:
+            failure = case.find("failure")
+            assert failure is not None and case.find("error") is None
+            assert "assert False is True" in failure.text
+            assert "needs_rebuild" in failure.text
+        print("All three regression cases fail at the expected cache-hit assertion before the fix.")
+        PY
+
+    - name: Record native build provenance
+      shell: bash
+      run: |
+        set -euo pipefail
+        source .venv-vllm-metal/bin/activate
+        git diff --exit-code -- vllm_metal tests
+        xcodebuild -version > native-toolchain.txt
+        uv pip freeze > native-environment.txt
+        python - <<'PY'
+        import hashlib
+        import json
+        import platform
+        import subprocess
+        from importlib.metadata import version
+        from pathlib import Path
+        files = []
+        for directory, patterns in {
+            "vllm_metal/metal": ["*.metallib*", "_paged_ops*.so*", "_paged_ops.mlx-version"],
+            "vllm_metal/pytorch_backend": ["_mps_ops*.so*", "_mps_ops.torch-version"],
+        }.items():
+            files.extend(p for pattern in patterns for p in Path(directory).glob(pattern))
+        assert len([p for p in files if p.suffix == ".so"]) == 2
+        assert len([p for p in files if p.suffix == ".metallib"]) == 5
+        result = {
+            "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+            "candidate": "60a53ed",
+            "python": platform.python_version(),
+            "platform": platform.platform(),
+            "packages": {p: version(p) for p in ["mlx", "mlx-metal", "mlx-lm", "nanobind", "torch"]},
+            "sha256": {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in files},
+        }
+        Path("native-provenance.json").write_text(json.dumps(result, indent=2) + "\n")
+        PY
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: pr1125-build-config-native
+        retention-days: 7
+        if-no-files-found: error
+        path: |
+          vllm_metal/metal/*.metallib*
+          vllm_metal/metal/_paged_ops*.so*
+          vllm_metal/metal/_paged_ops.mlx-version
+          vllm_metal/pytorch_backend/_mps_ops*.so*
+          vllm_metal/pytorch_backend/_mps_ops.torch-version
+          native-provenance.json
+          native-toolchain.txt
+          native-environment.txt
 
     # Save only after a fully successful Test step: a build that failed midway
     # would leave an artifact missing, and an exact-key hit never re-saves, so
