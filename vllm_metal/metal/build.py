@@ -334,7 +334,7 @@ def _build_extension(sources: dict[str, str], build_dir: Path) -> None:
 
 
 def build_metallibs() -> list[Path]:
-    """Build the MLX launcher and shader libraries when their inputs change."""
+    """Build the MLX launcher and stale shader libraries."""
     names = METALLIB_NAMES
     if _sdk_supports_nax():
         names = (*names, NAX_METALLIB_NAME)
@@ -349,20 +349,34 @@ def build_metallibs() -> list[Path]:
         metallib_path(name): _metallib_digest(name, source)
         for name, source in sources.items()
     }
-    if not needs_rebuild() and all(
-        path.exists() and _stamp_path(path).exists() and not is_stale(path, digest)
-        for path, digest in digests.items()
-    ):
+    pending_sources = {
+        name: source
+        for name, source in sources.items()
+        if not _metallib_is_current(name, source)
+    }
+    if not pending_sources and not needs_rebuild():
         return list(digests)
+    if not pending_sources:
+        # MetalExtension requires a library even for C++-only changes.
+        pending_sources["rope_kern"] = sources["rope_kern"]
 
     expected_hash = _input_hash()
+    toolchain = _metal_toolchain_id()
     logger.info("Building MLX native extension and Metal shader libraries ...")
-    # A changed host input gets a fresh CMake cache even if its mtime went back.
-    _build_extension(sources, _THIS_DIR / "build" / expected_hash)
+    if toolchain == "unavailable":
+        # Unknown toolchains must not reuse intermediate outputs.
+        with tempfile.TemporaryDirectory(prefix="vllm-metal-mlx-build-") as tmp:
+            _build_extension(pending_sources, Path(tmp))
+    else:
+        _build_extension(
+            pending_sources, _THIS_DIR / "build" / toolchain / expected_hash
+        )
     _HASH.write_text(expected_hash)
     _MLX_VERSION.write_text(_package_version("mlx") + "\n")
-    for path, digest in digests.items():
-        _stamp_path(path).write_text(digest)
+    for name in pending_sources:
+        path = metallib_path(name)
+        _stamp_path(path).write_text(digests[path])
+        _toolchain_path(path).write_text(toolchain)
     return list(digests)
 
 
@@ -394,7 +408,7 @@ def needs_rebuild() -> bool:
     if _missing_sentinels():
         return True
     try:
-        return _HASH.read_text().strip() != _input_hash()
+        return _read_strict(_HASH) != _input_hash()
     except (OSError, ImportError, RuntimeError):
         return True
 

@@ -80,6 +80,12 @@ def test_needs_rebuild_when_hash_differs(patched):
     assert build.needs_rebuild() is True
 
 
+def test_needs_rebuild_when_hash_is_not_utf8(patched):
+    patched.out.write_bytes(b"compiled")
+    patched.hsh.write_bytes(b"\xff\xfe")
+    assert build.needs_rebuild() is True
+
+
 def test_no_rebuild_when_hash_matches(patched):
     patched.out.write_bytes(b"compiled")
     patched.hsh.write_text(build._input_hash())
@@ -369,13 +375,14 @@ def compiler(patched, monkeypatch, tmp_path):
 
     monkeypatch.setattr(build, "_THIS_DIR", tmp_path)
     monkeypatch.setattr(build, "_sdk_supports_nax", lambda: False)
+    monkeypatch.setattr(build, "_metal_toolchain_id", lambda: "tc-a")
     monkeypatch.setattr(build, "_metallib_source", sources.__getitem__)
     monkeypatch.setattr(build, "_build_extension", compile_artifacts)
     return sources, calls
 
 
 @pytest.mark.parametrize("nax_supported", [False, True])
-def test_build_entries_share_artifact_paths_and_cache(
+def test_build_entries_reuse_final_artifacts_without_cmake_cache(
     patched, compiler, monkeypatch, nax_supported
 ):
     _, calls = compiler
@@ -391,6 +398,7 @@ def test_build_entries_share_artifact_paths_and_cache(
     assert patched.hsh.read_text() == build._input_hash()
     assert build.stale_artifacts() == []
     assert build.needs_rebuild() is False
+    assert not calls[0].exists()
     assert build.build() == patched.out
     assert len(calls) == 1
 
@@ -413,6 +421,7 @@ def test_build_recompiles_edited_shader_sources(patched, compiler):
     sources[build.METALLIB_NAMES[0]] = "changed shader"
     build.build()
     assert len(calls) == 2
+    assert calls[0] == calls[1]
     assert build.stale_artifacts() == []
 
 
@@ -435,11 +444,13 @@ def test_failed_build_does_not_mark_changed_sources_current(
     build.build()
     name = build.METALLIB_NAMES[0]
     sources[name] = "changed shader"
+    monkeypatch.setattr(build, "_metal_toolchain_id", lambda: "tc-b")
     monkeypatch.setattr(build, "_build_extension", _raise(RuntimeError("build failed")))
 
     with pytest.raises(RuntimeError, match="build failed"):
         build.build()
     assert build.stale_artifacts() == [build.metallib_path(name)]
+    assert build._toolchain_path(build.metallib_path(name)).read_text() == "tc-a"
 
 
 @pytest.mark.parametrize("build_from_source", ["0", "1"])
@@ -491,10 +502,14 @@ _LIB = "rope_kern"
 
 
 @pytest.fixture
-def metallib_env(tmp_path, monkeypatch):
-    """Redirect metallibs into tmp_path, fake the toolchain, and record compiles
-    instead of invoking ``xcrun metal``."""
-    state = {"source": "// rope v1", "toolchain": "tc-a", "compiled": []}
+def metallib_env(patched, tmp_path, monkeypatch):
+    """Record MetalExtension builds; CMake owns per-file incremental work."""
+    state = {
+        "source": "// rope v1",
+        "toolchain": "tc-a",
+        "compiled": [],
+        "build_dirs": [],
+    }
 
     monkeypatch.setattr(build, "_THIS_DIR", tmp_path)
     monkeypatch.setattr(build, "METALLIB_NAMES", (_LIB,))
@@ -503,12 +518,14 @@ def metallib_env(tmp_path, monkeypatch):
     monkeypatch.setattr(build, "_metallib_source", lambda name: state["source"])
     monkeypatch.setattr(build, "_metal_toolchain_id", lambda: state["toolchain"])
 
-    def fake_run(cmd, what):
-        out = Path(cmd[cmd.index("-o") + 1])
-        state["compiled"].append(out.stem)
-        out.write_bytes(b"metallib")
+    def fake_build(sources, build_dir):
+        state["build_dirs"].append(build_dir)
+        patched.out.write_bytes(b"compiled")
+        for name in sources:
+            state["compiled"].append(name)
+            build.metallib_path(name).write_bytes(b"metallib")
 
-    monkeypatch.setattr(build, "_run_or_raise", fake_run)
+    monkeypatch.setattr(build, "_build_extension", fake_build)
     return state
 
 
@@ -530,6 +547,54 @@ def test_metallib_hit_skips_compile(metallib_env):
     assert metallib_env["compiled"] == []
 
 
+@pytest.mark.parametrize("name", [_LIB, "nax_fake"])
+@pytest.mark.parametrize("host_changed", [False, True])
+def test_metallib_partial_hit_preserves_cached_library(
+    patched, metallib_env, monkeypatch, name, host_changed
+):
+    build.build_metallibs()
+    metallib_env["compiled"].clear()
+    cached_name = "nax_fake" if name == _LIB else _LIB
+    cached = build.metallib_path(cached_name)
+    cached.write_bytes(b"restored metallib")
+    monkeypatch.setattr(
+        build,
+        "_metallib_source",
+        lambda n: "changed shader" if n == name else metallib_env["source"],
+    )
+    if host_changed:
+        patched.src.write_bytes(b"// source v2")
+
+    assert build.build_metallibs() == [
+        build.metallib_path(_LIB),
+        build.metallib_path("nax_fake"),
+    ]
+    assert metallib_env["compiled"] == [name]
+    assert cached.read_bytes() == b"restored metallib"
+    assert build.needs_rebuild() is False
+    assert build._metallib_is_current(name, "changed shader")
+
+
+@pytest.mark.parametrize("host_changed", ["source", "missing_artifact"])
+def test_host_only_rebuild_includes_only_rope(patched, metallib_env, host_changed):
+    build.build_metallibs()
+    metallib_env["compiled"].clear()
+    cached = build.metallib_path("nax_fake")
+    cached.write_bytes(b"restored metallib")
+    if host_changed == "source":
+        patched.src.write_bytes(b"// source v2")
+    else:
+        patched.out.unlink()
+
+    assert build.build() == patched.out
+    assert metallib_env["compiled"] == [_LIB]
+    assert cached.read_bytes() == b"restored metallib"
+    assert build.needs_rebuild() is False
+    metallib_env["compiled"].clear()
+    build.build()
+    assert metallib_env["compiled"] == []
+
+
 def test_metallib_source_change_rebuilds(metallib_env):
     build.build_metallibs()
     metallib_env["compiled"].clear()
@@ -544,6 +609,10 @@ def test_metallib_toolchain_change_rebuilds(metallib_env):
     metallib_env["toolchain"] = "tc-b"
     build.build_metallibs()
     assert set(metallib_env["compiled"]) == {_LIB, "nax_fake"}
+    old_dir, new_dir = metallib_env["build_dirs"]
+    assert old_dir.parent.name == "tc-a"
+    assert new_dir.parent.name == "tc-b"
+    assert old_dir.name == new_dir.name == build._input_hash()
 
 
 @pytest.mark.parametrize(
@@ -559,6 +628,8 @@ def test_metallib_missing_file_rebuilds(metallib_env, tmp_path, remove):
     build.build_metallibs()
     metallib_env["compiled"].clear()
     remove(_lib(tmp_path)).unlink()
+    assert build._metallib_is_current(_LIB, metallib_env["source"]) is False
+    assert build._metallib_is_current("nax_fake", metallib_env["source"]) is True
     build.build_metallibs()
     assert metallib_env["compiled"] == [_LIB]
 
@@ -588,6 +659,10 @@ def test_metallib_unavailable_toolchain_never_skips(metallib_env):
     metallib_env["toolchain"] = "unavailable"
     build.build_metallibs()
     assert set(metallib_env["compiled"]) == {_LIB, "nax_fake"}
+    first_dir = metallib_env["build_dirs"][-1]
+    build.build_metallibs()
+    assert metallib_env["build_dirs"][-1] != first_dir
+    assert not first_dir.exists()
 
 
 def test_runtime_staleness_does_not_query_toolchain(monkeypatch, tmp_path):
