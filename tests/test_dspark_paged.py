@@ -527,8 +527,9 @@ def test_window_gather_reads_pooled_pages_past_32_bit_offsets():
 
     block_size, head_dim, stride = 16, 64, 1 << 16
     blocks = (1 << 15) + 2
-    # Only the two written pages are resident, as in upstream KV allocation.
-    backing = torch.empty((blocks, stride), dtype=torch.float16)
+    # Byte storage crosses the same INT32_MAX element offset without requiring
+    # a >4 GiB shared buffer. Only the two written pages are resident.
+    backing = torch.empty((blocks, stride), dtype=torch.uint8)
     cache = get_ops().as_strided(
         torch_to_mlx(backing),
         (blocks, block_size, 1, head_dim),
