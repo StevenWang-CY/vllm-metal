@@ -621,6 +621,33 @@ def test_mlx_version_change_rebuilds_all_metallibs(patched, metallib_env):
     assert metallib_env["compiled"] == []
 
 
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("DEBUG", "1"),
+        ("CMAKE_ARGS", "-DCMAKE_CXX_FLAGS=-g"),
+        ("ARCHFLAGS", "-arch arm64"),
+    ],
+)
+def test_build_setting_change_rebuilds_binding_and_shaders(
+    patched, metallib_env, monkeypatch, name, value
+):
+    monkeypatch.delenv(name, raising=False)
+    build.build_metallibs()
+    first_dir = metallib_env["build_dirs"][-1]
+    metallib_env["compiled"].clear()
+    monkeypatch.setenv(name, value)
+
+    assert build.needs_rebuild() is True
+    build.build_metallibs()
+    assert set(metallib_env["compiled"]) == {_LIB, "nax_fake"}
+    assert metallib_env["build_dirs"][-1] != first_dir
+    assert build.needs_rebuild() is False
+    metallib_env["compiled"].clear()
+    build.build_metallibs()
+    assert metallib_env["compiled"] == []
+
+
 def test_metallib_toolchain_change_rebuilds(metallib_env):
     build.build_metallibs()
     metallib_env["compiled"].clear()

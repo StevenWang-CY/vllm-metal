@@ -25,6 +25,8 @@ required `.metallib` libraries, plus optional NAX support. With
 `mlx.extension.MetalExtension`, then loads the generated `.metallib` files.
 Packaging uses the same build via `python -m vllm_metal.metal.build`.
 Source builds require the `build` extra and the Xcode Metal toolchain.
+Changing `DEBUG`, `CMAKE_ARGS`, or `ARCHFLAGS` rebuilds both the native binding
+and shader libraries.
 
 | Library | Source builder | Concatenated sources (in order) |
 |---------|----------------|----------------------------------|

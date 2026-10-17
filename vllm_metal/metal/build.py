@@ -154,9 +154,17 @@ def _metallib_source(name: str) -> str:
     return builders[name]()
 
 
-def _metallib_digest(name: str, source: str) -> str:
-    """Hash the assembled Metal source, compile flags, and MLX build version."""
+def _build_config_fingerprint() -> bytes:
+    """MLX compiler overrides shared by binding and shader cache keys."""
     h = hashlib.sha256()
+    for name, default in (("DEBUG", "0"), ("CMAKE_ARGS", ""), ("ARCHFLAGS", "")):
+        h.update(f"{name}={os.environ.get(name, default)}\0".encode())
+    return h.digest()
+
+
+def _metallib_digest(name: str, source: str) -> str:
+    """Hash the shader source, compile settings, and MLX build version."""
+    h = hashlib.sha256(_build_config_fingerprint())
     h.update(f"mlx={_package_version('mlx')}\0".encode())
     h.update("\0".join(_metallib_flags(name)).encode())
     h.update(b"\0")
@@ -387,7 +395,7 @@ def _package_version(name: str) -> str:
 
 
 def _input_hash() -> str:
-    h = hashlib.sha256()
+    h = hashlib.sha256(_build_config_fingerprint())
     # Paths are excluded so moving an environment does not invalidate artifacts.
     for name in ("mlx", "nanobind"):
         h.update(f"{name}={_package_version(name)}\0".encode())
