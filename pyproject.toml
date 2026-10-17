@@ -54,8 +54,6 @@ dependencies = [
     "huggingface_hub>=1.31.0",
     # Native Metal extension source builds
     "nanobind==3.1.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
-    "cmake>=3.25; platform_system == 'Darwin' and platform_machine == 'arm64'",
-    "setuptools>=77; platform_system == 'Darwin' and platform_machine == 'arm64'",
     # Core utilities
     "numpy>=1.24.0",
     "psutil>=5.9.0",
@@ -70,6 +68,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+build = [
+    "cmake>=3.25; platform_system == 'Darwin' and platform_machine == 'arm64'",
+    "setuptools>=77; platform_system == 'Darwin' and platform_machine == 'arm64'",
+]
 gguf = [
     # Local GGUF model loading. Keep aligned with upstream vLLM's lower bound
     # unless a Metal-specific path needs a newer API.
@@ -81,6 +83,7 @@ stt = [
     "numba>=0.59.0",  # Required by librosa on Python 3.12+
 ]
 dev = [
+    "vllm-metal[build]",
     "pytest>=9.0.2",
     "pytest-asyncio>=0.21.0",
     "ruff==0.16.0",

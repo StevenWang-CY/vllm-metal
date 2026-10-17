@@ -8,7 +8,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -442,24 +442,32 @@ def test_failed_build_does_not_mark_changed_sources_current(
     assert build.stale_artifacts() == [build.metallib_path(name)]
 
 
-def test_source_mode_jits_shaders_instead_of_loading_metallibs(monkeypatch):
+@pytest.mark.parametrize("build_from_source", ["0", "1"])
+def test_source_and_wheel_modes_load_metallibs(
+    tmp_path, monkeypatch, build_from_source
+):
     import vllm_metal.metal as metal
 
-    ops = SimpleNamespace(nax_supported=lambda: False)
-    for kind in ("v2", "gdn", "mla"):
-        setattr(ops, f"init_{kind}_library", Mock())
-    monkeypatch.setenv("VLLM_METAL_BUILD_FROM_SOURCE", "1")
+    ops = SimpleNamespace(
+        nax_supported=lambda: True,
+        init_library_path=Mock(),
+        init_nax_library_path=Mock(),
+    )
+    monkeypatch.setenv("VLLM_METAL_BUILD_FROM_SOURCE", build_from_source)
+    monkeypatch.delenv("VLLM_METAL_DISABLE_NAX", raising=False)
     monkeypatch.setattr(metal, "_ops_module", None)
     monkeypatch.setattr(metal, "_load_native_module", lambda: ops)
-    monkeypatch.setattr(metal, "_build_v2_paged_attention_source", lambda: "v2 source")
-    monkeypatch.setattr(metal, "_build_gdn_source", lambda: "gdn source")
-    monkeypatch.setattr(
-        metal, "_build_mla_paged_attention_source", lambda: "mla source"
-    )
+    monkeypatch.setattr(build, "_THIS_DIR", tmp_path)
+    for name in (*build.METALLIB_NAMES, build.NAX_METALLIB_NAME):
+        build.metallib_path(name).write_bytes(b"metallib")
 
     assert metal.get_ops() is ops
-    for kind in ("v2", "gdn", "mla"):
-        getattr(ops, f"init_{kind}_library").assert_called_once_with(f"{kind} source")
+    assert ops.init_library_path.call_args_list == [
+        call(name, str(build.metallib_path(name))) for name in build.METALLIB_NAMES
+    ]
+    ops.init_nax_library_path.assert_called_once_with(
+        str(build.metallib_path(build.NAX_METALLIB_NAME))
+    )
 
 
 def test_get_ops_rejects_an_extension_built_against_another_mlx(tmp_path, monkeypatch):
