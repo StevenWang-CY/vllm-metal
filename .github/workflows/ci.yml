@@ -121,9 +121,12 @@ jobs:
       run: |
         set -euo pipefail
         source .venv-vllm-metal/bin/activate
+        git fetch --no-tags --depth=1 origin da9fb0018d6ef5922706cda3a9bfc12f950288b6
+        git show da9fb0018d6ef5922706cda3a9bfc12f950288b6:vllm_metal/metal/build.py > "$RUNNER_TEMP/build-config-before.py"
+        echo "c631bc708defd4a00bc8f43ba37b88f0b409f697cf447e80129f07e07bf90f04  $RUNNER_TEMP/build-config-before.py" | shasum -a 256 -c -
         cp vllm_metal/metal/build.py "$RUNNER_TEMP/build-config-after.py"
         trap 'cp "$RUNNER_TEMP/build-config-after.py" vllm_metal/metal/build.py' EXIT
-        git show da9fb0018d6ef5922706cda3a9bfc12f950288b6:vllm_metal/metal/build.py > vllm_metal/metal/build.py
+        cp "$RUNNER_TEMP/build-config-before.py" vllm_metal/metal/build.py
         set +e
         python -m pytest -q tests/test_metal_build_cache.py \
           -k test_build_setting_change_rebuilds_binding_and_shaders \
