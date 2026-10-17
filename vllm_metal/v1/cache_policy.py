@@ -1056,14 +1056,20 @@ class WorkerCachePlanner:
         self._worker.model_runner.validate_paged_attention_support()
         plan = self._paged_attention_plan(overhead=overhead)
         self._validate_paged_attention_plan(plan, require_min_blocks=True)
+        num_blocks = plan.num_blocks
+        override = self._worker.vllm_config.cache_config.num_gpu_blocks_override
+        if override is not None:
+            if override <= 0:
+                raise ValueError("--num-gpu-blocks-override must be positive")
+            num_blocks = min(num_blocks, override)
         logger.info(
             "Paged attention memory breakdown: "
             "%s, per_block_bytes=%d, "
             "num_blocks=%d, max_tokens_cached=%d",
             plan.format_breakdown(),
             plan.per_block_bytes,
-            plan.num_blocks,
-            plan.num_blocks * plan.block_size,
+            num_blocks,
+            num_blocks * plan.block_size,
         )
 
         backend = self._worker.model_runner.build_paged_attention_runtime(
@@ -1080,14 +1086,14 @@ class WorkerCachePlanner:
                 f"and MLA runtimes; {type(backend).__name__} sizes its cache "
                 "from vLLM's KV cache config"
             )
-        backend.initialize(plan.num_blocks)
+        backend.initialize(num_blocks)
         self._worker.model_runner.install_gemma4_mtp_kv_sharing(
             backend,
             block_size=plan.block_size,
         )
         n_patched = backend.patch_model(self._worker.model_runner.model)
         self._worker.model_runner.install_drafter(
-            num_blocks=plan.num_blocks,
+            num_blocks=num_blocks,
             block_size=plan.block_size,
         )
         config = get_config()
@@ -1101,7 +1107,7 @@ class WorkerCachePlanner:
             "Paged attention enabled: %d layers patched, "
             "%d blocks allocated (block_size=%d, mla=%s, turboquant=%s, k_quant=%s)",
             n_patched,
-            plan.num_blocks,
+            num_blocks,
             plan.block_size,
             self._worker.model_runner.is_mla,
             config.turboquant,

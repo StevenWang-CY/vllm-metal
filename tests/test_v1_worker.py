@@ -28,6 +28,8 @@ from vllm.v1.kv_cache_interface import (  # noqa: E402
 from tests.stub_runner import make_stub_runner  # noqa: E402
 from vllm_metal.attention.caches.placement import KV_CACHE_LAYOUT  # noqa: E402
 from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
+from vllm_metal.attention.runtime.mla import MLAPagedAttentionRuntime
+from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
 from vllm_metal.config import MetalConfig
 from vllm_metal.stt.policy import STT_SCHED_AVAILABLE_BYTES  # noqa: E402
 from vllm_metal.utils import CommitProbe  # noqa: E402
@@ -674,6 +676,58 @@ class TestPagedAttentionPlanDiagnostics:
         fraction = WorkerCachePlanner(worker)._memory_fraction()
 
         assert fraction == gpu_mem_util
+
+    @pytest.mark.parametrize(
+        "runtime_type", [SDPAPagedAttentionRuntime, MLAPagedAttentionRuntime]
+    )
+    @pytest.mark.parametrize(
+        ("override", "expected_blocks"), [(None, 64), (7, 7), (128, 64), (0, None)]
+    )
+    def test_capacity_path_caps_target_and_draft_allocations(
+        self, monkeypatch, runtime_type, override, expected_blocks
+    ) -> None:
+        backend = MagicMock(spec=runtime_type)
+        backend.patch_model.return_value = 1
+        runner = SimpleNamespace(
+            validate_paged_attention_support=lambda: None,
+            build_paged_attention_runtime=MagicMock(return_value=backend),
+            install_gemma4_mtp_kv_sharing=MagicMock(),
+            install_drafter=MagicMock(),
+            install_paged_attention_runtime=MagicMock(),
+            model=object(),
+            model_args={},
+            is_mla=runtime_type is MLAPagedAttentionRuntime,
+        )
+        worker = _make_worker(runner)
+        worker.cache_config.num_gpu_blocks_override = override
+        planner = WorkerCachePlanner(worker)
+        plan = SimpleNamespace(
+            block_size=16,
+            num_blocks=64,
+            per_block_bytes=1,
+            format_breakdown=lambda: "stub",
+        )
+        monkeypatch.setattr(planner, "_paged_attention_plan", lambda **_: plan)
+        monkeypatch.setattr(
+            planner, "_validate_paged_attention_plan", lambda *a, **k: None
+        )
+        monkeypatch.setattr(
+            "vllm_metal.v1.cache_policy.try_enable_gemma4_yoco_fast_prefill",
+            lambda *a, **k: None,
+        )
+
+        if expected_blocks is None:
+            with pytest.raises(ValueError, match="num-gpu-blocks-override"):
+                planner.setup_paged_attention(overhead=0)
+            backend.initialize.assert_not_called()
+            return
+
+        planner.setup_paged_attention(overhead=0)
+
+        backend.initialize.assert_called_once_with(expected_blocks)
+        runner.install_drafter.assert_called_once_with(
+            num_blocks=expected_blocks, block_size=16
+        )
 
 
 class TestHybridPlanGuard:
