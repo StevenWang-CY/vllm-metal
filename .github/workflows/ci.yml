@@ -1,8 +1,8 @@
-name: CI
+name: Upstream native build qualification
 
 on:
   push:
-    branches: [ main ]
+    branches: [ validation/pr1125-upstream-build-20261018 ]
   pull_request:
     branches: [ main ]
 
@@ -30,6 +30,7 @@ jobs:
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
       MACOSX_DEPLOYMENT_TARGET: "15.0"
+      PYTORCH_ENABLE_MPS_FALLBACK: "0"
     permissions:
       contents: read
     strategy:
@@ -117,6 +118,92 @@ jobs:
     - name: Test
       run: |
         scripts/test.sh
+
+    - name: Verify runtime loading after changing build settings
+      shell: bash
+      run: |
+        set -euo pipefail
+        source .venv-vllm-metal/bin/activate
+        DEBUG=1 python -m vllm_metal.metal.build 2>&1 | tee native-debug-build.log
+        env -u DEBUG VLLM_METAL_BUILD_FROM_SOURCE=0 python - <<'PYCONTROL'
+        import json
+        from pathlib import Path
+        from vllm_metal.metal import get_ops
+        from vllm_metal.metal import build
+        assert build.needs_rebuild()
+        assert build.stale_artifacts() == []
+        extension = get_ops()
+        names = (*build.METALLIB_NAMES, build.NAX_METALLIB_NAME)
+        libraries = [str(build.prepare_metallib(name)) for name in names]
+        result = {"debug_build_runtime_without_debug": True,
+                  "source_rebuild_required": True,
+                  "extension": extension.__file__, "libraries": libraries}
+        Path("native-runtime-build-config.json").write_text(json.dumps(result, indent=2) + "\n")
+        PYCONTROL
+        env -u DEBUG python -m vllm_metal.metal.build 2>&1 | tee native-release-build.log
+        env -u DEBUG python - <<'PYCONTROL'
+        import json
+        from pathlib import Path
+        from vllm_metal.metal import build
+        assert not build.needs_rebuild()
+        assert build.stale_artifacts() == []
+        path = Path("native-runtime-build-config.json")
+        result = json.loads(path.read_text())
+        result["release_build_current"] = True
+        path.write_text(json.dumps(result, indent=2) + "\n")
+        PYCONTROL
+
+    - name: Record native build provenance
+      shell: bash
+      run: |
+        set -euo pipefail
+        source .venv-vllm-metal/bin/activate
+        git diff --exit-code -- vllm_metal tests
+        xcodebuild -version > native-toolchain.txt
+        uv pip freeze > native-environment.txt
+        python - <<'PY'
+        import hashlib
+        import json
+        import platform
+        import subprocess
+        from importlib.metadata import version
+        from pathlib import Path
+        files = []
+        for directory, patterns in {
+            "vllm_metal/metal": ["*.metallib*", "_paged_ops*.so*", "_paged_ops.mlx-version"],
+            "vllm_metal/pytorch_backend": ["_mps_ops*.so*", "_mps_ops.torch-version"],
+        }.items():
+            files.extend(p for pattern in patterns for p in Path(directory).glob(pattern))
+        assert len([p for p in files if p.suffix == ".so"]) == 2
+        assert len([p for p in files if p.suffix == ".metallib"]) == 5
+        result = {
+            "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+            "candidate": "918b49481bed2fcc56e7068395b847331b525bed",
+            "python": platform.python_version(),
+            "platform": platform.platform(),
+            "packages": {p: version(p) for p in ["mlx", "mlx-metal", "mlx-lm", "nanobind", "torch"]},
+            "sha256": {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in files},
+        }
+        Path("native-provenance.json").write_text(json.dumps(result, indent=2) + "\n")
+        PY
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: pr1125-upstream-native
+        retention-days: 7
+        if-no-files-found: error
+        path: |
+          vllm_metal/metal/*.metallib*
+          vllm_metal/metal/_paged_ops*.so*
+          vllm_metal/metal/_paged_ops.mlx-version
+          vllm_metal/pytorch_backend/_mps_ops*.so*
+          vllm_metal/pytorch_backend/_mps_ops.torch-version
+          native-provenance.json
+          native-toolchain.txt
+          native-environment.txt
+          native-runtime-build-config.json
+          native-debug-build.log
+          native-release-build.log
 
     # Save only after a fully successful Test step: a build that failed midway
     # would leave an artifact missing, and an exact-key hit never re-saves, so
