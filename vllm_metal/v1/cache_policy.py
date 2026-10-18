@@ -1061,7 +1061,13 @@ class WorkerCachePlanner:
         if override is not None:
             if override <= 0:
                 raise ValueError("--num-gpu-blocks-override must be positive")
-            num_blocks = min(num_blocks, override)
+            if override > num_blocks:
+                raise ValueError(
+                    f"--num-gpu-blocks-override={override} exceeds the planned "
+                    f"Metal cache capacity of {num_blocks} blocks. "
+                    "Lower or remove the override."
+                )
+            num_blocks = override
         logger.info(
             "Paged attention memory breakdown: "
             "%s, per_block_bytes=%d, "

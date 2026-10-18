@@ -15,8 +15,12 @@ import torch
 pytest.importorskip("vllm", reason="vllm not installed")
 
 import vllm.v1.worker.worker_base as worker_base  # noqa: E402
-from vllm.config import CacheConfig, VllmConfig  # noqa: E402
+from vllm.config import AttentionConfig, CacheConfig, VllmConfig  # noqa: E402
 from vllm.v1.attention.backends.utils import resolve_kv_cache_layout  # noqa: E402
+from vllm.v1.core.kv_cache_utils import (  # noqa: E402
+    get_kv_cache_config_from_groups,
+    get_kv_cache_groups,
+)
 from vllm.v1.executor.abstract import UniProcExecutor  # noqa: E402
 from vllm.v1.kv_cache_interface import (  # noqa: E402
     FullAttentionSpec,
@@ -25,7 +29,7 @@ from vllm.v1.kv_cache_interface import (  # noqa: E402
     SlidingWindowSpec,
 )
 
-from tests.stub_runner import make_stub_runner  # noqa: E402
+from tests.stub_runner import make_cache_config, make_stub_runner  # noqa: E402
 from vllm_metal.attention.caches.placement import KV_CACHE_LAYOUT  # noqa: E402
 from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
 from vllm_metal.attention.runtime.mla import MLAPagedAttentionRuntime
@@ -41,6 +45,10 @@ from vllm_metal.v1.cache_policy import (  # noqa: E402
     WorkerCachePlanner,
     kv_pool_bytes_after_probe,
     kv_swap_tolerance_bytes,
+)
+from vllm_metal.v1.draft_model_proposer import (  # noqa: E402
+    DraftDims,
+    DraftModelProposer,
 )
 from vllm_metal.v1.kv_offload.connector import (  # noqa: E402
     MetalOffloadingConnector,
@@ -681,53 +689,94 @@ class TestPagedAttentionPlanDiagnostics:
         "runtime_type", [SDPAPagedAttentionRuntime, MLAPagedAttentionRuntime]
     )
     @pytest.mark.parametrize(
-        ("override", "expected_blocks"), [(None, 64), (7, 7), (128, 64), (0, None)]
+        ("override", "expected_blocks"),
+        [(None, 64), (7, 7), (64, 64), (65, None), (0, None), (-1, None)],
     )
-    def test_capacity_path_caps_target_and_draft_allocations(
+    def test_capacity_override_through_engine_initialization(
         self, monkeypatch, runtime_type, override, expected_blocks
     ) -> None:
-        backend = MagicMock(spec=runtime_type)
-        backend.patch_model.return_value = 1
-        runner = SimpleNamespace(
-            validate_paged_attention_support=lambda: None,
-            build_paged_attention_runtime=MagicMock(return_value=backend),
-            install_gemma4_mtp_kv_sharing=MagicMock(),
-            install_drafter=MagicMock(),
-            install_paged_attention_runtime=MagicMock(),
-            model=object(),
-            model_args={},
-            is_mla=runtime_type is MLAPagedAttentionRuntime,
+        is_mla = runtime_type is MLAPagedAttentionRuntime
+        runner = make_stub_runner(
+            model=SimpleNamespace(),
+            model_args={"kv_lora_rank": 32, "qk_rope_head_dim": 32} if is_mla else {},
+            num_layers=1,
+            num_kv_cache_layers=1,
+            num_kv_heads=1,
+            head_dim=64,
+            kv_cache_dtype=mx.bfloat16,
+            cache_config=make_cache_config(
+                block_size=16,
+                gpu_memory_utilization=0.5,
+                num_gpu_blocks_override=override,
+            ),
+            profile_run=lambda: 0,
         )
+        config = runner.vllm_config
+        config.attention_config = AttentionConfig()
+        config.scheduler_config = SimpleNamespace(disable_hybrid_kv_cache_manager=False)
+        config.model_config.is_deepseek_v4 = False
+        config.model_config.max_model_len = 64
+        config.kv_transfer_config = None
+        if not is_mla:
+            # Ordinary draft-model speculation still uses count-based SDPA pools.
+            config.speculative_config = SimpleNamespace(
+                method="draft_model", uses_draft_model=lambda: True
+            )
+            runner._draft_dims = DraftDims(1, 1, 64)
+            drafter = DraftModelProposer(
+                model=SimpleNamespace(),
+                block_size=16,
+                max_model_len=runner.model_config.max_model_len,
+                num_layers=1,
+                controller=runner._spec_decode_controller,
+                extract_logits=lambda output: output,
+            )
+            drafter._dims = runner._draft_dims
+            runner._drafter = drafter
+
+        # Only model patching and host observations are stubbed; both target and
+        # draft pools allocate real arrays, and vLLM plans their scheduler groups.
+        def patch_model(backend, model):
+            model.backend = backend
+            return 1
+
+        monkeypatch.setattr(runtime_type, "patch_model", patch_model)
         worker = _make_worker(runner)
-        worker.cache_config.num_gpu_blocks_override = override
-        planner = WorkerCachePlanner(worker)
-        plan = SimpleNamespace(
-            block_size=16,
-            num_blocks=64,
-            per_block_bytes=1,
-            format_breakdown=lambda: "stub",
-        )
-        monkeypatch.setattr(planner, "_paged_attention_plan", lambda **_: plan)
+        worker.vllm_config = config
+        worker.cache_config = config.cache_config
+        per_block_bytes = worker.get_cache_block_size_bytes()
+        monkeypatch.setenv("VLLM_METAL_KV_COMMIT_PROBE", "0")
         monkeypatch.setattr(
-            planner, "_validate_paged_attention_plan", lambda *a, **k: None
+            WorkerCachePlanner, "_metal_limit_bytes", lambda self: 128 * per_block_bytes
         )
         monkeypatch.setattr(
-            "vllm_metal.v1.cache_policy.try_enable_gemma4_yoco_fast_prefill",
-            lambda *a, **k: None,
+            WorkerCachePlanner, "get_model_memory_usage", lambda self: 0
         )
+        build_runtime = MagicMock(wraps=runner.build_paged_attention_runtime)
+        monkeypatch.setattr(runner, "build_paged_attention_runtime", build_runtime)
 
         if expected_blocks is None:
             with pytest.raises(ValueError, match="num-gpu-blocks-override"):
-                planner.setup_paged_attention(overhead=0)
-            backend.initialize.assert_not_called()
+                worker.determine_available_memory()
+            build_runtime.assert_not_called()
+            assert runner.paged_attention_runtime is None
+            if not is_mla:
+                assert not hasattr(drafter._model, "backend")
             return
 
-        planner.setup_paged_attention(overhead=0)
+        available_memory = worker.determine_available_memory()
+        groups = get_kv_cache_groups(config, worker.get_kv_cache_spec())
+        kv_config = get_kv_cache_config_from_groups(config, groups, available_memory)
+        worker.initialize_from_config(kv_config)
 
-        backend.initialize.assert_called_once_with(expected_blocks)
-        runner.install_drafter.assert_called_once_with(
-            num_blocks=expected_blocks, block_size=16
-        )
+        assert available_memory == expected_blocks * per_block_bytes
+        assert kv_config.num_blocks == expected_blocks
+        assert isinstance(runner.paged_attention_runtime, runtime_type)
+        assert runner.paged_attention_runtime.num_blocks() == expected_blocks
+        if not is_mla:
+            assert drafter._model.backend.num_blocks() == expected_blocks
+            draft_group = kv_config.kv_cache_groups[drafter._scheduler_group_index]
+            assert "draft_layers.0.self_attn" in draft_group.layer_names
 
 
 class TestHybridPlanGuard:
