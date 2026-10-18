@@ -73,6 +73,7 @@ jobs:
         # Artifacts travel with their .sha256 stamps (digests of build
         # inputs, not checksums of the artifacts); the build recompiles
         # anything whose stamp no longer matches the current sources.
+        # Build-only .build-config records also reject mismatched MLX settings.
         # Compiler/SDK compatibility relies on two layers: the toolchain
         # fingerprint in this key (metal/clang/SDK/Python versions, Xcode
         # pin, deployment target, mlx/nanobind pins) and, for metallibs
@@ -91,8 +92,10 @@ jobs:
           vllm_metal/metal/*.metallib
           vllm_metal/metal/*.metallib.sha256
           vllm_metal/metal/*.metallib.toolchain
+          vllm_metal/metal/*.metallib.build-config
           vllm_metal/metal/_paged_ops*.so
           vllm_metal/metal/_paged_ops*.so.sha256
+          vllm_metal/metal/_paged_ops*.so.build-config
           vllm_metal/metal/_paged_ops.mlx-version
           vllm_metal/pytorch_backend/_mps_ops*.so
           vllm_metal/pytorch_backend/_mps_ops*.so.sha256
@@ -128,8 +131,10 @@ jobs:
           vllm_metal/metal/*.metallib
           vllm_metal/metal/*.metallib.sha256
           vllm_metal/metal/*.metallib.toolchain
+          vllm_metal/metal/*.metallib.build-config
           vllm_metal/metal/_paged_ops*.so
           vllm_metal/metal/_paged_ops*.so.sha256
+          vllm_metal/metal/_paged_ops*.so.build-config
           vllm_metal/metal/_paged_ops.mlx-version
           vllm_metal/pytorch_backend/_mps_ops*.so
           vllm_metal/pytorch_backend/_mps_ops*.so.sha256

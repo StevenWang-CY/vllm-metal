@@ -90,6 +90,17 @@ def metallib_path(name: str) -> Path:
 # behaviourally identical to what users get today.
 MIN_MACOS_VERSION = "15.0"
 NAX_MIN_MACOS_VERSION = "26.2"
+# Build inputs consumed by MetalExtension, CMake, and the host compiler.
+_MLX_BUILD_ENV = (
+    "DEBUG",
+    "CMAKE_ARGS",
+    "ARCHFLAGS",
+    "CXX",
+    "CXXFLAGS",
+    "LDFLAGS",
+    "SDKROOT",
+    "DEVELOPER_DIR",
+)
 _METALLIB_BASE_FLAGS = ("xcrun", "-sdk", "macosx", "metal", "-fno-fast-math")
 _METALLIB_FLAGS = (
     *_METALLIB_BASE_FLAGS,
@@ -178,6 +189,8 @@ def _compile_metallib(name: str, source: str) -> Path:
     """Compile Metal *source* to ``<name>.metallib`` in the package dir and write
     its ``.sha256`` staleness stamp."""
     out = metallib_path(name)
+    # This compiler path does not use MetalExtension's configuration.
+    _build_config_path(out).unlink(missing_ok=True)
     tmp = tempfile.NamedTemporaryFile(
         mode="w", suffix=".metal", delete=False, dir=_THIS_DIR
     )
@@ -221,6 +234,18 @@ def _toolchain_path(artifact: Path) -> Path:
     return artifact.with_suffix(artifact.suffix + ".toolchain")
 
 
+def _build_config_path(artifact: Path) -> Path:
+    """Build-only configuration record; runtime loading never reads it."""
+    return artifact.with_suffix(artifact.suffix + ".build-config")
+
+
+def _mlx_build_config() -> str:
+    h = hashlib.sha256()
+    for name in _MLX_BUILD_ENV:
+        h.update(f"{name}={os.environ.get(name)!r}\0".encode())
+    return h.hexdigest()
+
+
 @functools.lru_cache(maxsize=1)
 def _metal_toolchain_id() -> str:
     """Digest of ``xcrun metal --version`` + the SDK version. Build-time only.
@@ -255,13 +280,15 @@ def _read_strict(path: Path) -> str | None:
 
 def _metallib_is_current(name: str, source: str) -> bool:
     """Build-side skip gate: the library exists, its ``.sha256`` stamp matches
-    the source, flags, and MLX version, and it was compiled by the current
-    Metal toolchain. Stricter than the runtime :func:`is_stale` on purpose: an
-    unreadable stamp or toolchain record means rebuild."""
+    the source, flags, and MLX version, and its build configuration and Metal
+    toolchain match. Stricter than the runtime :func:`is_stale` on purpose:
+    an unreadable build record means rebuild."""
     path = metallib_path(name)
     if not path.is_file():
         return False
     if _read_strict(_stamp_path(path)) != _metallib_digest(name, source):
+        return False
+    if _read_strict(_build_config_path(path)) != _mlx_build_config():
         return False
     toolchain = _metal_toolchain_id()
     return (
@@ -361,7 +388,11 @@ def build_metallibs() -> list[Path]:
         pending_sources["rope_kern"] = sources["rope_kern"]
 
     expected_hash = _input_hash()
+    config = _mlx_build_config()
     toolchain = _metal_toolchain_id()
+    # Failed/partial builds must not retain an older configuration's cache hit.
+    for artifact in (_OUT, *(metallib_path(name) for name in pending_sources)):
+        _build_config_path(artifact).unlink(missing_ok=True)
     logger.info("Building MLX native extension and Metal shader libraries ...")
     if toolchain == "unavailable":
         # Unknown toolchains must not reuse intermediate outputs.
@@ -369,14 +400,16 @@ def build_metallibs() -> list[Path]:
             _build_extension(pending_sources, Path(tmp))
     else:
         _build_extension(
-            pending_sources, _THIS_DIR / "build" / toolchain / expected_hash
+            pending_sources, _THIS_DIR / "build" / toolchain / config / expected_hash
         )
     _HASH.write_text(expected_hash)
     _MLX_VERSION.write_text(_package_version("mlx") + "\n")
+    _build_config_path(_OUT).write_text(config)
     for name in pending_sources:
         path = metallib_path(name)
         _stamp_path(path).write_text(digests[path])
         _toolchain_path(path).write_text(toolchain)
+        _build_config_path(path).write_text(config)
     return list(digests)
 
 
@@ -408,7 +441,10 @@ def needs_rebuild() -> bool:
     if _missing_sentinels():
         return True
     try:
-        return _read_strict(_HASH) != _input_hash()
+        return (
+            _read_strict(_HASH) != _input_hash()
+            or _read_strict(_build_config_path(_OUT)) != _mlx_build_config()
+        )
     except (OSError, ImportError, RuntimeError):
         return True
 

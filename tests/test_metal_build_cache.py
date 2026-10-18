@@ -90,6 +90,7 @@ def test_needs_rebuild_when_hash_is_not_utf8(patched):
 def test_no_rebuild_when_hash_matches(patched):
     patched.out.write_bytes(b"compiled")
     patched.hsh.write_text(build._input_hash())
+    build._build_config_path(patched.out).write_text(build._mlx_build_config())
     assert build.needs_rebuild() is False
 
 
@@ -507,6 +508,38 @@ def test_get_ops_rejects_an_extension_built_against_another_mlx(tmp_path, monkey
 _LIB = "rope_kern"
 
 
+@pytest.mark.parametrize("fail", [False, True])
+def test_mlx_build_preserves_configuration_and_restores_target(
+    patched, tmp_path, monkeypatch, fail
+):
+    extension = pytest.importorskip("mlx.extension")
+    settings = {
+        "DEBUG": "1",
+        "CMAKE_ARGS": "-DCMAKE_BUILD_TYPE=Debug -DMLX_METAL_DEBUG=ON",
+        "ARCHFLAGS": "-arch x86_64",
+        "SDKROOT": "/other-sdk",
+    }
+    for name, value in settings.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("MACOSX_DEPLOYMENT_TARGET", raising=False)
+
+    def run(command):
+        assert command.debug is None
+        assert {name: os.environ[name] for name in settings} == settings
+        assert os.environ["MACOSX_DEPLOYMENT_TARGET"] == build.MIN_MACOS_VERSION
+        if fail:
+            raise RuntimeError("compiler failed")
+
+    monkeypatch.setattr(extension.BuildExtension, "run", run)
+    if fail:
+        with pytest.raises(RuntimeError, match="compiler failed"):
+            build._build_extension({_LIB: "// shader"}, tmp_path / "build")
+    else:
+        build._build_extension({_LIB: "// shader"}, tmp_path / "build")
+    assert {name: os.environ[name] for name in settings} == settings
+    assert "MACOSX_DEPLOYMENT_TARGET" not in os.environ
+
+
 @pytest.fixture
 def metallib_env(patched, tmp_path, monkeypatch):
     """Record MetalExtension builds; CMake owns per-file incremental work."""
@@ -544,13 +577,116 @@ def test_metallib_first_build_compiles_and_writes_sidecars(metallib_env, tmp_pat
     assert set(metallib_env["compiled"]) == {_LIB, "nax_fake"}
     assert build._stamp_path(_lib(tmp_path)).is_file()
     assert build._toolchain_path(_lib(tmp_path)).read_text() == "tc-a"
+    assert (
+        build._build_config_path(_lib(tmp_path)).read_text()
+        == build._mlx_build_config()
+    )
 
 
-def test_metallib_hit_skips_compile(metallib_env):
+def test_metallib_hit_skips_compile(metallib_env, monkeypatch):
     build.build_metallibs()
     metallib_env["compiled"].clear()
+    monkeypatch.setenv("CMAKE_BUILD_PARALLEL_LEVEL", "2")
+    monkeypatch.setenv("CMAKE_GENERATOR", "Ninja")
+    monkeypatch.setenv("CMAKE_GENERATOR_TOOLSET", "unused")
+    monkeypatch.setenv("CMAKE_GENERATOR_PLATFORM", "unused")
+    monkeypatch.setenv("CMAKE_GENERATOR_INSTANCE", "unused")
+    monkeypatch.setenv("CMAKE_TOOLCHAIN_FILE", "/unused-toolchain.cmake")
     build.build_metallibs()
     assert metallib_env["compiled"] == []
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("DEBUG", "1"),
+        ("CMAKE_ARGS", "-DMLX_METAL_DEBUG=ON"),
+        ("ARCHFLAGS", "-arch x86_64"),
+        ("CXX", "/other/clang++"),
+        ("CXXFLAGS", "-g"),
+        ("LDFLAGS", "-Wl,-dead_strip"),
+        ("SDKROOT", "/other-sdk"),
+        ("CMAKE_ARGS", "-DCMAKE_TOOLCHAIN_FILE=/other-toolchain.cmake"),
+    ],
+)
+def test_build_configuration_change_invalidates_all_artifacts(
+    patched, metallib_env, monkeypatch, name, value
+):
+    monkeypatch.delenv(name, raising=False)
+    build.build()
+    original_dir = metallib_env["build_dirs"][-1]
+    monkeypatch.setenv(name, value)
+    assert build.needs_rebuild() is True
+    assert build.stale_artifacts() == []
+    metallib_env["compiled"].clear()
+    build.build()
+    assert set(metallib_env["compiled"]) == {_LIB, "nax_fake"}
+    assert metallib_env["build_dirs"][-1] != original_dir
+    assert build.needs_rebuild() is False
+    metallib_env["compiled"].clear()
+    build.build()
+    assert metallib_env["compiled"] == []
+    monkeypatch.delenv(name)
+    build.build()
+    assert metallib_env["build_dirs"][-1] == original_dir
+
+
+def test_debug_artifacts_load_without_build_environment(patched, compiler, monkeypatch):
+    import vllm_metal.metal as metal
+
+    monkeypatch.setenv("DEBUG", "1")
+    monkeypatch.setenv("CMAKE_ARGS", "-DMLX_METAL_DEBUG=ON")
+    build.build()
+    monkeypatch.delenv("DEBUG")
+    monkeypatch.delenv("CMAKE_ARGS")
+    monkeypatch.delenv("VLLM_METAL_BUILD_FROM_SOURCE", raising=False)
+    monkeypatch.setattr(metal, "_ops_module", None)
+    monkeypatch.setattr(metal, "_native_module", None)
+    monkeypatch.setattr(
+        build, "_mlx_build_config", _raise(AssertionError("runtime read build config"))
+    )
+    monkeypatch.setattr(
+        build,
+        "_metal_toolchain_id",
+        _raise(AssertionError("runtime queried toolchain")),
+    )
+    ops = SimpleNamespace(nax_supported=lambda: False, init_library_path=Mock())
+    loader = SimpleNamespace(exec_module=Mock())
+    monkeypatch.setattr(
+        metal.importlib.util,
+        "spec_from_file_location",
+        lambda *args: SimpleNamespace(loader=loader),
+    )
+    monkeypatch.setattr(metal.importlib.util, "module_from_spec", lambda spec: ops)
+
+    assert metal.get_ops() is ops
+    assert ops.init_library_path.call_count == len(build.METALLIB_NAMES)
+    assert len(compiler[1]) == 1
+    for name in build.METALLIB_NAMES:
+        assert build.prepare_metallib(name) == build.metallib_path(name)
+
+
+def test_mps_shader_rebuild_invalidates_mlx_configuration(metallib_env, monkeypatch):
+    build.build()
+    monkeypatch.setattr(build, "_run_or_raise", lambda *args: None)
+    build.prepare_metallib(_LIB, build_from_source=True)
+    assert build.stale_artifacts() == []
+    assert not build._metallib_is_current(_LIB, metallib_env["source"])
+    metallib_env["compiled"].clear()
+    build.build()
+    assert metallib_env["compiled"] == [_LIB]
+
+
+def test_failed_build_invalidates_previous_configuration(metallib_env, monkeypatch):
+    monkeypatch.delenv("DEBUG", raising=False)
+    build.build()
+    monkeypatch.setenv("DEBUG", "1")
+    monkeypatch.setattr(build, "_build_extension", _raise(RuntimeError("build failed")))
+    with pytest.raises(RuntimeError, match="build failed"):
+        build.build()
+    monkeypatch.delenv("DEBUG")
+    assert build.needs_rebuild() is True
+    assert not build._metallib_is_current(_LIB, metallib_env["source"])
 
 
 @pytest.mark.parametrize("name", [_LIB, "nax_fake"])
@@ -581,7 +717,9 @@ def test_metallib_partial_hit_preserves_cached_library(
     assert build._metallib_is_current(name, "changed shader")
 
 
-@pytest.mark.parametrize("host_changed", ["source", "missing_artifact"])
+@pytest.mark.parametrize(
+    "host_changed", ["source", "missing_artifact", "missing_config"]
+)
 def test_host_only_rebuild_includes_only_rope(patched, metallib_env, host_changed):
     build.build_metallibs()
     metallib_env["compiled"].clear()
@@ -589,8 +727,10 @@ def test_host_only_rebuild_includes_only_rope(patched, metallib_env, host_change
     cached.write_bytes(b"restored metallib")
     if host_changed == "source":
         patched.src.write_bytes(b"// source v2")
-    else:
+    elif host_changed == "missing_artifact":
         patched.out.unlink()
+    else:
+        build._build_config_path(patched.out).unlink()
 
     assert build.build() == patched.out
     assert metallib_env["compiled"] == [_LIB]
@@ -628,8 +768,8 @@ def test_metallib_toolchain_change_rebuilds(metallib_env):
     build.build_metallibs()
     assert set(metallib_env["compiled"]) == {_LIB, "nax_fake"}
     old_dir, new_dir = metallib_env["build_dirs"]
-    assert old_dir.parent.name == "tc-a"
-    assert new_dir.parent.name == "tc-b"
+    assert old_dir.parent.parent.name == "tc-a"
+    assert new_dir.parent.parent.name == "tc-b"
     assert old_dir.name == new_dir.name == build._input_hash()
 
 
@@ -639,8 +779,9 @@ def test_metallib_toolchain_change_rebuilds(metallib_env):
         lambda p: p,
         build._stamp_path,
         build._toolchain_path,
+        build._build_config_path,
     ],
-    ids=["artifact", "stamp", "toolchain"],
+    ids=["artifact", "stamp", "toolchain", "configuration"],
 )
 def test_metallib_missing_file_rebuilds(metallib_env, tmp_path, remove):
     build.build_metallibs()
