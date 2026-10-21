@@ -32,7 +32,6 @@ from vllm.v1.kv_cache_interface import (  # noqa: E402
 from tests.stub_runner import make_cache_config, make_stub_runner  # noqa: E402
 from vllm_metal.attention.caches.placement import KV_CACHE_LAYOUT  # noqa: E402
 from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
-from vllm_metal.attention.runtime.mla import MLAPagedAttentionRuntime
 from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
 from vllm_metal.config import MetalConfig
 from vllm_metal.stt.policy import STT_SCHED_AVAILABLE_BYTES  # noqa: E402
@@ -686,19 +685,14 @@ class TestPagedAttentionPlanDiagnostics:
         assert fraction == gpu_mem_util
 
     @pytest.mark.parametrize(
-        "runtime_type", [SDPAPagedAttentionRuntime, MLAPagedAttentionRuntime]
-    )
-    @pytest.mark.parametrize(
         ("override", "expected_blocks"),
         [(None, 64), (7, 7), (64, 64), (65, None), (0, None), (-1, None)],
     )
-    def test_capacity_override_through_engine_initialization(
-        self, monkeypatch, runtime_type, override, expected_blocks
+    def test_draft_pool_override_through_engine_initialization(
+        self, monkeypatch, override, expected_blocks
     ) -> None:
-        is_mla = runtime_type is MLAPagedAttentionRuntime
         runner = make_stub_runner(
             model=SimpleNamespace(),
-            model_args={"kv_lora_rank": 32, "qk_rope_head_dim": 32} if is_mla else {},
             num_layers=1,
             num_kv_cache_layers=1,
             num_kv_heads=1,
@@ -717,22 +711,21 @@ class TestPagedAttentionPlanDiagnostics:
         config.model_config.is_deepseek_v4 = False
         config.model_config.max_model_len = 64
         config.kv_transfer_config = None
-        if not is_mla:
-            # Ordinary draft-model speculation still uses count-based SDPA pools.
-            config.speculative_config = SimpleNamespace(
-                method="draft_model", uses_draft_model=lambda: True
-            )
-            runner._draft_dims = DraftDims(1, 1, 64)
-            drafter = DraftModelProposer(
-                model=SimpleNamespace(),
-                block_size=16,
-                max_model_len=runner.model_config.max_model_len,
-                num_layers=1,
-                controller=runner._spec_decode_controller,
-                extract_logits=lambda output: output,
-            )
-            drafter._dims = runner._draft_dims
-            runner._drafter = drafter
+        # Ordinary draft-model speculation still uses count-based SDPA pools.
+        config.speculative_config = SimpleNamespace(
+            method="draft_model", uses_draft_model=lambda: True
+        )
+        runner._draft_dims = DraftDims(1, 1, 64)
+        drafter = DraftModelProposer(
+            model=SimpleNamespace(),
+            block_size=16,
+            max_model_len=runner.model_config.max_model_len,
+            num_layers=1,
+            controller=runner._spec_decode_controller,
+            extract_logits=lambda output: output,
+        )
+        drafter._dims = runner._draft_dims
+        runner._drafter = drafter
 
         # Only model patching and host observations are stubbed; both target and
         # draft pools allocate real arrays, and vLLM plans their scheduler groups.
@@ -740,7 +733,7 @@ class TestPagedAttentionPlanDiagnostics:
             model.backend = backend
             return 1
 
-        monkeypatch.setattr(runtime_type, "patch_model", patch_model)
+        monkeypatch.setattr(SDPAPagedAttentionRuntime, "patch_model", patch_model)
         worker = _make_worker(runner)
         worker.vllm_config = config
         worker.cache_config = config.cache_config
@@ -760,8 +753,7 @@ class TestPagedAttentionPlanDiagnostics:
                 worker.determine_available_memory()
             build_runtime.assert_not_called()
             assert runner.paged_attention_runtime is None
-            if not is_mla:
-                assert not hasattr(drafter._model, "backend")
+            assert not hasattr(drafter._model, "backend")
             return
 
         available_memory = worker.determine_available_memory()
@@ -771,12 +763,11 @@ class TestPagedAttentionPlanDiagnostics:
 
         assert available_memory == expected_blocks * per_block_bytes
         assert kv_config.num_blocks == expected_blocks
-        assert isinstance(runner.paged_attention_runtime, runtime_type)
+        assert isinstance(runner.paged_attention_runtime, SDPAPagedAttentionRuntime)
         assert runner.paged_attention_runtime.num_blocks() == expected_blocks
-        if not is_mla:
-            assert drafter._model.backend.num_blocks() == expected_blocks
-            draft_group = kv_config.kv_cache_groups[drafter._scheduler_group_index]
-            assert "draft_layers.0.self_attn" in draft_group.layer_names
+        assert drafter._model.backend.num_blocks() == expected_blocks
+        draft_group = kv_config.kv_cache_groups[drafter._scheduler_group_index]
+        assert "draft_layers.0.self_attn" in draft_group.layer_names
 
 
 class TestHybridPlanGuard:
