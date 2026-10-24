@@ -1,0 +1,57 @@
+name: PR1103 native qualification
+
+on:
+  push:
+    branches: [validation/pr1103-current-96d45a27]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
+      VLLM_METAL_BUILD_FROM_SOURCE: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - name: Lint
+        run: scripts/lint.sh
+      - name: Build and run standard tests
+        run: |
+          set -euo pipefail
+          scripts/test.sh 2>&1 | tee native-tests.log
+      - name: Record build provenance
+        run: |
+          set -euo pipefail
+          source .venv-vllm-metal/bin/activate
+          git rev-parse HEAD > native-build-commit.txt
+          git diff 96d45a271427e0e839da33de66b26f8442240140 -- vllm_metal tests scripts pyproject.toml > native-source-diff.txt
+          test ! -s native-source-diff.txt
+          python -c 'from vllm_metal.metal.build import stale_artifacts; assert not stale_artifacts(), stale_artifacts()'
+          python -c 'import importlib.metadata as m, json; print(json.dumps({p:m.version(p) for p in ("mlx","mlx-metal","mlx-lm","vllm","torch","nanobind","numpy")}, indent=2))' > native-packages.json
+          xcodebuild -version > native-toolchain.txt
+          shasum -a 256 vllm_metal/metal/*.metallib vllm_metal/metal/_paged_ops*.so > native-checksums.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr1103-native-96d45a27
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            vllm_metal/metal/*.metallib
+            vllm_metal/metal/*.metallib.sha256
+            vllm_metal/metal/*.metallib.toolchain
+            vllm_metal/metal/*.metallib.build-config
+            vllm_metal/metal/_paged_ops*.so
+            vllm_metal/metal/_paged_ops*.so.sha256
+            vllm_metal/metal/_paged_ops*.so.build-config
+            vllm_metal/metal/_paged_ops.mlx-version
+            native-*.txt
+            native-*.json
+            native-tests.log
