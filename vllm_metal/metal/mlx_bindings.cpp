@@ -445,6 +445,8 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("gqa_length_plan") = nb::none(),
         nb::arg("nax_split_hint") = -1,
         nb::arg("nax_prefill_split_hint") = -1,
+        // Window validation may evaluate metadata with a Python-backed reader.
+        nb::call_guard<nb::gil_scoped_release>(),
         "Return a lazy paged attention array (read-only). Cache writes are handled "
         "by MLX-native scatter upstream.  window_seqlen_q must equal the "
         "longest cu_seqlens_q segment (validated when > 1); small "
