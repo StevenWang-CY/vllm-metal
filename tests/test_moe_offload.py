@@ -66,11 +66,21 @@ def _expert_bytes(model: nn.Module) -> int:
     )
 
 
-@pytest.fixture(params=["stacked", "per_expert"])
+@pytest.fixture(
+    params=[
+        ("stacked", mx.float32),
+        ("per_expert", mx.float32),
+        ("stacked", mx.bfloat16),
+        ("per_expert", mx.bfloat16),
+    ],
+    ids=["stacked-fp32", "per-expert-fp32", "stacked-bf16", "per-expert-bf16"],
+)
 def checkpoint(request, tmp_path) -> tuple[nn.Module, Path]:
+    layout, dtype = request.param
     model = _tiny_olmoe(seed=1)
-    model_dir = tmp_path / request.param
-    _save_checkpoint(model, model_dir, per_expert=request.param == "per_expert")
+    model.set_dtype(dtype)
+    model_dir = tmp_path / layout
+    _save_checkpoint(model, model_dir, per_expert=layout == "per_expert")
     return model, model_dir
 
 
@@ -82,7 +92,9 @@ def _offloaded_twin(reference: nn.Module, model_dir: Path, cache_bytes: int):
 
 
 @pytest.mark.parametrize("num_tokens", [1, 4, 32, 128])
-@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@pytest.mark.parametrize(
+    "dtype", [mx.float32, mx.float16, mx.bfloat16], ids=["fp32", "fp16", "bf16"]
+)
 def test_offloaded_forward_matches_resident_model(
     checkpoint, num_tokens, dtype
 ) -> None:
@@ -103,7 +115,9 @@ def test_offloaded_forward_matches_resident_model(
     assert switch.gate_proj.weight.shape[0] == 0
 
 
-@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@pytest.mark.parametrize(
+    "dtype", [mx.float32, mx.float16, mx.bfloat16], ids=["fp32", "fp16", "bf16"]
+)
 def test_cache_honours_its_byte_budget_and_counts_hits(checkpoint, dtype) -> None:
     reference, model_dir = checkpoint
     reference.set_dtype(dtype)
@@ -121,7 +135,9 @@ def test_cache_honours_its_byte_budget_and_counts_hits(checkpoint, dtype) -> Non
     assert (store.hits, store.misses) == (3, 5)
 
 
-@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@pytest.mark.parametrize(
+    "dtype", [mx.float32, mx.float16, mx.bfloat16], ids=["fp32", "fp16", "bf16"]
+)
 def test_reserve_covers_the_cache_and_one_stacked_layer(checkpoint, dtype) -> None:
     reference, model_dir = checkpoint
     reference.set_dtype(dtype)

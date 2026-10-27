@@ -126,7 +126,11 @@ def test_profile_warmup_selects_max_sequence_rows():
 
 
 @pytest.mark.parametrize("revision", [None, "release-tag", "a" * 40])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.float16, torch.bfloat16, torch.float32],
+    ids=["fp16", "bf16", "fp32"],
+)
 def test_draft_load_honours_dtype_and_revision(monkeypatch, revision, dtype):
     dims, model = object(), nn.Linear(8, 8)
     model.set_dtype(mx.bfloat16)

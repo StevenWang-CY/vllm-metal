@@ -232,8 +232,12 @@ def _make_lifecycle(
 
 
 class TestModelLifecycle:
-    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-    @pytest.mark.parametrize("quantized", [False, True])
+    @pytest.mark.parametrize(
+        "dtype",
+        [torch.float16, torch.bfloat16, torch.float32],
+        ids=["fp16", "bf16", "fp32"],
+    )
+    @pytest.mark.parametrize("quantized", [False, True], ids=["dense", "quantized"])
     def test_native_load_honours_dtype_without_casting_packed_weights(
         self, monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype, quantized: bool
     ) -> None:
