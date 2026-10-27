@@ -82,9 +82,13 @@ def _offloaded_twin(reference: nn.Module, model_dir: Path, cache_bytes: int):
 
 
 @pytest.mark.parametrize("num_tokens", [1, 4, 32, 128])
-def test_offloaded_forward_matches_resident_model(checkpoint, num_tokens) -> None:
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+def test_offloaded_forward_matches_resident_model(
+    checkpoint, num_tokens, dtype
+) -> None:
     """Both SwitchGLU paths (sorted gather from 64 routed slots) stay bit-exact."""
     reference, model_dir = checkpoint
+    reference.set_dtype(dtype)
     # Room for two experts: every layer call evicts, so misses are exercised.
     twin, store = _offloaded_twin(reference, model_dir, 2 * _expert_bytes(reference))
     tokens = mx.random.randint(0, 128, (1, num_tokens))
@@ -99,8 +103,10 @@ def test_offloaded_forward_matches_resident_model(checkpoint, num_tokens) -> Non
     assert switch.gate_proj.weight.shape[0] == 0
 
 
-def test_cache_honours_its_byte_budget_and_counts_hits(checkpoint) -> None:
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+def test_cache_honours_its_byte_budget_and_counts_hits(checkpoint, dtype) -> None:
     reference, model_dir = checkpoint
+    reference.set_dtype(dtype)
     _, store = _offloaded_twin(reference, model_dir, 3 * _expert_bytes(reference))
     path = "model.layers.0.mlp.switch_mlp"
 
@@ -115,8 +121,10 @@ def test_cache_honours_its_byte_budget_and_counts_hits(checkpoint) -> None:
     assert (store.hits, store.misses) == (3, 5)
 
 
-def test_reserve_covers_the_cache_and_one_stacked_layer(checkpoint) -> None:
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+def test_reserve_covers_the_cache_and_one_stacked_layer(checkpoint, dtype) -> None:
     reference, model_dir = checkpoint
+    reference.set_dtype(dtype)
     cache_bytes = 2 * _expert_bytes(reference)
 
     _, store = _offloaded_twin(reference, model_dir, cache_bytes)
