@@ -63,25 +63,8 @@ Parity runs daily at 07:17 UTC on `main`. Users with repository write access can
 
 Both triggers invoke this same tool for Qwen3-0.6B and Qwen3.5-0.8B on a self-hosted Apple Silicon Mac: 40 shared prompts, 20 output tokens, top-K 5, and HTTP request batch sizes 1/2. CI supplies the checkpoint and environment and collects the tool's results.
 
-The Qwen3-0.6B job also compares same-checkpoint speculative outputs at batch
-sizes 1/2 using the checkpoint's normal precision and the speculative parity tool.
-A separate FP32 test checks acceptance, EAL, and each draft position through
-`LLM.get_metrics()` before and after prefix reuse. FP32 isolates cache and metric
-regressions from BF16 ties. The fixture explicitly converts target and draft
-weights to FP32 and uses FP32 KV caches; the engine's dtype option alone does
-not convert native MLX-LM checkpoint weights. It uses eight shared natural
-prompts and 65 output tokens, requiring at least 98% same-model acceptance;
-this bound does not certify BF16 acceptance.
+The Qwen3-0.6B job also checks speculative output parity and FP32 acceptance
+and rejection recovery, including prefix-cache reuse.
 
-A controlled FP32 test replaces proposal generation with recorded target
-tokens, inserting a mismatch at each draft position and following each rejection
-with full acceptance. The real engine must recover the exact target-only output
-and expected counters, before and after prefix reuse. This checks shared target
-KV bookkeeping and verification, not each method's private draft cache or model
-acceptance rate. It uses two prompts and 37 output tokens at batch sizes 1/2.
-
-The job summary shows the tested commit and checkpoint revision, separate
-EXACT / TOP_K_MATCH / FAIL counts, acceptance, EAL, per-position rates, and
-recovery results. Missing or failed phases remain visible. The `Parity` check
-links to these summaries and the raw counters, token IDs, environment and logs,
-retained for 14 days. Regular PR CI runs fast tests without starting model servers.
+The `Parity` check links to summary tables and diagnostic artifacts, retained
+for 14 days. Regular PR CI runs fast tests without starting model servers.
